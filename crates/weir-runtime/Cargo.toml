@@ -1,0 +1,40 @@
+[package]
+name = "weir-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Host runtime: loads and invokes connectors over the execution seam, backend-agnostic (WEIR-S-0005 / WEIR-A-0002)."
+
+[dependencies]
+# Everything (PluginHost/load_wasm, EgressPolicy/EgressDenied, http_types) is reached
+# white-label via weir_connector::fidius — no direct fidius-host dependency. The `wasm`
+# feature enables the sandboxed backend + the egress contract; `host` the typed client.
+weir-connector = { path = "../weir-connector", features = ["host", "wasm", "streaming"] }
+# Stream/StreamExt to map the fidius ChunkStream into the typed v1 read stream.
+futures = "0.3"
+# Ed25519 verifying keys for signature-gated WASM package load.
+ed25519-dalek = "2"
+thiserror = { workspace = true }
+# Host-side OAuth2/session token grants ([[WEIR-A-0033]]): a small blocking HTTP
+# client so the *host* performs the grant — the secret never enters the guest.
+ureq = { version = "2", features = ["json"] }
+serde_json = { workspace = true }
+# base64 for the host-side HTTP Basic credential ([[WEIR-A-0033]]).
+base64 = "0.22"
+# AWS SigV4 request signing for the S3/object-store credential ([[WEIR-T-0109]]) — the host signs
+# each outbound request so the secret key never enters the guest.
+sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
+
+[dev-dependencies]
+weir-wasm-testkit = { path = "../weir-wasm-testkit" }
+# A connector to load in tests (linked in-process via rlib).
+tempfile = "3"
+# Signing helpers for the signature-gating test (package_digest + ed25519 sign).
+fidius-core = "0.5.4"
+# Drive the async streaming `read` in tests (current-thread runtime, like the engine).
+tokio = { version = "1", features = ["rt", "macros"] }

@@ -1,0 +1,10 @@
+DROP TABLE IF EXISTS leader_leases;
+DROP TABLE IF EXISTS schedules;
+DROP TABLE IF EXISTS work_units;
+DROP TABLE IF EXISTS connectors;
+DROP TABLE IF EXISTS connections;
+DROP TABLE IF EXISTS run_logs;
+DROP TABLE IF EXISTS outbox;
+DROP TABLE IF EXISTS stream_schemas;
+DROP TABLE IF EXISTS stream_state;
+DROP TABLE IF EXISTS dead_letters;

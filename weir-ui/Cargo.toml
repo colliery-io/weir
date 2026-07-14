@@ -1,0 +1,25 @@
+# Standalone workspace: the web app is built on its own (trunk →
+# wasm32-unknown-unknown), not as a member of the weir workspace.
+[workspace]
+
+[package]
+name = "weir-ui"
+version = "0.1.0"
+edition = "2021"
+description = "Leptos web UI for weir (WASM, embedded in the weir binary), built on Colliery Aurora Dark."
+
+[dependencies]
+leptos = { version = "0.8", features = ["csr"] }
+# Colliery Aurora Dark design system (published `aurora-leptos`), imported as `aurora_leptos`.
+colliery-io-aurora = "0.1"
+gloo-net = "0.6"
+gloo-timers = { version = "0.3", features = ["futures"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wasm-bindgen-futures = "0.4"
+# localStorage for the interim API-key bearer ([[WEIR-T-0084]]); the sign-in gate is T-0087.
+web-sys = { version = "0.3", features = ["Window", "Storage", "Location"] }
+
+[profile.release]
+opt-level = "z"
+lto = true

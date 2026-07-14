@@ -1,0 +1,45 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "weir-server.fullname" . }}
+  labels:
+    {{- include "weir-server.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "weir-server.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "weir-server.labels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "weir-server.serviceAccountName" . }}
+      containers:
+        - name: weir
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["api", "--port", "{{ .Values.service.port }}"]
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.port }}
+          envFrom:
+            - secretRef:
+                name: {{ include "weir-server.fullname" . }}
+          env:
+            - name: WEIR_CONNECTORS_DIR
+              value: {{ .Values.connectorsDir | quote }}
+            {{- if .Values.oidc.enabled }}
+            - name: WEIR_OIDC_ISSUER
+              value: {{ .Values.oidc.issuer | quote }}
+            - name: WEIR_OIDC_CLIENT_ID
+              value: {{ .Values.oidc.clientId | quote }}
+            {{- end }}
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http

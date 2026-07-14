@@ -1,0 +1,37 @@
+# Mirrors weir-orchestrator `runner_deployment_json` ([[WEIR-T-0103]]): name `weir-runner-<tenant>`,
+# `app`/`weir/tenant` labels, `runner --tenant <id>` args, WEIR_DB/WEIR_CONNECTORS_DIR env — so the
+# actuator's server-side-apply lands on the same object.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: weir-runner-{{ .Values.tenant | lower }}
+  labels:
+    app: weir-runner
+    weir/tenant: {{ .Values.tenant | quote }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: weir-runner
+      weir/tenant: {{ .Values.tenant | quote }}
+  template:
+    metadata:
+      labels:
+        app: weir-runner
+        weir/tenant: {{ .Values.tenant | quote }}
+    spec:
+      containers:
+        - name: runner
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - "runner"
+            - "--tenant"
+            - {{ .Values.tenant | quote }}
+            - "--concurrency"
+            - {{ .Values.concurrency | quote }}
+          env:
+            - name: WEIR_DB
+              value: {{ .Values.store.url | quote }}
+            - name: WEIR_CONNECTORS_DIR
+              value: {{ .Values.connectorsDir | quote }}

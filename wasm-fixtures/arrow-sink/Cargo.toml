@@ -1,0 +1,30 @@
+# Hand-written WASM guest for the `arrow-sink` connector (WEIR-I-0011 S2).
+# Standalone workspace: built on its own for wasm32-wasip2.
+[workspace]
+
+[package]
+name = "weir-arrow-sink-wasm"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+fidius-guest = "0.5.4"
+fidius-macro = "0.5.4"
+wit-bindgen = "0.44"
+# Fidius-free shared types (the configured-construct Config wire + write envelope).
+weir-connector-types = { path = "../../crates/weir-connector-types" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# IPC decode only (no default features) to keep the wasm lean.
+arrow = { version = "59", default-features = false, features = ["ipc"] }
+
+[build-dependencies]
+fidius-build = "0.5.4"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true

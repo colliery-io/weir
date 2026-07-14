@@ -1,0 +1,28 @@
+# Dex OIDC provider for the weir auth integration/e2e ([[WEIR-T-0088]]). Test-only: in-memory
+# storage, a static `weir` client, and a static test user. Never for production.
+issuer: http://localhost:5557/dex
+
+storage:
+  type: memory
+
+web:
+  http: 0.0.0.0:5557
+
+oauth2:
+  # Skip the consent screen so the e2e login is a single form.
+  skipApprovalScreen: true
+
+staticClients:
+  - id: weir
+    name: weir
+    secret: weir-secret
+    redirectURIs:
+      - http://localhost:8787/auth/callback
+
+enablePasswordDB: true
+staticPasswords:
+  - email: admin@weir.test
+    username: admin
+    userID: "08a8684b-db88-4b73-90a9-3cd1661f5466"
+    # bcrypt hash of the password "password".
+    hash: "$2y$10$Vv6CtIjL1uQ.u2KemfzWoejVHIZfj.1NNomIG3FJqDMJOLMOJF.lm"

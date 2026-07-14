@@ -1,0 +1,6 @@
+apiVersion: v2
+name: weir-server
+description: weir control plane — API + scheduler + the k8s actuator/autoscaler ([[WEIR-I-0021]])
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

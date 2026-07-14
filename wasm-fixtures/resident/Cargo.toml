@@ -1,0 +1,33 @@
+# Standalone (own [workspace]) so the parent weir workspace doesn't build this
+# wasm-only crate natively. The UNIFIED resident source fixture ([[WEIR-I-0035]] F1.9):
+# one connector, `mode` from config — `poll` (warm loop: read a bounded batch → checkpoint
+# → the host sleeps the declared cadence → repeat, never exits; the read-amplification
+# clamp), `tail` (emit per config-supplied arrival — the "while"/event-reader shape), and
+# `ws` (hand-rolled RFC6455 over the host-brokered TCP egress — a live blocking ws tail /
+# sink). Replaces the resident-poll / resident-events / resident-ws fixtures.
+[workspace]
+
+[package]
+name = "weir-resident-wasm"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+fidius-guest = "0.5.4"
+fidius-macro = "0.5.4"
+wit-bindgen = "0.44"
+weir-connector-types = { path = "../../crates/weir-connector-types" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[build-dependencies]
+fidius-build = "0.5.4"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true

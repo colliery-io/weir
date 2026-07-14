@@ -1,0 +1,43 @@
+[package]
+name = "weir-orchestrator"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Async run/work-unit orchestration: claim/heartbeat-lease relay + WorkExecutor seam over the sync engine (WEIR-S-0004 / WEIR-A-0010 / WEIR-A-0028)."
+
+[dependencies]
+weir-engine = { path = "../weir-engine" }
+weir-schema = { path = "../weir-schema" }
+weir-runtime = { path = "../weir-runtime" }
+weir-connector = { path = "../weir-connector", features = ["host"] }
+diesel = "2.3"
+# The work-unit store names `DualConnection` for its row helpers ([[WEIR-I-0030]]).
+diesel-dualdb = { version = "0.1", default-features = false, features = ["uuid"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = "0.1"
+futures = "0.3"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time"] }
+cron = "0.17"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+# OpenLineage emission ([[WEIR-A-0022]] / [[WEIR-T-0100]]) — fire-and-forget POST to an OL endpoint.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# Metrics ([[WEIR-T-0099]]) — the run path emits to the global recorder; the API installs the exporter.
+metrics = "0.24"
+# Run-path spans ([[WEIR-T-0098]]) carrying connection/run/tenant.
+tracing = { workspace = true }
+# Kubernetes actuator ([[WEIR-T-0103]] / [[WEIR-A-0023]]) — behind the `kubernetes` feature so the
+# default build compiles no kube tree. Versions mirror cloacina.
+kube = { version = "2.0", default-features = false, features = ["client", "rustls-tls"], optional = true }
+k8s-openapi = { version = "0.26", features = ["v1_32"], optional = true }
+
+[features]
+kubernetes = ["dep:kube", "dep:k8s-openapi"]
+
+[dev-dependencies]
+weir-wasm-testkit = { path = "../weir-wasm-testkit" }
+tempfile = "3"

@@ -1,0 +1,34 @@
+[package]
+name = "weir-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "weir control-plane HTTP API (axum) + embedded Leptos UI, over weir-app."
+
+[dependencies]
+weir-app = { path = "../weir-app" }
+axum = "0.8"
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+# Access-log middleware ([[WEIR-I-0035]] F1 diagnostics) — method/path/status at debug.
+tracing = { workspace = true }
+# AuthN key cache ([[WEIR-A-0008]] / [[WEIR-T-0084]], mirroring cloacina routes/auth.rs).
+lru = "0.12"
+# Prometheus exporter ([[WEIR-T-0099]]) — installs the global recorder + renders /metrics text.
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.16", default-features = false }
+# OIDC relying party ([[WEIR-T-0086]]/[[WEIR-T-0088]], mirroring cloacina oidc.rs): discovery,
+# authorization-code + PKCE, JWKS ID-token verification.
+openidconnect = { version = "4", features = ["reqwest"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+
+[dev-dependencies]
+weir-wasm-testkit = { path = "../weir-wasm-testkit" }
+# Fails / dead-letters on demand — for the run-legibility test (WEIR-T-0035).
+# Emits a connector log — for the log-capture test (WEIR-T-0036).
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }

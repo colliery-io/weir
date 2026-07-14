@@ -1,0 +1,19 @@
+[workspace]
+
+[package]
+name = "weir-py"
+version = "0.0.1"
+edition = "2024"
+license = "Apache-2.0"
+description = "Python bindings for weir"
+
+[lib]
+name = "weir"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.25", features = ["extension-module", "abi3-py39"] }
+weir-core = { path = "../../crates/weir-core" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+pythonize = "0.25"

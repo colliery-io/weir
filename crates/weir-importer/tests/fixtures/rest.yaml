@@ -1,0 +1,25 @@
+# Reference declarative REST source (WEIR-T-0003).
+# `weir-codegen manifests/rest.yaml dylib crates/weir-connector-rest`
+# `weir-codegen manifests/rest.yaml wasm  wasm-fixtures/rest`
+spec:
+  name: rest
+  version: "0.1.0"
+# Default base; overridable at runtime via config `{"base_url": "..."}`.
+base_url: https://example.invalid
+streams:
+  - name: posts
+    path: /posts
+    primary_key: [id]
+    schema:
+      - { name: id, type: int64, nullable: false }
+      - { name: title, type: utf8 }
+      - { name: updated_at, type: timestamp }
+    record_selector: ""        # response body is itself the array of records
+    incremental:
+      cursor_field: updated_at
+      cursor_param: since
+    pagination:
+      kind: page
+      page_param: _page
+      size_param: _limit
+      size: 2

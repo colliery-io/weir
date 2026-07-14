@@ -1,0 +1,60 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Test artifacts
+/tmp/
+/test-results/
+
+# Database files
+*.db
+*.db-shm
+*.db-wal
+
+# Coverage reports
+/coverage/
+tarpaulin-report.html
+cobertura.xml
+lcov.info
+
+# Build artifacts
+**/*.orig
+
+# Metis ephemeral state
+.metis/.index-dirty
+
+# Documentation build output
+/site/
+
+# Environment
+.env
+.env.local
+
+# Standalone wasm guest build artifacts (own workspaces, wasm32-wasip2 target)
+wasm-fixtures/**/target/
+crates/connectors/**/target/
+
+# Leptos UI build artifacts (embedded at build time, not committed)
+weir-ui/dist/
+weir-ui/target/
+
+# Connector test secrets ([[WEIR-I-0014]]): plaintext API keys are NEVER committed.
+# Only the sops-encrypted *.enc.json bundles, *.example.json templates, and the
+# README are tracked. (*.enc.json also matches *.json, so it must be re-included.)
+/secrets/*.json
+!/secrets/*.enc.json
+!/secrets/*.example.json
