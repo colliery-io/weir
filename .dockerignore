@@ -1,0 +1,10 @@
+# Keep the build context lean — everything is rebuilt inside the image.
+**/target/
+.git/
+.github/
+.metis/
+.angreal/__pycache__/
+weir-ui/dist/
+docs/
+**/*.db
+*.png

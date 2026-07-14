@@ -1,0 +1,35 @@
+[package]
+name = "weir-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "The `weir` binary: thin CLI over weir-app + the weir-api control plane."
+
+[[bin]]
+name = "weir"
+path = "src/main.rs"
+
+[dependencies]
+weir-app = { path = "../weir-app" }
+weir-api = { path = "../weir-api" }
+# Reference connectors bundled into the binary so they resolve by name.
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+
+# OTLP trace export ([[WEIR-A-0022]] / [[WEIR-T-0098]]) — behind the `telemetry` feature so the default
+# build compiles none of the opentelemetry tree. Versions mirror cloacina.
+opentelemetry = { version = "0.31", optional = true }
+opentelemetry-otlp = { version = "0.31", optional = true, features = ["grpc-tonic"] }
+opentelemetry_sdk = { version = "0.31", optional = true, features = ["rt-tokio"] }
+tracing-opentelemetry = { version = "0.32", optional = true }
+
+[features]
+telemetry = ["dep:opentelemetry", "dep:opentelemetry-otlp", "dep:opentelemetry_sdk", "dep:tracing-opentelemetry"]
+# The k8s actuator/autoscaler ([[WEIR-I-0021]]) — enables `weir autoscaler`.
+kubernetes = ["weir-app/kubernetes"]

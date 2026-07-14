@@ -1,0 +1,6 @@
+apiVersion: v2
+name: weir-runner
+description: weir connector runner — the per-tenant Deployment the actuator/autoscaler scales ([[WEIR-I-0021]])
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

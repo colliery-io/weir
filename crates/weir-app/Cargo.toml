@@ -1,0 +1,45 @@
+[package]
+name = "weir-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "weir application core: the connection config model + App orchestration over the engine/relay (single-node)."
+
+[features]
+# Kubernetes actuator + autoscaler ([[WEIR-I-0021]]) — off by default (no kube in the default build).
+kubernetes = ["weir-orchestrator/kubernetes"]
+
+[dependencies]
+weir-orchestrator = { path = "../weir-orchestrator" }
+weir-engine = { path = "../weir-engine" }
+weir-schema = { path = "../weir-schema" }
+weir-connector = { path = "../weir-connector", features = ["host"] }
+# Low-code onboarding ([[WEIR-A-0032]] / [[WEIR-I-0012]]): validate a manifest +
+# map it onto the shared declarative runtime (rest) config.
+weir-importer = { path = "../weir-importer" }
+weir-manifest = { path = "../weir-manifest" }
+serde_yaml = "0.9"
+diesel = "2.3"
+# Control-plane auth ([[WEIR-A-0008]] / [[WEIR-I-0017]], mirroring cloacina): UUID ids +
+# SHA-256-hashed API keys (high-entropy → plain hash, O(1) lookup + caching).
+diesel-dualdb = { version = "0.1", default-features = false, features = ["uuid"] }
+uuid = { version = "1", features = ["v4"] }
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.8"
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+# Connector-crate manifest parsing for ingress ([[WEIR-I-0010]] S2).
+toml = "0.8"
+
+[dev-dependencies]
+weir-wasm-testkit = { path = "../weir-wasm-testkit" }
+# Reverse-ETL wire tests ([[WEIR-T-0074]]): load wasm guests with a host egress policy.
+weir-runtime = { path = "../weir-runtime" }
+tempfile = "3"

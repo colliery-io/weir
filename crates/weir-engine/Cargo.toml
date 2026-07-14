@@ -1,0 +1,44 @@
+[package]
+name = "weir-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Minimal Sync Engine slice: drives source→map→destination with a transactional checkpoint + outbox (WEIR-S-0004 / WEIR-A-0009/0010/0011)."
+
+[dependencies]
+weir-runtime = { path = "../weir-runtime" }
+weir-connector = { path = "../weir-connector", features = ["host"] }
+# diesel-dualdb store (WEIR-A-0009): the typed query builder + a generated portable
+# schema (weir-schema) keep one code path across Postgres + SQLite (WEIR-I-0013).
+weir-schema = { path = "../weir-schema" }
+diesel = "2.3"
+diesel-dualdb = { version = "0.1", default-features = false, features = ["uuid"] }
+uuid = { version = "1", features = ["v4"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+# Drive the connector's async streaming `read` via `futures::executor::block_on`
+# (off-tokio, so a WASM source's wasi:http can enter its own runtime) while DB
+# commits stay synchronous (WEIR-A-0029; the executor bridges via spawn_blocking,
+# so the engine's exterior stays sync).
+futures = "0.3"
+
+[dev-dependencies]
+# The GENERATED reference declarative REST source (WEIR-T-0003).
+# Fails on demand — for run-failure / retry tests.
+# Multi-checkpoint source — for the per-checkpoint progress test (WEIR-T-0037).
+# Build + stage connector wasm guest packages (WEIR-I-0011 S1).
+weir-wasm-testkit = { path = "../weir-wasm-testkit" }
+tempfile = "3"
+# A raw SQL client for the CDC fidelity test ([[WEIR-T-0107]]) — drives INSERT/UPDATE/DELETE that
+# the connector's logical-slot reader must then capture, in order, once each.
+postgres = "0.19"
+# A local websocket echo/push server for the ws→ws resident consumer e2e ([[WEIR-T-0143]] /
+# [[WEIR-A-0039]]) — fully local, no external network. Test-only.
+tokio = { workspace = true }
+tokio-tungstenite = "0.21"
+futures-util = "0.3"

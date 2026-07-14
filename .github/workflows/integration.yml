@@ -1,0 +1,46 @@
+name: Integration
+
+# Runs the `#[ignore]`d integration tests against real resources (Postgres) in a
+# service container — the CI counterpart of `angreal integration test`.
+# (Actions are disabled repo-wide while private; this is defined for re-enable.)
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  integration:
+    name: Integration (Postgres)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: weir
+          POSTGRES_PASSWORD: weir
+          POSTGRES_DB: weir
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U weir -d weir"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.96.1
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.1"
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Service Postgres is reachable on localhost:5432 — matches the default
+      # `WEIR_PG_URL` (postgres://weir:weir@localhost:5432/weir).
+      - name: Integration tests
+        run: cargo test --workspace -- --ignored

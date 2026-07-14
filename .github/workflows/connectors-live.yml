@@ -1,0 +1,60 @@
+name: Connectors (live)
+
+# Runs the declarative connectors end-to-end against their real APIs ([[WEIR-I-0014]]):
+# the no-auth set always, and the authed set by sops-decrypting secrets/*.enc.json with
+# the SOPS_AGE_KEY repo secret. Nightly + on-demand only — never on the PR path, so live
+# API flakiness can't block a merge. Assertion is functional (rows > 0), not data-exact.
+#
+# Operator setup to enable the authed connectors:
+#   - add the CI age private key as the repo secret `SOPS_AGE_KEY`
+#     (the matching pubkey must be a recipient in .sops.yaml)
+#   - commit at least one secrets/<slug>.enc.json bundle (`angreal secrets edit <slug>`)
+# (Actions are disabled repo-wide while private; this is defined for re-enable.)
+on:
+  schedule:
+    - cron: "0 7 * * *" # nightly ~07:00 UTC
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  connectors-live:
+    name: Connectors (live integration)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.96.1 (+ wasm32-wasip2 for the rest guest)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.1"
+          targets: wasm32-wasip2
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install age + sops
+        run: |
+          sudo apt-get update && sudo apt-get install -y age
+          SOPS_VERSION=v3.11.0
+          curl -fsSL -o /tmp/sops \
+            "https://github.com/getsops/sops/releases/download/${SOPS_VERSION}/sops-${SOPS_VERSION}.linux.amd64"
+          sudo install -m 0755 /tmp/sops /usr/local/bin/sops
+
+      - name: Install angreal
+        run: pip install angreal
+
+      # `angreal test connectors-live` decrypts secrets/*.enc.json with SOPS_AGE_KEY into a
+      # private temp dir and runs the full live manifest_corpus suite (no-auth + authed).
+      # With no bundles present, the no-auth connectors still run; the authed ones skip.
+      - name: Live connector suite
+        env:
+          SOPS_AGE_KEY: ${{ secrets.SOPS_AGE_KEY }}
+          # The shared GH runner is slower + shares egress IPs, so give heavy connectors more
+          # room and skip the two that can't work here: nasa (public DEMO_KEY is per-IP
+          # rate-limited across all Actions users) and coinpaprika (~60k-row fetch). Both still
+          # run in full locally (no skip list). See WEIR-T-0066.
+          WEIR_LIVE_TIMEOUT_SECS: "90"
+          WEIR_LIVE_SKIP: "nasa,coinpaprika"
+        run: angreal test connectors-live

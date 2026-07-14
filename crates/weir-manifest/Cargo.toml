@@ -1,0 +1,16 @@
+[package]
+name = "weir-manifest"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Declarative connector manifest v0: schema + YAML parsing (WEIR-A-0014 §2, the codegen source-of-truth)."
+
+[dependencies]
+serde = { workspace = true }
+serde_yaml = "0.9"
+thiserror = { workspace = true }
+# In-flight transform ops carried on a stream ([[WEIR-T-0071]]); fidius-free without `wit`.
+weir-connector-types = { path = "../weir-connector-types" }

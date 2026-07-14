@@ -1,0 +1,13 @@
+[package]
+name = "weir-slow-pkg"
+version = "0.1.0"
+interface = "connector"
+interface_version = 1
+runtime = "wasm"
+
+[metadata]
+category = "connector"
+
+[wasm]
+component = "weir_slow_wasm.wasm"
+capabilities = []

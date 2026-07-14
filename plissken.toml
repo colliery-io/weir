@@ -1,0 +1,14 @@
+[project]
+name = "weir"
+version_from = "cargo"
+
+[output]
+format = "markdown"
+path = "docs/api"
+template = "mkdocs-material"
+
+[rust]
+crates = ["crates/weir-core", "crates/weir-cli"]
+
+[python]
+package = "bindings/weir-py/python/weir"

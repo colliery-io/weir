@@ -1,0 +1,34 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "weir"
+dynamic = ["version"]
+description = "Python bindings for weir"
+readme = "README.md"
+authors = [
+    {name = "Dylan Storey", email = "contact@colliery.io"}
+]
+license = {text = "Apache-2.0"}
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Rust",
+]
+requires-python = ">=3.9"
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/colliery-io/weir"
+Repository = "https://github.com/colliery-io/weir"
+
+[tool.maturin]
+module-name = "weir"
+python-source = "python"
+strip = true

@@ -1,0 +1,42 @@
+# An Airbyte low-code (declarative) manifest, structurally equivalent to
+# manifests/rest-ref.yaml. WEIR-T-0013 proves that importing this and running it
+# through codegen yields the byte-identical connector that `rest_ref.rs` already
+# compiles and paginates end-to-end against a mock.
+type: DeclarativeSource
+streams:
+  - type: DeclarativeStream
+    name: posts
+    primary_key: id
+    retriever:
+      type: SimpleRetriever
+      requester:
+        type: HttpRequester
+        url_base: "https://example.invalid"
+        path: "/posts"
+      paginator:
+        type: DefaultPaginator
+        page_size_option:
+          type: RequestOption
+          field_name: "_limit"
+          inject_into: request_parameter
+        page_token_option:
+          type: RequestOption
+          field_name: "_page"
+          inject_into: request_parameter
+        pagination_strategy:
+          type: PageIncrement
+          page_size: 2
+    incremental_sync:
+      type: DatetimeBasedCursor
+      cursor_field: updated_at
+      start_time_option:
+        type: RequestOption
+        field_name: "since"
+    schema_loader:
+      type: InlineSchemaLoader
+      schema:
+        type: object
+        properties:
+          id: { type: integer }
+          title: { type: ["null", "string"] }
+          updated_at: { type: ["null", "string"], format: date-time }

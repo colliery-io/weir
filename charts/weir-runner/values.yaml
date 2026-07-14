@@ -1,0 +1,17 @@
+# A per-tenant runner ([[WEIR-T-0102]]). Shape MUST match the actuator's runner_deployment_json
+# ([[WEIR-T-0103]]) — same labels/args/env — since the actuator server-side-applies over it.
+tenant: "default"
+
+image:
+  repository: ghcr.io/colliery-io/weir
+  tag: latest
+  pullPolicy: IfNotPresent
+
+# The autoscaler owns this at runtime; the chart default is 0 (scale-to-zero until there's work).
+replicaCount: 0
+
+store:
+  url: "postgres://weir:weir@postgres:5432/weir"
+
+connectorsDir: "/connectors"
+concurrency: 16

@@ -1,0 +1,19 @@
+# Test helper (WEIR-T-0041 / WEIR-I-0011): build a connector guest crate to
+# wasm32-wasip2 and stage it as a fidius package, with a freshness cache so
+# repeated test runs don't rebuild. Shared by the wasm engine/runtime tests;
+# the migration (S2+) reuses it for the migrated connectors.
+[package]
+name = "weir-wasm-testkit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Build + stage connector wasm guest packages for tests (WEIR-I-0011)."
+publish = false
+
+[dependencies]
+# Load staged wasm packages as ConnectorHandles for tests (WEIR-I-0011 S3).
+weir-runtime = { path = "../weir-runtime" }
+weir-connector = { path = "../weir-connector", features = ["host", "wasm", "streaming"] }

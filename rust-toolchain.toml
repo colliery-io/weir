@@ -1,0 +1,9 @@
+# Pin the toolchain so `cargo fmt --check` and `clippy` are reproducible across every
+# machine and CI (the drift that surfaced in [[WEIR-I-0031]] came from environments running
+# an older rustfmt than the repo was formatted with). Bump this deliberately — a version
+# change means running `cargo fmt --all` in the same commit. `wasm32-wasip2` is here so the
+# standalone guest crates (connectors/*, wasm-fixtures/*) build without a manual target add.
+[toolchain]
+channel = "1.96.1"
+components = ["rustfmt", "clippy"]
+targets = ["wasm32-wasip2"]

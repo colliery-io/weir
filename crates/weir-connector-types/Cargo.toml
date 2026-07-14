@@ -1,0 +1,22 @@
+[package]
+name = "weir-connector-types"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "weir connector contract boundary types + error taxonomy + envelope codec. fidius-free so it is wasm-buildable and shareable by host, dylib, and WASM-guest connectors."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+bincode = "1.3"
+# WitType derive (proc-macro; host-side at build) for WASM-guest WIT projection.
+# Optional so the host/dylib path needn't pull it.
+fidius-macro = { version = "0.5.4", optional = true }
+
+[features]
+# Enables #[derive(WitType)] on the typed-method boundary types (WASM guests).
+wit = ["dep:fidius-macro"]

@@ -1,0 +1,23 @@
+[package]
+name = "weir-importer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Maps an Airbyte low-code (declarative) manifest onto a weir manifest, so codegen can lower it to a connector (WEIR-A-0020 / WEIR-A-0003)."
+
+[dependencies]
+weir-manifest = { path = "../weir-manifest" }
+serde = { workspace = true }
+serde_yaml = "0.9"
+# Serialize an Airbyte `request_body_json` object to a JSON body string ([[WEIR-T-0068]]).
+serde_json = { workspace = true }
+# MappingOp/MappingSpec target for transform lowering ([[WEIR-T-0071]]).
+weir-connector-types = { path = "../weir-connector-types" }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# Fidelity test: import → codegen, compared to the rest codegen output.
+weir-codegen = { path = "../weir-codegen" }

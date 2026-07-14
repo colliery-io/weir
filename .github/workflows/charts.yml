@@ -1,0 +1,31 @@
+name: Helm charts
+
+# Lint + render the weir-server / weir-runner charts ([[WEIR-I-0021]]) on change. The live k8s flow
+# is the kind smoke (scripts/kind-smoke.sh) — not run here (no cluster in CI).
+on:
+  push:
+    branches: [main]
+    paths:
+      - "charts/**"
+      - ".github/workflows/charts.yml"
+  pull_request:
+    paths:
+      - "charts/**"
+  workflow_dispatch:
+
+jobs:
+  helm:
+    name: helm lint + template
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - name: Lint
+        run: |
+          helm lint charts/weir-server
+          helm lint charts/weir-runner
+      - name: Template (render sanity)
+        run: |
+          helm template w charts/weir-server > /dev/null
+          helm template w charts/weir-server --set oidc.enabled=true --set oidc.issuer=https://x --set oidc.clientSecret=s > /dev/null
+          helm template r charts/weir-runner --set tenant=acme > /dev/null

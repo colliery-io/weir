@@ -1,0 +1,3 @@
+{"id":1,"event":"signup","user":"ada"}
+{"id":2,"event":"login","user":"grace"}
+{"id":3,"event":"purchase","user":"ada","amount":42}

@@ -1,0 +1,102 @@
+# weir stack — one Postgres, two entrypoints.
+#
+#   Demo (control plane + Postgres SoR):   docker compose --profile demo up --build
+#                                          (or: angreal docker up)  → http://localhost:8080
+#   Integration tests (Postgres only):     docker compose up -d --wait
+#                                          (or: angreal integration up/test)
+#
+# Postgres is the single SoR. It's only published on loopback (127.0.0.1) for the
+# host-run integration tests; it is NOT exposed to the network, and the weir
+# service reaches it over the compose network at `postgres:5432` (never localhost).
+# The `weir` service is gated behind the `demo` profile, so a bare `up` (integration)
+# starts only Postgres and never builds the image.
+name: weir
+
+services:
+  postgres:
+    image: postgres:16
+    # wal_level=logical enables logical replication slots for CDC (WEIR-T-0028).
+    command: ["postgres", "-c", "wal_level=logical"]
+    environment:
+      POSTGRES_USER: weir
+      POSTGRES_PASSWORD: weir
+      POSTGRES_DB: weir
+    ports:
+      # Loopback-only, and the host port is overridable (WEIR_PG_HOST_PORT) so the stack can
+      # coexist with another Postgres already on 5432. In-compose services still use `postgres:5432`;
+      # only the host-run integration tests need this mapping (set WEIR_TEST_PG_URL to match).
+      - "127.0.0.1:${WEIR_PG_HOST_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U weir -d weir"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  # Dex — OIDC provider for the auth integration/e2e ([[WEIR-T-0088]]). Test-only.
+  dex:
+    image: dexidp/dex:v2.41.1
+    command: ["dex", "serve", "/etc/dex/config.yaml"]
+    volumes:
+      - ./dex.yaml:/etc/dex/config.yaml:ro
+    ports:
+      - "127.0.0.1:5557:5557"
+    healthcheck:
+      test:
+        - CMD
+        - wget
+        - -q
+        - -O
+        - /dev/null
+        - http://localhost:5557/dex/.well-known/openid-configuration
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # MinIO — an S3-compatible object store for the `s3` connector's integration test
+  # ([[WEIR-T-0109]]). Loopback-only; host port overridable to coexist. Test-only.
+  minio:
+    image: minio/minio:RELEASE.2024-09-13T20-26-02Z
+    command: ["server", "/data"]
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "127.0.0.1:${WEIR_MINIO_HOST_PORT:-9000}:9000"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # Seed the `weir-test` bucket with the NDJSON fixtures, then exit.
+  minio-seed:
+    image: minio/mc:RELEASE.2024-09-16T17-43-14Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    volumes:
+      - ./test-fixtures/s3:/fixtures:ro
+    entrypoint:
+      - /bin/sh
+      - -c
+      - >
+        mc alias set local http://minio:9000 minioadmin minioadmin &&
+        mc mb --ignore-existing local/weir-test &&
+        mc cp /fixtures/events.ndjson local/weir-test/events.ndjson &&
+        mc cp /fixtures/more.ndjson local/weir-test/more.ndjson &&
+        echo "seeded weir-test"
+
+  weir:
+    profiles: ["demo"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: weir:demo
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Postgres is the SoR; weir connects via libpq over the compose network.
+      WEIR_DB: "postgres://weir:weir@postgres:5432/weir"
+    ports:
+      - "8080:8080"

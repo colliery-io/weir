@@ -1,0 +1,91 @@
+site_name: weir
+site_description: An early-stage Rust project.
+site_url: https://colliery-io.github.io/weir
+repo_url: https://github.com/colliery-io/weir
+repo_name: colliery-io/weir
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: deep purple
+      accent: amber
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: deep purple
+      accent: amber
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.code.annotate
+  icon:
+    repo: fontawesome/brands/github
+
+plugins:
+  - search
+
+markdown_extensions:
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - admonition
+  - pymdownx.details
+  - attr_list
+  - md_in_html
+  - toc:
+      permalink: true
+      toc_depth: 3
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/colliery-io/weir
+
+# Docs are organised around Diátaxis (https://diataxis.fr): Tutorials (learning),
+# How-to guides (tasks), Reference (information), Explanation (understanding).
+nav:
+  - Home: index.md
+  - Tutorials:
+    - Your first sync: tutorials/first-sync.md
+  - How-to guides:
+    - Onboard a declarative connector: guides/onboard-manifest-connector.md
+    - Schedule syncs: guides/schedule-syncs.md
+    - Capture changes + propagate deletes: guides/cdc-deletes.md
+    - Secure the control plane: guides/secure-control-plane.md
+    - Manage tenants: guides/manage-tenants.md
+    - Deploy to Kubernetes: guides/deploy-kubernetes.md
+    - Map fields: guides/field-mapping.md
+    - Author a connector: guides/connector-authoring.md
+    - Soak testing: guides/soak-testing.md
+  - Reference:
+    - Installation: reference/installation.md
+    - CLI: reference/cli.md
+    - Connection config: reference/connection-config.md
+    - Connector contract: reference/connector-contract.md
+    - HTTP API: api/index.md
+  - Explanation:
+    - Architecture: explanation/architecture.md
+    - The connector model: explanation/connector-model.md
+    - Multi-tenancy: explanation/multi-tenancy.md
+    - Delivery guarantees: explanation/delivery-guarantees.md
+    - Typed schemas: explanation/typed-schemas.md
+    - Deployment topology: explanation/deployment.md

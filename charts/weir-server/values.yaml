@@ -1,0 +1,41 @@
+# weir control plane. Postgres is the SoR ([[WEIR-A-0009]]); the actuator provisions per-tenant
+# runner Deployments ([[WEIR-I-0018]]/[[WEIR-I-0021]]) that the leader-elected autoscaler scales.
+replicaCount: 1
+
+image:
+  repository: ghcr.io/colliery-io/weir
+  tag: latest
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 8080
+
+# The Postgres store URL (the SoR). Prefer wiring via an existing Secret in production.
+store:
+  url: "postgres://weir:weir@postgres:5432/weir"
+
+# Where the wasm connectors are staged in the image ([[WEIR-A-0030]]).
+connectorsDir: "/connectors"
+
+# OIDC login ([[WEIR-I-0017]]). clientSecret lands in the chart Secret.
+oidc:
+  enabled: false
+  issuer: ""
+  clientId: "weir"
+  clientSecret: ""
+
+# The weir-owned autoscaler ([[WEIR-T-0104]]). Disable to defer scaling to HPA/KEDA.
+autoscaler:
+  enabled: true
+  minReplicas: 0
+  maxReplicas: 8
+  perReplica: 20
+
+serviceAccount:
+  create: true
+  name: ""
+
+# RBAC so the actuator can manage runner Deployments in this namespace ([[WEIR-T-0103]]).
+rbac:
+  create: true

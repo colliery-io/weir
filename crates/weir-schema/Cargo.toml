@@ -1,0 +1,19 @@
+[package]
+name = "weir-schema"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Portable control-plane schema + migrations (diesel-dualdb), generated from logical DDL (WEIR-I-0013)."
+
+[dependencies]
+# The generated schema.rs uses diesel_dualdb portable sql_types (Uuid/Bytes/...);
+# the dispatched migration runner uses diesel's SimpleConnection.
+diesel = "2.3"
+diesel-dualdb = { version = "0.1", default-features = false, features = ["uuid"] }
+
+[dev-dependencies]
+# Dual-backend round-trip test (#[diesel_dualdb::test]) generates UUID keys.
+uuid = { version = "1", features = ["v4"] }

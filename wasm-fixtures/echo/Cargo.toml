@@ -1,0 +1,31 @@
+# Standalone (own [workspace]) so the parent weir workspace doesn't try to build
+# this wasm-only crate natively. A self-contained WASM echo connector that
+# proves the contract is authorable as a WASM component (WEIR-T-0002). The typed
+# types are defined locally (fidius_build::emit_wit only sees this crate's src);
+# the raw-path types + codec are reused from weir-connector-types.
+[workspace]
+
+[package]
+name = "weir-echo-wasm"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+fidius-guest = "0.5.4"
+fidius-macro = "0.5.4"
+wit-bindgen = "0.44"
+weir-connector-types = { path = "../../crates/weir-connector-types" }
+# Client-streamed `write` items cross as bincode → local RecordBatch needs serde.
+serde = { version = "1", features = ["derive"] }
+
+[build-dependencies]
+fidius-build = "0.5.4"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true

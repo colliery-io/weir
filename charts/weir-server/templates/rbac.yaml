@@ -1,0 +1,28 @@
+{{- if .Values.rbac.create -}}
+# The actuator ([[WEIR-T-0103]]) manages per-tenant weir-runner Deployments in this namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "weir-server.fullname" . }}-runner-manager
+  labels:
+    {{- include "weir-server.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "weir-server.fullname" . }}-runner-manager
+  labels:
+    {{- include "weir-server.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "weir-server.fullname" . }}-runner-manager
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "weir-server.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

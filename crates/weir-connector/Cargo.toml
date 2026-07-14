@@ -1,0 +1,26 @@
+[package]
+name = "weir-connector"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "The weir connector contract: the fidius Connector interface and its boundary types (WEIR-A-0014 / WEIR-S-0006)."
+
+[dependencies]
+fidius = "0.5.4"
+weir-connector-types = { path = "../weir-connector-types" }
+
+[features]
+# Downstream host applications enable this to get the generated typed client.
+host = ["fidius/host"]
+# Sandboxed WASM backend surface: load_wasm + the egress contract
+# (EgressPolicy/EgressDenied/http_types), reached via weir_connector::fidius.
+wasm = ["fidius/wasm"]
+# Server-streaming host surface (call_streaming / ChunkStream) for the v1
+# streaming `read` (WEIR-A-0029).
+streaming = ["fidius/streaming"]
+
+[dev-dependencies]
+serde_json = { workspace = true }
