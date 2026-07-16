@@ -27,6 +27,7 @@ fn airbyte_imports_to_the_runnable_rest_connector() {
             page_param,
             size_param,
             size,
+            ..
         } => {
             assert_eq!(page_param, "_page");
             assert_eq!(size_param, "_limit");
@@ -48,5 +49,86 @@ fn airbyte_imports_to_the_runnable_rest_connector() {
         gen_imported.file("src/lib.rs"),
         gen_reference.file("src/lib.rs"),
         "Airbyte→import→codegen must yield the exact connector rest.rs runs"
+    );
+}
+
+/// Body-injection fidelity ([[WEIR-T-0154]]): an Airbyte manifest whose paginator token
+/// and incremental lower bound inject into the POST body (`inject_into: body_json`,
+/// nested `field_path`) imports to exactly the weir manifest a connector author would
+/// hand-write with `inject_into: body`.
+#[test]
+fn airbyte_body_injection_imports_to_the_handwritten_manifest() {
+    let airbyte = r#"
+type: DeclarativeSource
+streams:
+  - type: DeclarativeStream
+    name: search
+    primary_key: id
+    retriever:
+      type: SimpleRetriever
+      requester:
+        type: HttpRequester
+        url_base: "https://api.notion.example"
+        path: "/v1/search"
+        http_method: POST
+        request_body_json:
+          filter: { property: object, value: page }
+      record_selector:
+        type: RecordSelector
+        extractor:
+          type: DpathExtractor
+          field_path: ["results"]
+      paginator:
+        type: DefaultPaginator
+        pagination_strategy:
+          type: CursorPagination
+          cursor_value: "{{ response['next_cursor'] }}"
+        page_token_option:
+          type: RequestOption
+          inject_into: body_json
+          field_name: start_cursor
+    incremental_sync:
+      type: DatetimeBasedCursor
+      cursor_field: last_edited_time
+      start_time_option:
+        type: RequestOption
+        inject_into: body_json
+        field_path: ["filter", "timestamp_after"]
+    schema_loader:
+      type: InlineSchemaLoader
+      schema:
+        type: object
+        properties:
+          id: { type: string }
+          last_edited_time: { type: string, format: date-time }
+"#;
+    let handwritten = r#"
+spec: { name: search-src }
+base_url: https://api.notion.example
+streams:
+  - name: search
+    path: /v1/search
+    primary_key: [id]
+    http_method: POST
+    request_body: '{"filter":{"property":"object","value":"page"}}'
+    record_selector: results
+    schema:
+      - { name: id, type: utf8, nullable: false }
+      - { name: last_edited_time, type: timestamp, nullable: false }
+    incremental:
+      cursor_field: last_edited_time
+      cursor_param: filter.timestamp_after
+      inject_into: body
+    pagination:
+      kind: cursor
+      cursor_path: next_cursor
+      token_param: start_cursor
+      inject_into: body
+"#;
+    let imported = import_yaml("search-src", airbyte).expect("import body-injected manifest");
+    let reference = Manifest::from_yaml(handwritten).expect("handwritten manifest");
+    assert_eq!(
+        imported, reference,
+        "Airbyte body_json injection must lower to the hand-written inject_into: body form"
     );
 }

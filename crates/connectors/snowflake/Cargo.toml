@@ -1,0 +1,41 @@
+# weir Snowflake destination connector ([[WEIR-T-0157]]) — a WASM component built for wasm32-wasip2.
+# Standalone workspace: built on its own for the wasm target, not a member of the
+# host weir workspace.
+[workspace]
+
+[package]
+name = "weir-snowflake-wasm"
+version = "0.0.1"
+edition = "2024"
+description = "weir snowflake connector (WASM component)."
+license = "Apache-2.0"
+repository = "https://github.com/colliery-io/weir"
+homepage = "https://github.com/colliery-io/weir"
+keywords = ["weir", "connector", "etl", "http"]
+categories = ["wasm", "web-programming"]
+readme = "README.md"
+
+# weir ingress reads this to stage the package with the right host capabilities.
+[package.metadata.weir]
+capabilities = ["http"]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+fidius-guest = "0.5.4"
+fidius-macro = "0.5.4"
+wit-bindgen = "0.44"
+# Fidius-free serde types + codec, shared with the host (the configured Config wire
+# + the raw `write` envelope). `path` for local dev; `version` for crates.io publish.
+weir-connector-types = { path = "../../weir-connector-types", version = "0.0.1" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[build-dependencies]
+fidius-build = "0.5.4"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true

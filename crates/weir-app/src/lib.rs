@@ -1479,7 +1479,13 @@ fn manifest_stream_to_config(m: &weir_manifest::Manifest, stream: &str) -> serde
         }
         if let Some(inc) = &s.incremental {
             cfg.insert("cursor_field".to_string(), inc.cursor_field.clone().into());
-            cfg.insert("cursor_param".to_string(), inc.cursor_param.clone().into());
+            // Empty = track-only ([[WEIR-T-0159]]): checkpoint advances, nothing injected.
+            if !inc.cursor_param.is_empty() {
+                cfg.insert("cursor_param".to_string(), inc.cursor_param.clone().into());
+            }
+            if let Some(vp) = &inc.cursor_value_path {
+                cfg.insert("cursor_value_path".to_string(), vp.clone().into());
+            }
             if let Some(sv) = &inc.start_value {
                 cfg.insert("cursor_start".to_string(), sv.clone().into());
             }
@@ -1487,32 +1493,49 @@ fn manifest_stream_to_config(m: &weir_manifest::Manifest, stream: &str) -> serde
                 cfg.insert("cursor_end_param".to_string(), ep.clone().into());
                 cfg.insert("cursor_end".to_string(), ev.clone().into());
             }
+            // Body-injected cursor params ([[WEIR-T-0154]]): the param names are dot-paths
+            // into the POST body; the runtime overlays them per request.
+            if inc.inject_into == weir_manifest::InjectInto::Body {
+                cfg.insert("cursor_inject_into".to_string(), "body".into());
+            }
         }
+        let page_inject = |cfg: &mut serde_json::Map<String, serde_json::Value>,
+                           inject: &weir_manifest::InjectInto| {
+            if *inject == weir_manifest::InjectInto::Body {
+                cfg.insert("page_inject_into".to_string(), "body".into());
+            }
+        };
         match &s.pagination {
             Some(Pagination::Page {
                 page_param,
                 size_param,
                 size,
+                inject_into,
             }) => {
                 cfg.insert("page_param".to_string(), page_param.clone().into());
                 cfg.insert("page_size_param".to_string(), size_param.clone().into());
                 cfg.insert("page_size".to_string(), (*size).into());
+                page_inject(&mut cfg, inject_into);
             }
             Some(Pagination::Offset {
                 offset_param,
                 limit_param,
                 size,
+                inject_into,
             }) => {
                 cfg.insert("offset_param".to_string(), offset_param.clone().into());
                 cfg.insert("page_size_param".to_string(), limit_param.clone().into());
                 cfg.insert("page_size".to_string(), (*size).into());
+                page_inject(&mut cfg, inject_into);
             }
             Some(Pagination::Cursor {
                 cursor_path,
                 token_param,
+                inject_into,
             }) => {
                 cfg.insert("page_cursor_path".to_string(), cursor_path.clone().into());
                 cfg.insert("page_cursor_param".to_string(), token_param.clone().into());
+                page_inject(&mut cfg, inject_into);
             }
             Some(Pagination::LinkHeader) => {
                 cfg.insert("page_link_header".to_string(), true.into());
@@ -1550,6 +1573,10 @@ fn manifest_stream_to_config(m: &weir_manifest::Manifest, stream: &str) -> serde
                 }
             }
             None => {}
+        }
+        // Header-row response shape ([[WEIR-T-0160]]): zip row-arrays into objects.
+        if s.header_row {
+            cfg.insert("header_row".to_string(), true.into());
         }
         // Request options ([[WEIR-T-0068]]): method / POST body / static headers.
         if let Some(m) = &s.http_method {
@@ -1659,6 +1686,35 @@ fn manifest_stream_to_config(m: &weir_manifest::Manifest, stream: &str) -> serde
                 password_key.clone().into(),
             );
         }
+        // Google service-account ([[WEIR-T-0155]]): non-secret metadata only — the SA
+        // JSON key itself comes from the connection config and is stripped host-side.
+        Auth::GoogleServiceAccount { key_key, scopes } => {
+            cfg.insert("auth_scheme".to_string(), "google_service_account".into());
+            cfg.insert("google_sa_key_key".to_string(), key_key.clone().into());
+            cfg.insert(
+                "google_scopes".to_string(),
+                serde_json::Value::Array(scopes.iter().map(|s| s.clone().into()).collect()),
+            );
+        }
+        // Snowflake key-pair JWT ([[WEIR-T-0156]]): key names only — the values come from
+        // the connection config; only the private key is stripped host-side (account/user
+        // stay for `{{ config['account'] }}` url_base templating).
+        Auth::SnowflakeKeypairJwt {
+            account_key,
+            user_key,
+            private_key_key,
+        } => {
+            cfg.insert("auth_scheme".to_string(), "snowflake_keypair_jwt".into());
+            cfg.insert(
+                "snowflake_account_key".to_string(),
+                account_key.clone().into(),
+            );
+            cfg.insert("snowflake_user_key".to_string(), user_key.clone().into());
+            cfg.insert(
+                "snowflake_private_key_key".to_string(),
+                private_key_key.clone().into(),
+            );
+        }
         Auth::None => {}
     }
     serde_json::Value::Object(cfg)
@@ -1753,6 +1809,32 @@ pub fn dest_object_to_config(
                     serde_json::Value::Array(scopes.iter().map(|s| s.clone().into()).collect()),
                 );
             }
+        }
+        // Google service-account ([[WEIR-T-0155]]) — mirrors the source emission.
+        Auth::GoogleServiceAccount { key_key, scopes } => {
+            cfg.insert("auth_scheme".to_string(), "google_service_account".into());
+            cfg.insert("google_sa_key_key".to_string(), key_key.clone().into());
+            cfg.insert(
+                "google_scopes".to_string(),
+                serde_json::Value::Array(scopes.iter().map(|s| s.clone().into()).collect()),
+            );
+        }
+        // Snowflake key-pair JWT ([[WEIR-T-0156]]) — mirrors the source emission.
+        Auth::SnowflakeKeypairJwt {
+            account_key,
+            user_key,
+            private_key_key,
+        } => {
+            cfg.insert("auth_scheme".to_string(), "snowflake_keypair_jwt".into());
+            cfg.insert(
+                "snowflake_account_key".to_string(),
+                account_key.clone().into(),
+            );
+            cfg.insert("snowflake_user_key".to_string(), user_key.clone().into());
+            cfg.insert(
+                "snowflake_private_key_key".to_string(),
+                private_key_key.clone().into(),
+            );
         }
         _ => {}
     }
@@ -2213,6 +2295,83 @@ streams:
         let none = weir_importer::import_yaml("ex", &authed_manifest("")).expect("import no-auth");
         let cfg = manifest_stream_to_config(&none, "things");
         assert!(cfg.get("auth_scheme").is_none());
+
+        // Google service account ([[WEIR-T-0155]]): scheme + key-key + scopes are baked;
+        // the SA JSON itself comes from the connection config and is never in the base.
+        let google = weir_importer::import_yaml(
+            "ex",
+            &authed_manifest(
+                "        authenticator:\n          type: GoogleServiceAccountAuthenticator\n          service_account_key: \"{{ config['service_account_key'] }}\"\n          scopes:\n            - \"https://www.googleapis.com/auth/analytics.readonly\"",
+            ),
+        )
+        .expect("import google-sa manifest");
+        let cfg = manifest_stream_to_config(&google, "things");
+        assert_eq!(cfg["auth_scheme"], "google_service_account");
+        assert_eq!(cfg["google_sa_key_key"], "service_account_key");
+        assert_eq!(
+            cfg["google_scopes"][0],
+            "https://www.googleapis.com/auth/analytics.readonly"
+        );
+        assert!(cfg.get("service_account_key").is_none());
+
+        // Snowflake key-pair JWT ([[WEIR-T-0156]]): scheme + the three key names baked;
+        // no key material in the base config.
+        let snowflake = weir_importer::import_yaml(
+            "ex",
+            &authed_manifest(
+                "        authenticator:\n          type: SnowflakeKeypairAuthenticator\n          account: \"{{ config['account'] }}\"\n          user: \"{{ config['user'] }}\"\n          private_key: \"{{ config['private_key'] }}\"",
+            ),
+        )
+        .expect("import snowflake manifest");
+        let cfg = manifest_stream_to_config(&snowflake, "things");
+        assert_eq!(cfg["auth_scheme"], "snowflake_keypair_jwt");
+        assert_eq!(cfg["snowflake_account_key"], "account");
+        assert_eq!(cfg["snowflake_user_key"], "user");
+        assert_eq!(cfg["snowflake_private_key_key"], "private_key");
+        assert!(cfg.get("private_key").is_none());
+    }
+
+    /// Body-injected pagination/cursor params ([[WEIR-T-0154]]) bake the
+    /// `page_inject_into` / `cursor_inject_into` flags into the rest config; query-mode
+    /// manifests bake neither (the runtime default).
+    #[test]
+    fn manifest_body_injection_maps_to_rest_config() {
+        let m = weir_manifest::Manifest::from_yaml(
+            r#"
+spec: { name: notionish }
+base_url: https://api.example.com
+streams:
+  - name: search
+    path: /v1/search
+    http_method: POST
+    request_body: '{"filter":{"property":"object","value":"page"}}'
+    schema:
+      - { name: id, type: utf8 }
+      - { name: last_edited_time, type: timestamp }
+    incremental:
+      cursor_field: last_edited_time
+      cursor_param: filter.timestamp_after
+      inject_into: body
+    pagination:
+      kind: cursor
+      cursor_path: next_cursor
+      token_param: start_cursor
+      inject_into: body
+"#,
+        )
+        .expect("parse");
+        let cfg = manifest_stream_to_config(&m, "search");
+        assert_eq!(cfg["page_inject_into"], "body");
+        assert_eq!(cfg["cursor_inject_into"], "body");
+        assert_eq!(cfg["page_cursor_param"], "start_cursor");
+        assert_eq!(cfg["cursor_param"], "filter.timestamp_after");
+        assert_eq!(cfg["http_method"], "POST");
+
+        // Query-mode manifests (the default) bake no inject flags.
+        let plain = weir_importer::import_yaml("ex", &authed_manifest("")).expect("import");
+        let cfg = manifest_stream_to_config(&plain, "things");
+        assert!(cfg.get("page_inject_into").is_none());
+        assert!(cfg.get("cursor_inject_into").is_none());
     }
 
     /// CursorPagination maps to the rest config's `page_cursor_path` (dot-path extracted

@@ -29,6 +29,10 @@ base64 = "0.22"
 sha2 = "0.10"
 hmac = "0.12"
 hex = "0.4"
+# RS256 signing for the Google service-account JWT-bearer grant ([[WEIR-T-0155]]) —
+# already in the tree via rustls; the host signs the assertion so the SA key never
+# enters the guest.
+ring = "0.17"
 
 [dev-dependencies]
 weir-wasm-testkit = { path = "../weir-wasm-testkit" }

@@ -43,3 +43,5 @@ weir-wasm-testkit = { path = "../weir-wasm-testkit" }
 # Reverse-ETL wire tests ([[WEIR-T-0074]]): load wasm guests with a host egress policy.
 weir-runtime = { path = "../weir-runtime" }
 tempfile = "3"
+# Drive the streaming read in the live snowflake read-back ([[WEIR-T-0157]]).
+futures = "0.3"

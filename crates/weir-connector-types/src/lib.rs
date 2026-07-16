@@ -9,6 +9,8 @@
 //! WASM guest can project them to WIT (WEIR-T-0002/0003).
 
 pub mod error;
+pub mod mssql;
+pub mod snowflake;
 pub mod types;
 
 pub use error::{ConnectorError, ErrorKind};

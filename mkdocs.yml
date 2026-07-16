@@ -76,6 +76,7 @@ nav:
     - Map fields: guides/field-mapping.md
     - Author a connector: guides/connector-authoring.md
     - Soak testing: guides/soak-testing.md
+    - Demo pipelines: guides/demo-pipelines.md
   - Reference:
     - Installation: reference/installation.md
     - CLI: reference/cli.md

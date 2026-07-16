@@ -11,8 +11,8 @@ use std::collections::BTreeMap;
 use serde::Deserialize;
 use weir_connector_types::{CompareOp, ComputeExpr, MappingOp, MappingSpec};
 use weir_manifest::{
-    ArrowType, Auth, Field, Incremental, Manifest, ManifestError, OAuthGrant, Pagination,
-    PartitionRouter, Spec, Stream,
+    ArrowType, Auth, Field, Incremental, InjectInto, Manifest, ManifestError, OAuthGrant,
+    Pagination, PartitionRouter, Spec, Stream,
 };
 
 /// Errors importing an Airbyte manifest.
@@ -40,6 +40,10 @@ struct DeclarativeStream {
     retriever: Retriever,
     #[serde(default)]
     primary_key: PrimaryKey,
+    /// weir extension ([[WEIR-T-0160]]): the records array is row-arrays whose first
+    /// row is a header — the runtime zips the rest into objects.
+    #[serde(default)]
+    header_row: bool,
     #[serde(default)]
     incremental_sync: Option<IncrementalSync>,
     #[serde(default)]
@@ -192,6 +196,25 @@ enum Authenticator {
         #[serde(default)]
         password: String,
     },
+    /// weir extension ([[WEIR-T-0155]]) — Google service-account JWT-bearer grant, minted
+    /// host-side. `service_account_key` is a `{{ config['…'] }}` ref naming the connection-
+    /// config key holding the **whole SA JSON key**; the key never enters the guest.
+    GoogleServiceAccountAuthenticator {
+        #[serde(default)]
+        service_account_key: String,
+        #[serde(default)]
+        scopes: Vec<String>,
+    },
+    /// weir extension ([[WEIR-T-0156]]) — Snowflake key-pair JWT, self-signed host-side.
+    /// All three fields are `{{ config['…'] }}` refs; only the private key is a secret.
+    SnowflakeKeypairAuthenticator {
+        #[serde(default)]
+        account: String,
+        #[serde(default)]
+        user: String,
+        #[serde(default)]
+        private_key: String,
+    },
     #[serde(other)]
     Other,
 }
@@ -271,6 +294,27 @@ enum PaginationStrategy {
 struct RequestOption {
     #[serde(default)]
     field_name: Option<String>,
+    /// Nested body injection names the target as a path (`field_path: [filter, ts]`).
+    #[serde(default)]
+    field_path: Vec<String>,
+    /// `request_parameter` (default) | `header` | `body_json` | `body_data` — where the
+    /// param goes ([[WEIR-T-0154]]). `body_json`/`body_data` lower to `inject_into: body`.
+    #[serde(default)]
+    inject_into: Option<String>,
+}
+
+/// A [`RequestOption`]'s param name (`field_name`, or dotted `field_path` for nested body
+/// injection) and whether it targets the request body.
+fn option_param(o: &RequestOption) -> (Option<String>, bool) {
+    let name = o
+        .field_name
+        .clone()
+        .or_else(|| (!o.field_path.is_empty()).then(|| o.field_path.join(".")));
+    let body = matches!(
+        o.inject_into.as_deref(),
+        Some("body_json") | Some("body_data")
+    );
+    (name, body)
 }
 
 #[derive(Debug, Deserialize)]
@@ -278,10 +322,11 @@ struct RequestOption {
 enum IncrementalSync {
     DatetimeBasedCursor {
         cursor_field: String,
+        // Boxed to keep the enum variant small (clippy `large_enum_variant`).
         #[serde(default)]
-        start_time_option: Option<RequestOption>,
+        start_time_option: Option<Box<RequestOption>>,
         #[serde(default)]
-        end_time_option: Option<RequestOption>,
+        end_time_option: Option<Box<RequestOption>>,
         /// A literal / `{{ config[...] }}` string, or a `MinMaxDatetime` object with a
         /// `datetime` field. Kept as a raw value so unexpected shapes don't fail the parse;
         /// boxed to keep the enum variant small (clippy `large_enum_variant`).
@@ -289,6 +334,14 @@ enum IncrementalSync {
         start_datetime: Option<Box<serde_yaml::Value>>,
         #[serde(default)]
         end_datetime: Option<Box<serde_yaml::Value>>,
+        /// weir extension ([[WEIR-T-0159]]): raw-record dot-path the cursor value is
+        /// extracted from (columnar responses), when it differs from `cursor_field`.
+        #[serde(default)]
+        cursor_value_path: Option<String>,
+        /// weir extension ([[WEIR-T-0159]]): track-only cursor — checkpoint advances but
+        /// nothing is injected into the request (APIs that restate history, e.g. GA4).
+        #[serde(default)]
+        track_only: bool,
     },
     #[serde(other)]
     Other,
@@ -433,6 +486,22 @@ pub fn to_weir_manifest(name: &str, airbyte: &AirbyteManifest) -> Result<Manifes
             username_key: cfg_key_ref(username, "username"),
             password_key: cfg_key_ref(password, "password"),
         },
+        Some(Authenticator::GoogleServiceAccountAuthenticator {
+            service_account_key,
+            scopes,
+        }) => Auth::GoogleServiceAccount {
+            key_key: cfg_key_ref(service_account_key, "service_account_key"),
+            scopes: scopes.clone(),
+        },
+        Some(Authenticator::SnowflakeKeypairAuthenticator {
+            account,
+            user,
+            private_key,
+        }) => Auth::SnowflakeKeypairJwt {
+            account_key: cfg_key_ref(account, "account"),
+            user_key: cfg_key_ref(user, "user"),
+            private_key_key: cfg_key_ref(private_key, "private_key"),
+        },
         _ => Auth::None,
     };
 
@@ -451,16 +520,37 @@ pub fn to_weir_manifest(name: &str, airbyte: &AirbyteManifest) -> Result<Manifes
                 end_time_option,
                 start_datetime,
                 end_datetime,
-            }) => Some(Incremental {
-                cursor_field: cursor_field.clone(),
-                cursor_param: start_time_option
-                    .as_ref()
-                    .and_then(|o| o.field_name.clone())
-                    .unwrap_or_else(|| cursor_field.clone()),
-                start_value: start_datetime.as_ref().and_then(|v| datetime_str(v)),
-                end_param: end_time_option.as_ref().and_then(|o| o.field_name.clone()),
-                end_value: end_datetime.as_ref().and_then(|v| datetime_str(v)),
-            }),
+                cursor_value_path,
+                track_only,
+            }) => {
+                let (cursor_param, start_body) = start_time_option
+                    .as_deref()
+                    .map(option_param)
+                    .unwrap_or((None, false));
+                let (end_param, end_body) = end_time_option
+                    .as_deref()
+                    .map(option_param)
+                    .unwrap_or((None, false));
+                Some(Incremental {
+                    cursor_field: cursor_field.clone(),
+                    // Track-only ([[WEIR-T-0159]]): checkpoint advances, nothing injected.
+                    cursor_param: if *track_only {
+                        String::new()
+                    } else {
+                        cursor_param.unwrap_or_else(|| cursor_field.clone())
+                    },
+                    cursor_value_path: cursor_value_path.clone(),
+                    start_value: start_datetime.as_ref().and_then(|v| datetime_str(v)),
+                    end_param,
+                    end_value: end_datetime.as_ref().and_then(|v| datetime_str(v)),
+                    // Either bound asking for the body puts the pair there ([[WEIR-T-0154]]).
+                    inject_into: if start_body || end_body {
+                        InjectInto::Body
+                    } else {
+                        InjectInto::Query
+                    },
+                })
+            }
             _ => None,
         };
 
@@ -498,6 +588,7 @@ pub fn to_weir_manifest(name: &str, airbyte: &AirbyteManifest) -> Result<Manifes
                 .partition_router
                 .as_ref()
                 .and_then(map_partition_router),
+            header_row: s.header_row,
             http_method: req.http_method.clone(),
             // `request_body_json` (an object) → the POST body as a JSON string.
             request_body: req
@@ -572,7 +663,9 @@ pub fn analyze(yaml: &str) -> ImportReport {
             | Some(Authenticator::ApiKeyAuthenticator { .. })
             | Some(Authenticator::OAuthAuthenticator { .. })
             | Some(Authenticator::SessionTokenAuthenticator { .. })
-            | Some(Authenticator::BasicHttpAuthenticator { .. }) => {}
+            | Some(Authenticator::BasicHttpAuthenticator { .. })
+            | Some(Authenticator::GoogleServiceAccountAuthenticator { .. })
+            | Some(Authenticator::SnowflakeKeypairAuthenticator { .. }) => {}
             Some(Authenticator::Other) => {
                 unsupported.push(format!("{}: unsupported authenticator", s.name))
             }
@@ -780,22 +873,33 @@ fn map_transforms(s: &DeclarativeStream) -> MappingSpec {
     MappingSpec { ops }
 }
 
-/// A **lone** field reference `record['x']` / `record["x"]` / `record.x` → `x`. Rejects
-/// anything that isn't a clean identifier (so compound expressions parse to `None`, not junk).
+/// A **lone** field reference — `record['x']` / `record["x"]` / `record.x`, or a
+/// **chained accessor** into nested values ([[WEIR-T-0159]]):
+/// `record['dimensionValues'][0]['value']` → the dot-path `dimensionValues.0.value`
+/// (numeric segments index arrays in the engine's mapping stage). Rejects anything
+/// that isn't a clean accessor chain (compound expressions parse to `None`, not junk).
 fn record_field(s: &str) -> Option<String> {
-    let rest = s.trim().strip_prefix("record")?.trim();
-    let field = if let Some(b) = rest.strip_prefix('[') {
-        // Must be the whole `[...]` — nothing trailing (else it's a larger expression).
-        b.strip_suffix(']')?
-            .trim()
-            .trim_matches(|c| c == '\'' || c == '"')
-            .to_string()
-    } else if let Some(f) = rest.strip_prefix('.') {
-        f.trim().to_string()
-    } else {
-        return None;
-    };
-    (!field.is_empty() && field.chars().all(|c| c.is_alphanumeric() || c == '_')).then_some(field)
+    let mut rest = s.trim().strip_prefix("record")?.trim();
+    let mut segs: Vec<String> = Vec::new();
+    while !rest.is_empty() {
+        if let Some(b) = rest.strip_prefix('[') {
+            let end = b.find(']')?;
+            let seg = b[..end].trim().trim_matches(|c| c == '\'' || c == '"');
+            segs.push(seg.to_string());
+            rest = b[end + 1..].trim_start();
+        } else if let Some(f) = rest.strip_prefix('.') {
+            // Dotted tail: `record.a.b` — the remainder is the whole (dot-joined) path.
+            segs.extend(f.trim().split('.').map(str::to_string));
+            rest = "";
+        } else {
+            return None; // trailing junk → a larger expression, not a lone reference
+        }
+    }
+    let clean = !segs.is_empty()
+        && segs
+            .iter()
+            .all(|f| !f.is_empty() && f.chars().all(|c| c.is_alphanumeric() || c == '_'));
+    clean.then(|| segs.join("."))
 }
 
 /// An `AddFields` value → a bounded compute expr: a literal (`Const`) or a single record
@@ -866,20 +970,33 @@ fn map_paginator(p: &Option<Paginator>) -> Option<Pagination> {
     else {
         return None;
     };
-    let page_param = page_token_option
+    let (page_param, token_body) = page_token_option
         .as_ref()
-        .and_then(|o| o.field_name.clone());
-    let size_param = page_size_option.as_ref().and_then(|o| o.field_name.clone());
+        .map(option_param)
+        .unwrap_or((None, false));
+    let (size_param, size_body) = page_size_option
+        .as_ref()
+        .map(option_param)
+        .unwrap_or((None, false));
+    // Either option asking for the body puts the pair there ([[WEIR-T-0154]]) — in
+    // practice APIs carry both in the same place.
+    let inject_into = if token_body || size_body {
+        InjectInto::Body
+    } else {
+        InjectInto::Query
+    };
     match pagination_strategy {
         PaginationStrategy::PageIncrement { page_size } => Some(Pagination::Page {
             page_param: page_param.unwrap_or_else(|| "page".into()),
             size_param: size_param.unwrap_or_else(|| "page_size".into()),
             size: page_size.unwrap_or(50),
+            inject_into,
         }),
         PaginationStrategy::OffsetIncrement { page_size } => Some(Pagination::Offset {
             offset_param: page_param.unwrap_or_else(|| "offset".into()),
             limit_param: size_param.unwrap_or_else(|| "limit".into()),
             size: page_size.unwrap_or(50),
+            inject_into,
         }),
         PaginationStrategy::CursorPagination { cursor_value } => {
             // Link-header form: the cursor references the response `Link` header (rel="next"),
@@ -891,6 +1008,7 @@ fn map_paginator(p: &Option<Paginator>) -> Option<Pagination> {
                 Some(Pagination::Cursor {
                     cursor_path: response_path(cursor_value),
                     token_param: page_param.unwrap_or_else(|| "cursor".into()),
+                    inject_into,
                 })
             }
         }
@@ -1069,6 +1187,7 @@ streams:
                 page_param,
                 size_param,
                 size,
+                ..
             } => {
                 assert_eq!(page_param, "_page");
                 assert_eq!(size_param, "_limit");
@@ -1385,6 +1504,270 @@ streams:
             s.request_headers,
             vec![("Notion-Version".to_string(), "2022-06-28".to_string())]
         );
+    }
+
+    /// The weir `GoogleServiceAccountAuthenticator` extension ([[WEIR-T-0155]]) lowers to
+    /// `Auth::GoogleServiceAccount` — config-key ref preserved, scopes carried.
+    #[test]
+    fn imports_google_service_account_authenticator() {
+        let yaml = r#"
+type: DeclarativeSource
+streams:
+  - type: DeclarativeStream
+    name: reports
+    retriever:
+      type: SimpleRetriever
+      requester:
+        type: HttpRequester
+        url_base: "https://analyticsdata.googleapis.com"
+        path: "/v1beta/properties/123:runReport"
+        authenticator:
+          type: GoogleServiceAccountAuthenticator
+          service_account_key: "{{ config['sa_json'] }}"
+          scopes:
+            - "https://www.googleapis.com/auth/analytics.readonly"
+      record_selector:
+        type: RecordSelector
+        extractor:
+          type: DpathExtractor
+          field_path: ["rows"]
+    schema_loader:
+      type: InlineSchemaLoader
+      schema:
+        type: object
+        properties:
+          date: { type: string }
+"#;
+        let m = import_yaml("ga4ish", yaml).expect("import");
+        assert_eq!(
+            m.auth,
+            Auth::GoogleServiceAccount {
+                key_key: "sa_json".into(),
+                scopes: vec!["https://www.googleapis.com/auth/analytics.readonly".into()],
+            }
+        );
+    }
+
+    /// The `header_row` stream extension ([[WEIR-T-0160]]) carries through to the weir
+    /// manifest (Google Sheets shape).
+    #[test]
+    fn imports_header_row_stream() {
+        let yaml = r#"
+type: DeclarativeSource
+streams:
+  - type: DeclarativeStream
+    name: rows
+    header_row: true
+    retriever:
+      type: SimpleRetriever
+      requester:
+        type: HttpRequester
+        url_base: "https://sheets.googleapis.com"
+        path: "/v4/spreadsheets/{{ config['spreadsheet_id'] }}/values/{{ config['tab'] }}"
+        authenticator:
+          type: GoogleServiceAccountAuthenticator
+          service_account_key: "{{ config['service_account_key'] }}"
+          scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+      record_selector:
+        type: RecordSelector
+        extractor:
+          type: DpathExtractor
+          field_path: ["values"]
+    schema_loader:
+      type: InlineSchemaLoader
+      schema:
+        type: object
+        properties:
+          _row: { type: integer }
+"#;
+        let m = import_yaml("sheetsish", yaml).expect("import");
+        assert!(m.streams[0].header_row, "header_row carried through");
+        assert_eq!(
+            m.auth,
+            Auth::GoogleServiceAccount {
+                key_key: "service_account_key".into(),
+                scopes: vec!["https://www.googleapis.com/auth/spreadsheets.readonly".into()],
+            }
+        );
+    }
+
+    /// Chained record accessors ([[WEIR-T-0159]]) lower to dot-paths, and the
+    /// `cursor_value_path`/`track_only` extensions land on the Incremental block —
+    /// the GA4 columnar shape end-to-end at the import layer.
+    #[test]
+    fn imports_ga4_columnar_constructs() {
+        // Chained accessor forms → dot-paths; junk stays rejected.
+        assert_eq!(
+            record_field("record['dimensionValues'][0]['value']").as_deref(),
+            Some("dimensionValues.0.value")
+        );
+        assert_eq!(record_field("record.a.b").as_deref(), Some("a.b"));
+        assert_eq!(record_field("record['a'] ~ 'x'"), None);
+
+        let yaml = r#"
+type: DeclarativeSource
+streams:
+  - type: DeclarativeStream
+    name: traffic
+    retriever:
+      type: SimpleRetriever
+      requester:
+        type: HttpRequester
+        url_base: "https://analyticsdata.googleapis.com"
+        path: "/v1beta/properties/{{ config['property_id'] }}:runReport"
+        http_method: POST
+        request_body_json:
+          dateRanges:
+            - startDate: "{{ config['start_date'] }}"
+              endDate: today
+      record_selector:
+        type: RecordSelector
+        extractor:
+          type: DpathExtractor
+          field_path: ["rows"]
+    incremental_sync:
+      type: DatetimeBasedCursor
+      cursor_field: date
+      cursor_value_path: dimensionValues.0.value
+      track_only: true
+    transformations:
+      - type: AddFields
+        fields:
+          - path: [date]
+            value: "{{ record['dimensionValues'][0]['value'] }}"
+    schema_loader:
+      type: InlineSchemaLoader
+      schema:
+        type: object
+        properties:
+          date: { type: string }
+"#;
+        let m = import_yaml("ga4ish", yaml).expect("import");
+        let inc = m.streams[0].incremental.as_ref().expect("incremental");
+        assert_eq!(inc.cursor_field, "date");
+        assert_eq!(inc.cursor_param, "", "track-only: nothing injected");
+        assert_eq!(
+            inc.cursor_value_path.as_deref(),
+            Some("dimensionValues.0.value")
+        );
+        assert!(
+            m.streams[0].mapping.ops.iter().any(|op| matches!(
+                op,
+                MappingOp::Compute { field, value: ComputeExpr::Field(p) }
+                    if field == "date" && p == "dimensionValues.0.value"
+            )),
+            "AddFields chained accessor lowered to a dot-path Compute"
+        );
+    }
+
+    /// The weir `SnowflakeKeypairAuthenticator` extension ([[WEIR-T-0156]]) lowers to
+    /// `Auth::SnowflakeKeypairJwt` with the three config-key refs preserved.
+    #[test]
+    fn imports_snowflake_keypair_authenticator() {
+        let yaml = r#"
+type: DeclarativeSource
+streams:
+  - type: DeclarativeStream
+    name: rows
+    retriever:
+      type: SimpleRetriever
+      requester:
+        type: HttpRequester
+        url_base: "https://{{ config['account'] }}.snowflakecomputing.com"
+        path: "/api/v2/statements"
+        authenticator:
+          type: SnowflakeKeypairAuthenticator
+          account: "{{ config['account'] }}"
+          user: "{{ config['user'] }}"
+          private_key: "{{ config['private_key'] }}"
+      record_selector:
+        type: RecordSelector
+        extractor:
+          type: DpathExtractor
+          field_path: ["data"]
+    schema_loader:
+      type: InlineSchemaLoader
+      schema:
+        type: object
+        properties:
+          id: { type: string }
+"#;
+        let m = import_yaml("snowish", yaml).expect("import");
+        assert_eq!(
+            m.auth,
+            Auth::SnowflakeKeypairJwt {
+                account_key: "account".into(),
+                user_key: "user".into(),
+                private_key_key: "private_key".into(),
+            }
+        );
+    }
+
+    /// Airbyte `inject_into: body_json` on paginator + incremental options lowers to
+    /// `InjectInto::Body`, with `field_path` joined as the dot-path ([[WEIR-T-0154]]).
+    /// This was previously a silent mis-lowering (treated as query params).
+    #[test]
+    fn imports_body_json_injection() {
+        let yaml = r#"
+type: DeclarativeSource
+streams:
+  - type: DeclarativeStream
+    name: search
+    retriever:
+      type: SimpleRetriever
+      requester:
+        type: HttpRequester
+        url_base: "https://api.notion.example"
+        path: "/v1/search"
+        http_method: POST
+        request_body_json:
+          filter: { property: object, value: page }
+      record_selector:
+        type: RecordSelector
+        extractor:
+          type: DpathExtractor
+          field_path: ["results"]
+      paginator:
+        type: DefaultPaginator
+        pagination_strategy:
+          type: CursorPagination
+          cursor_value: "{{ response['next_cursor'] }}"
+        page_token_option:
+          type: RequestOption
+          inject_into: body_json
+          field_name: start_cursor
+    incremental_sync:
+      type: DatetimeBasedCursor
+      cursor_field: last_edited_time
+      start_time_option:
+        type: RequestOption
+        inject_into: body_json
+        field_path: ["filter", "timestamp_after"]
+    schema_loader:
+      type: InlineSchemaLoader
+      schema:
+        type: object
+        properties:
+          id: { type: string }
+          last_edited_time: { type: string, format: date-time }
+"#;
+        let m = import_yaml("notionish", yaml).expect("import");
+        let s = &m.streams[0];
+        match s.pagination.as_ref().expect("pagination") {
+            Pagination::Cursor {
+                cursor_path,
+                token_param,
+                inject_into,
+            } => {
+                assert_eq!(cursor_path, "next_cursor");
+                assert_eq!(token_param, "start_cursor");
+                assert_eq!(*inject_into, InjectInto::Body);
+            }
+            other => panic!("expected cursor pagination, got {other:?}"),
+        }
+        let inc = s.incremental.as_ref().expect("incremental");
+        assert_eq!(inc.cursor_param, "filter.timestamp_after");
+        assert_eq!(inc.inject_into, InjectInto::Body);
     }
 
     #[test]

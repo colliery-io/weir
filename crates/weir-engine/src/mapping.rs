@@ -191,7 +191,7 @@ fn as_f64(v: &Value) -> Option<f64> {
 }
 
 fn eval_compute(expr: &ComputeExpr, obj: &Map<String, Value>) -> String {
-    let field = |f: &str| obj.get(f).map(as_str).unwrap_or_default();
+    let field = |f: &str| lookup_path(obj, f).map(as_str).unwrap_or_default();
     match expr {
         ComputeExpr::Const(s) => s.clone(),
         ComputeExpr::Field(f) => field(f),
@@ -199,6 +199,22 @@ fn eval_compute(expr: &ComputeExpr, obj: &Map<String, Value>) -> String {
         ComputeExpr::Lower(f) => field(f).to_lowercase(),
         ComputeExpr::Upper(f) => field(f).to_uppercase(),
     }
+}
+
+/// Resolve a compute field reference: a plain name, or a **dot-path** into nested
+/// values ([[WEIR-T-0159]]) where a numeric segment indexes an array —
+/// `dimensionValues.0.value` reaches `{"dimensionValues": [{"value": …}]}`. This is
+/// what lets a mapping flatten columnar API responses (GA4-style) without a new op.
+fn lookup_path<'a>(obj: &'a Map<String, Value>, path: &str) -> Option<&'a Value> {
+    let mut segs = path.split('.');
+    let mut cur = obj.get(segs.next()?)?;
+    for seg in segs {
+        cur = match (cur, seg.parse::<usize>()) {
+            (Value::Array(a), Ok(i)) => a.get(i)?,
+            (v, _) => v.get(seg)?,
+        };
+    }
+    Some(cur)
 }
 
 #[cfg(test)]
@@ -538,5 +554,49 @@ mod tests {
             rec("[1,2,3]"),
         ));
         assert_eq!(v, rec("[1,2,3]"));
+    }
+
+    /// Dot-path Compute ([[WEIR-T-0159]]): flatten a GA4-style columnar record —
+    /// numeric segments index arrays; flat names still work; missing paths → empty.
+    #[test]
+    fn compute_field_resolves_dot_paths() {
+        let columnar = rec(
+            r#"{"dimensionValues":[{"value":"20260701"},{"value":"Direct"}],
+                "metricValues":[{"value":"12"}],"plain":"x"}"#,
+        );
+        let v = kept(apply(
+            &spec(vec![
+                MappingOp::Compute {
+                    field: "date".into(),
+                    value: ComputeExpr::Field("dimensionValues.0.value".into()),
+                },
+                MappingOp::Compute {
+                    field: "channel".into(),
+                    value: ComputeExpr::Field("dimensionValues.1.value".into()),
+                },
+                MappingOp::Compute {
+                    field: "sessions".into(),
+                    value: ComputeExpr::Field("metricValues.0.value".into()),
+                },
+                MappingOp::Compute {
+                    field: "still_flat".into(),
+                    value: ComputeExpr::Field("plain".into()),
+                },
+                MappingOp::Compute {
+                    field: "missing".into(),
+                    value: ComputeExpr::Field("metricValues.9.value".into()),
+                },
+                MappingOp::Drop {
+                    fields: vec!["dimensionValues".into(), "metricValues".into()],
+                },
+            ]),
+            columnar,
+        ));
+        assert_eq!(v["date"], "20260701");
+        assert_eq!(v["channel"], "Direct");
+        assert_eq!(v["sessions"], "12");
+        assert_eq!(v["still_flat"], "x");
+        assert_eq!(v["missing"], "");
+        assert!(v.get("dimensionValues").is_none());
     }
 }
