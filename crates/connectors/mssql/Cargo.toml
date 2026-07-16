@@ -1,0 +1,47 @@
+# weir MSSQL source connector — a WASM component built for wasm32-wasip2.
+# Standalone workspace: built on its own for the wasm target, not a member of the
+# host weir workspace.
+[workspace]
+
+[package]
+name = "weir-mssql-wasm"
+version = "0.0.1"
+edition = "2024"
+description = "weir mssql connector (WASM component)."
+license = "Apache-2.0"
+repository = "https://github.com/colliery-io/weir"
+homepage = "https://github.com/colliery-io/weir"
+keywords = ["weir", "connector", "etl", "mssql"]
+categories = ["wasm", "database"]
+readme = "README.md"
+
+# weir ingress reads this to stage the package with the right host capabilities.
+[package.metadata.weir]
+capabilities = ["tcp"]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+fidius-guest = "0.5.4"
+fidius-macro = "0.5.4"
+wit-bindgen = "0.44"
+# Fidius-free serde types + codec, shared with the host (the configured Config wire
+# + the raw `write` envelope). `path` for local dev; `version` for crates.io publish.
+weir-connector-types = { path = "../../weir-connector-types", version = "0.0.1" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# TDS (SQL Server) protocol codec + row/column typing. Runtime-agnostic: driven over a
+# sync blocking wasi socket via a poll-Ready transport adapter + futures::block_on (no
+# tokio). `tds73` = the modern token stream; TLS features off (plaintext against the
+# demo compose service).
+tiberius = { version = "0.12", default-features = false, features = ["tds73"] }
+futures = { version = "0.3", default-features = false, features = ["executor"] }
+
+[build-dependencies]
+fidius-build = "0.5.4"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true

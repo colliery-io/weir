@@ -32,6 +32,41 @@ services:
       timeout: 3s
       retries: 15
 
+  # SQL Server — the source for the `mssql` connector's integration test
+  # ([[WEIR-T-0161]]). Loopback-only; host port overridable to coexist. Test-only;
+  # plaintext login (Force Encryption off by default) is the pre-authorized demo path.
+  mssql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "weirStrong!Pass1"
+      MSSQL_PID: "Developer"
+    ports:
+      - "127.0.0.1:${WEIR_MSSQL_HOST_PORT:-1433}:1433"
+    healthcheck:
+      # `-C` trusts the self-signed cert; the demo DB is seeded by the mssql-seed job.
+      test:
+        - CMD-SHELL
+        - /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$$MSSQL_SA_PASSWORD" -C -Q "SELECT 1" || exit 1
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  # Seed the demo database + table the integration test reads, then exit.
+  mssql-seed:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    depends_on:
+      mssql:
+        condition: service_healthy
+    volumes:
+      - ./test-fixtures/mssql:/fixtures:ro
+    entrypoint:
+      - /bin/bash
+      - -c
+      - >
+        /opt/mssql-tools18/bin/sqlcmd -S mssql -U sa -P "weirStrong!Pass1" -C -b -i /fixtures/seed.sql &&
+        echo "seeded weir_demo"
+
   # Dex — OIDC provider for the auth integration/e2e ([[WEIR-T-0088]]). Test-only.
   dex:
     image: dexidp/dex:v2.41.1

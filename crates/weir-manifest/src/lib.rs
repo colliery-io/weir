@@ -94,6 +94,48 @@ pub enum Auth {
         username_key: String,
         password_key: String,
     },
+    /// Google service-account JWT-bearer grant ([[WEIR-T-0155]]) — the host builds the
+    /// RS256 assertion from the SA JSON key, exchanges it at the key's `token_uri` for a
+    /// scoped access token, caches/refreshes it, and injects `Authorization: Bearer`.
+    /// `key_key` names the connection-config key holding the **whole SA JSON key**
+    /// (object or string); the key material never enters the guest.
+    GoogleServiceAccount {
+        #[serde(default = "default_sa_key_key")]
+        key_key: String,
+        /// OAuth scopes the token is minted for (e.g.
+        /// `https://www.googleapis.com/auth/analytics.readonly`).
+        #[serde(default)]
+        scopes: Vec<String>,
+    },
+    /// Snowflake key-pair JWT ([[WEIR-T-0156]]) — the host signs a self-issued RS256 JWT
+    /// (`iss`/`sub` from account + user, public-key fingerprint) and injects it as a
+    /// bearer plus `X-Snowflake-Authorization-Token-Type: KEYPAIR_JWT`. The `*_key`
+    /// fields name the connection-config keys; only the private key is a secret —
+    /// account/user stay visible for `{{ config[…] }}` templating.
+    SnowflakeKeypairJwt {
+        #[serde(default = "default_sf_account_key")]
+        account_key: String,
+        #[serde(default = "default_sf_user_key")]
+        user_key: String,
+        #[serde(default = "default_sf_private_key_key")]
+        private_key_key: String,
+    },
+}
+
+fn default_sa_key_key() -> String {
+    "service_account_key".to_string()
+}
+
+fn default_sf_account_key() -> String {
+    "account".to_string()
+}
+
+fn default_sf_user_key() -> String {
+    "user".to_string()
+}
+
+fn default_sf_private_key_key() -> String {
+    "private_key".to_string()
 }
 
 /// OAuth2 grant type the host uses to mint an access token ([[WEIR-A-0033]]).
@@ -128,6 +170,12 @@ pub struct Stream {
     /// per parent-stream record). `None` = a single flat read.
     #[serde(default)]
     pub partition: Option<PartitionRouter>,
+    /// Header-row response shape ([[WEIR-T-0160]], Google-Sheets-style): the records
+    /// array is **row-arrays** whose first row is a header — the runtime zips the rest
+    /// into objects (snake_cased header cells as field names, ragged rows padded with
+    /// null) and adds `_row` (1-based data-row index) as a stable key.
+    #[serde(default)]
+    pub header_row: bool,
     /// Request options ([[WEIR-T-0068]]): HTTP method (`None`/`GET` | `POST`), a POST body
     /// (JSON string, config-templated), and static request headers (e.g. `Notion-Version`).
     #[serde(default)]
@@ -187,13 +235,36 @@ pub enum ArrowType {
     Timestamp,
 }
 
-/// Incremental sync via a cursor field carried as a query parameter.
+/// Where a request parameter (pagination token/size, incremental cursor bounds) is
+/// carried ([[WEIR-T-0154]]): the query string (default) or the JSON request body.
+/// Body injection requires `http_method: POST` on the stream; the param name is then
+/// a **dot-path** into the body (e.g. `filter.timestamp_after`), created if absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InjectInto {
+    #[default]
+    Query,
+    Body,
+}
+
+/// Incremental sync via a cursor field carried as a query parameter (or, with
+/// `inject_into: body`, as a dot-path field of the POST body).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Incremental {
     /// Record field that advances the cursor (e.g. `updated_at`).
     pub cursor_field: String,
-    /// Query parameter the cursor value is sent as (e.g. `since`).
+    /// Query parameter the cursor value is sent as (e.g. `since`). A dot-path into the
+    /// request body when `inject_into: body`. **Empty = track-only** ([[WEIR-T-0159]]):
+    /// the checkpoint advances and resumes but nothing is injected into the request —
+    /// for APIs that restate history (GA4) and are re-read over a window instead.
+    #[serde(default)]
     pub cursor_param: String,
+    /// Raw-record **dot-path** the cursor value is extracted from when it differs from
+    /// `cursor_field` ([[WEIR-T-0159]]) — columnar responses (GA4's
+    /// `dimensionValues.0.value`) carry the cursor nested while the mapping stage
+    /// flattens it to `cursor_field` afterwards. Absent = read `cursor_field` directly.
+    #[serde(default)]
+    pub cursor_value_path: Option<String>,
     /// Initial lower-bound cursor for the first run (Airbyte `start_datetime`) — a literal
     /// or a `{{ config['…'] }}` ref the runtime renders. `None` = start from the beginning.
     #[serde(default)]
@@ -204,6 +275,9 @@ pub struct Incremental {
     pub end_param: Option<String>,
     #[serde(default)]
     pub end_value: Option<String>,
+    /// Where `cursor_param`/`end_param` are carried ([[WEIR-T-0154]]).
+    #[serde(default)]
+    pub inject_into: InjectInto,
 }
 
 /// Pagination strategy.
@@ -215,18 +289,28 @@ pub enum Pagination {
         page_param: String,
         size_param: String,
         size: u32,
+        /// Where the page/size params are carried ([[WEIR-T-0154]]).
+        #[serde(default)]
+        inject_into: InjectInto,
     },
     /// `?offset=N&limit=S`, stop when a short/empty page returns.
     Offset {
         offset_param: String,
         limit_param: String,
         size: u32,
+        /// Where the offset/limit params are carried ([[WEIR-T-0154]]).
+        #[serde(default)]
+        inject_into: InjectInto,
     },
     /// Opaque cursor: read the next-page token at `cursor_path` (dot-sep dpath into the
-    /// response) and send it as `?<token_param>=<token>`; stop when the token is absent.
+    /// response) and send it as `?<token_param>=<token>` — or, with `inject_into: body`,
+    /// as a dot-path field of the POST body (Notion-style); stop when the token is absent.
     Cursor {
         cursor_path: String,
         token_param: String,
+        /// Where the token param is carried ([[WEIR-T-0154]]).
+        #[serde(default)]
+        inject_into: InjectInto,
     },
     /// `Link` header (RFC 5988): follow `Link: <url>; rel="next"` from the response headers
     /// (GitHub-style) until absent. The next URL is absolute.
@@ -263,6 +347,37 @@ impl Manifest {
                 return Err(ManifestError::Invalid(format!(
                     "stream `{}` cursor_field `{}` is not in its schema",
                     s.name, inc.cursor_field
+                )));
+            }
+            // Body injection only makes sense on a request that has a body ([[WEIR-T-0154]]).
+            let body_injected = s
+                .incremental
+                .as_ref()
+                .is_some_and(|i| i.inject_into == InjectInto::Body)
+                || matches!(
+                    &s.pagination,
+                    Some(
+                        Pagination::Page {
+                            inject_into: InjectInto::Body,
+                            ..
+                        } | Pagination::Offset {
+                            inject_into: InjectInto::Body,
+                            ..
+                        } | Pagination::Cursor {
+                            inject_into: InjectInto::Body,
+                            ..
+                        }
+                    )
+                );
+            if body_injected
+                && !s
+                    .http_method
+                    .as_deref()
+                    .is_some_and(|m| m.eq_ignore_ascii_case("post"))
+            {
+                return Err(ManifestError::Invalid(format!(
+                    "stream `{}` uses `inject_into: body` but `http_method` is not POST",
+                    s.name
                 )));
             }
         }
@@ -397,6 +512,50 @@ streams:
     incremental: { cursor_field: nope, cursor_param: since }
 "#;
         assert!(Manifest::from_yaml(bad).is_err());
+    }
+
+    #[test]
+    fn parses_body_injection_and_requires_post() {
+        let yaml = r#"
+spec: { name: notionish }
+base_url: https://api.example.com
+streams:
+  - name: search
+    path: /v1/search
+    http_method: POST
+    request_body: '{"filter":{"property":"object","value":"page"}}'
+    schema:
+      - { name: id, type: utf8 }
+      - { name: last_edited_time, type: timestamp }
+    incremental:
+      cursor_field: last_edited_time
+      cursor_param: filter.timestamp_after
+      inject_into: body
+    pagination:
+      kind: cursor
+      cursor_path: next_cursor
+      token_param: start_cursor
+      inject_into: body
+"#;
+        let m = Manifest::from_yaml(yaml).expect("parse");
+        let s = &m.streams[0];
+        assert_eq!(
+            s.incremental.as_ref().unwrap().inject_into,
+            InjectInto::Body
+        );
+        match s.pagination.as_ref().unwrap() {
+            Pagination::Cursor { inject_into, .. } => assert_eq!(*inject_into, InjectInto::Body),
+            _ => panic!("expected cursor pagination"),
+        }
+        // Same manifest without POST is invalid.
+        let bad = yaml.replace("    http_method: POST\n", "");
+        assert!(Manifest::from_yaml(&bad).is_err());
+        // Default stays query for untouched manifests.
+        let plain = Manifest::from_yaml(SAMPLE).unwrap();
+        match plain.streams[0].pagination.as_ref().unwrap() {
+            Pagination::Page { inject_into, .. } => assert_eq!(*inject_into, InjectInto::Query),
+            _ => panic!("expected page pagination"),
+        }
     }
 
     #[test]

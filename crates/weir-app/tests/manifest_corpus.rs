@@ -370,3 +370,352 @@ async fn keyed_manifests_run_live() {
         "keyed connectors expected to function but didn't: {failed:?}"
     );
 }
+
+/// Live Snowflake **destination** ([[WEIR-T-0157]]): write a fixture batch through the
+/// `snowflake-dest` wasm guest into the trial account (key-pair JWT injected host-side,
+/// [[WEIR-T-0156]]), **replay it** (MERGE idempotency), then read the rows back over the
+/// SQL API through the `rest` runtime (POST-with-body, [[WEIR-T-0154]]). Skips when the
+/// `snowflake` bundle is absent. Bundle shape ([[WEIR-S-0018]] §2): `account`, `user`,
+/// `private_key`, `database`, `schema`, `warehouse`.
+#[tokio::test]
+#[ignore = "live + keyed: needs secrets/snowflake.json (WEIR-S-0018 §2)"]
+async fn snowflake_dest_writes_and_reads_back_live() {
+    use futures::StreamExt;
+    use weir_connector::{
+        Config, ConfiguredStream, MappingSpec, Partition, ReadContext, ReadMessage, RecordBatch,
+        StreamState, SyncMode, WriteContext, WriteMode, WriteResult,
+    };
+    use weir_runtime::{ConnectorHandle, Credential, HostAllowList};
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let secrets_dir = std::env::var_os("WEIR_SECRETS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join("secrets"));
+    let Ok(raw) = std::fs::read_to_string(secrets_dir.join("snowflake.json")) else {
+        eprintln!("\n=== snowflake dest live: no secrets/snowflake.json — skipped ===");
+        return;
+    };
+    let bundle: serde_json::Value =
+        serde_json::from_str(&raw).expect("secrets/snowflake.json is not valid JSON");
+    let field = |k: &str| {
+        bundle
+            .get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| panic!("snowflake bundle missing `{k}`"))
+            .to_string()
+    };
+
+    let conns = weir_wasm_testkit::connectors_dir();
+    weir_wasm_testkit::stage(
+        &weir_wasm_testkit::WasmPackage {
+            fixture_dir: &root.join("crates/connectors/snowflake"),
+            wasm_file: "weir_snowflake_wasm.wasm",
+            pkg_name: "weir-snowflake-pkg",
+            capabilities: &["http"],
+        },
+        &conns,
+    );
+    weir_wasm_testkit::stage(
+        &weir_wasm_testkit::WasmPackage {
+            fixture_dir: &root.join("crates/connectors/rest"),
+            wasm_file: "weir_rest_wasm.wasm",
+            pkg_name: "weir-rest-pkg",
+            capabilities: &["http"],
+        },
+        &conns,
+    );
+
+    const TABLE: &str = "weir_live_t0157";
+    let auth_cfg = |extra: serde_json::Value| {
+        let mut cfg = bundle.clone();
+        cfg["auth_scheme"] = "snowflake_keypair_jwt".into();
+        if let (Some(c), Some(e)) = (cfg.as_object_mut(), extra.as_object()) {
+            for (k, v) in e {
+                c.insert(k.clone(), v.clone());
+            }
+        }
+        cfg.to_string()
+    };
+
+    // ── Write, then replay (MERGE keyed on email → idempotent). ─────────────────
+    let dest_json = auth_cfg(serde_json::json!({ "table": TABLE }));
+    let (cred, guest_json) = Credential::from_auth_config(&dest_json);
+    assert!(
+        !guest_json.contains("PRIVATE KEY"),
+        "key material must never reach the guest config"
+    );
+    let policy = HostAllowList {
+        allowed_hosts: Vec::new(),
+        inject_headers: Vec::new(),
+        credential: cred,
+    };
+    let dest = ConnectorHandle::from_wasm_package(
+        &conns,
+        "weir-snowflake-pkg",
+        &Config { json: guest_json },
+        policy,
+        &[],
+    )
+    .expect("load snowflake-dest");
+    let ctx = WriteContext {
+        stream: ConfiguredStream {
+            stream: TABLE.to_string(),
+            sync_mode: SyncMode::FullRefresh,
+            cursor_field: None,
+            primary_key: Some(vec!["email".to_string()]),
+            write_mode: WriteMode::Upsert {
+                business_keys: vec!["email".to_string()],
+            },
+            mapping: MappingSpec::default(),
+        },
+    };
+    let batch = RecordBatch::Rows(vec![
+        r#"{"email":"ada@weir.test","name":"Ada","score":1}"#.to_string(),
+        r#"{"email":"cy@weir.test","name":"Cy","score":2}"#.to_string(),
+    ]);
+    for attempt in ["write", "replay"] {
+        let out = dest
+            .write(&ctx, vec![batch.clone()])
+            .unwrap_or_else(|e| panic!("{attempt}: {e}"));
+        match out.result {
+            WriteResult::Ok(r) => assert_eq!(r.accepted, 2, "{attempt} accepted both rows"),
+            WriteResult::Err(e) => panic!("{attempt} failed: {e:?}"),
+        }
+    }
+
+    // ── Read back through the rest runtime (SQL API SELECT, POST body). ─────────
+    let fq = format!(
+        "\"{}\".\"{}\".\"{}\"",
+        field("database").to_uppercase(),
+        field("schema").to_uppercase(),
+        TABLE.to_uppercase()
+    );
+    let statement = serde_json::json!({
+        "statement": format!("SELECT \"EMAIL\" FROM {fq}"),
+        "database": field("database").to_uppercase(),
+        "schema": field("schema").to_uppercase(),
+        "warehouse": field("warehouse").to_uppercase(),
+    });
+    let src_json = auth_cfg(serde_json::json!({
+        "base_url": format!("https://{}.snowflakecomputing.com", field("account").to_lowercase()),
+        "path": "/api/v2/statements",
+        "http_method": "POST",
+        "request_body": statement.to_string(),
+        "record_path": "data",
+    }));
+    let (cred, guest_json) = Credential::from_auth_config(&src_json);
+    let policy = HostAllowList {
+        allowed_hosts: Vec::new(),
+        inject_headers: Vec::new(),
+        credential: cred,
+    };
+    let source = ConnectorHandle::from_wasm_package(
+        &conns,
+        "weir-rest-pkg",
+        &Config { json: guest_json },
+        policy,
+        &[],
+    )
+    .expect("load rest source for read-back");
+    let rctx = ReadContext {
+        stream: ConfiguredStream {
+            stream: "records".to_string(),
+            sync_mode: SyncMode::FullRefresh,
+            cursor_field: None,
+            primary_key: None,
+            write_mode: WriteMode::Append,
+            mapping: MappingSpec::default(),
+        },
+        partition: Partition {
+            id: String::new(),
+            bounds: None,
+        },
+        state: StreamState {
+            cursor: None,
+            opaque: Vec::new(),
+        },
+    };
+    let mut rows = 0usize;
+    let mut stream = source.read(&rctx).await.expect("read-back stream");
+    while let Some(msg) = stream.next().await {
+        if let ReadMessage::Records(RecordBatch::Rows(r)) = msg.expect("read-back message") {
+            rows += r.len();
+        }
+    }
+    assert_eq!(
+        rows, 2,
+        "write + replay must land exactly the 2 keyed rows (MERGE is idempotent)"
+    );
+    eprintln!("\n=== snowflake dest live: 2 rows written, replayed, read back — no dupes ===");
+}
+
+/// Live rETL ([[WEIR-T-0158]]): **seeded Snowflake table → weir → HubSpot contact
+/// upsert** — the reverse-ETL pipeline end-to-end. Seeds the table through the
+/// `snowflake` guest's write side ([[WEIR-T-0157]]), then engine-syncs the guest's
+/// **source** side into `rest-dest` baked from the vendored `hubspot-dest.yaml`
+/// (private-app token injected host-side). Runs twice: the PATCH upsert is idempotent.
+/// Skips unless BOTH bundles are present ([[WEIR-S-0018]] §2 + §3).
+#[tokio::test]
+#[ignore = "live + keyed: needs secrets/snowflake.json + secrets/hubspot.json"]
+async fn snowflake_to_hubspot_retl_live() {
+    use weir_connector::{
+        Config, ConfiguredStream, MappingSpec, RecordBatch, SyncMode, WriteContext, WriteMode,
+        WriteResult,
+    };
+    use weir_engine::{Engine, Store};
+    use weir_manifest::DestinationManifest;
+    use weir_runtime::{ConnectorHandle, Credential, HostAllowList};
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let secrets_dir = std::env::var_os("WEIR_SECRETS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join("secrets"));
+    let (Ok(sf_raw), Ok(hs_raw)) = (
+        std::fs::read_to_string(secrets_dir.join("snowflake.json")),
+        std::fs::read_to_string(secrets_dir.join("hubspot.json")),
+    ) else {
+        eprintln!("\n=== snowflake→hubspot rETL live: needs both bundles — skipped ===");
+        return;
+    };
+    let sf: serde_json::Value = serde_json::from_str(&sf_raw).expect("snowflake.json JSON");
+    let hs: serde_json::Value = serde_json::from_str(&hs_raw).expect("hubspot.json JSON");
+    let hs_token = hs
+        .get("api_key")
+        .or_else(|| hs.get("token"))
+        .and_then(|t| t.as_str())
+        .expect("hubspot bundle needs `api_key` (private-app token)")
+        .to_string();
+
+    let conns = weir_wasm_testkit::connectors_dir();
+    for (dir, wasm, pkg) in [
+        (
+            "crates/connectors/snowflake",
+            "weir_snowflake_wasm.wasm",
+            "weir-snowflake-pkg",
+        ),
+        (
+            "crates/connectors/rest-dest",
+            "weir_rest_dest_wasm.wasm",
+            "weir-rest-dest-pkg",
+        ),
+    ] {
+        weir_wasm_testkit::stage(
+            &weir_wasm_testkit::WasmPackage {
+                fixture_dir: &root.join(dir),
+                wasm_file: wasm,
+                pkg_name: pkg,
+                capabilities: &["http"],
+            },
+            &conns,
+        );
+    }
+
+    const TABLE: &str = "weir_live_t0158";
+    let sf_cfg = |extra: serde_json::Value| {
+        let mut cfg = sf.clone();
+        cfg["auth_scheme"] = "snowflake_keypair_jwt".into();
+        if let (Some(c), Some(e)) = (cfg.as_object_mut(), extra.as_object()) {
+            for (k, v) in e {
+                c.insert(k.clone(), v.clone());
+            }
+        }
+        cfg.to_string()
+    };
+    let sf_handle = |json: &str| {
+        let (cred, guest_json) = Credential::from_auth_config(json);
+        let policy = HostAllowList {
+            allowed_hosts: Vec::new(),
+            inject_headers: Vec::new(),
+            credential: cred,
+        };
+        ConnectorHandle::from_wasm_package(
+            &conns,
+            "weir-snowflake-pkg",
+            &Config { json: guest_json },
+            policy,
+            &[],
+        )
+        .expect("load snowflake guest")
+    };
+
+    // ── Seed the warehouse table (upsert by email → stable across reruns). ─────
+    let seeder = sf_handle(&sf_cfg(serde_json::json!({ "table": TABLE })));
+    let wctx = WriteContext {
+        stream: ConfiguredStream {
+            stream: TABLE.to_string(),
+            sync_mode: SyncMode::FullRefresh,
+            cursor_field: None,
+            primary_key: Some(vec!["email".to_string()]),
+            write_mode: WriteMode::Upsert {
+                business_keys: vec!["email".to_string()],
+            },
+            mapping: MappingSpec::default(),
+        },
+    };
+    let out = seeder
+        .write(
+            &wctx,
+            vec![RecordBatch::Rows(vec![
+                r#"{"email":"retl-ada@weir.test","first_name":"Ada","last_name":"Weir","updated_at":"2026-01-01T00:00:00Z"}"#.to_string(),
+                r#"{"email":"retl-cy@weir.test","first_name":"Cy","last_name":"Weir","updated_at":"2026-01-02T00:00:00Z"}"#.to_string(),
+            ])],
+        )
+        .expect("seed write");
+    match out.result {
+        WriteResult::Ok(r) => assert_eq!(r.accepted, 2, "seeded both rows"),
+        WriteResult::Err(e) => panic!("seed failed: {e:?}"),
+    }
+
+    // ── rETL: snowflake source → rest-dest (hubspot-dest.yaml), token host-side. ──
+    let source = sf_handle(&sf_cfg(serde_json::json!({ "table": TABLE })));
+    let m = DestinationManifest::from_yaml(
+        &std::fs::read_to_string(root.join("dest-manifests/hubspot-dest.yaml")).unwrap(),
+    )
+    .expect("parse hubspot dest manifest");
+    let mut dest_cfg = weir_app::dest_object_to_config(&m, "contacts");
+    dest_cfg["api_key"] = serde_json::Value::String(hs_token);
+    let (cred, guest_json) = Credential::from_auth_config(&dest_cfg.to_string());
+    assert!(
+        !guest_json.contains("pat-") && !guest_json.contains("api_key"),
+        "the HubSpot token must be stripped from the guest config"
+    );
+    let policy = HostAllowList {
+        allowed_hosts: Vec::new(),
+        inject_headers: Vec::new(),
+        credential: cred,
+    };
+    let dest = ConnectorHandle::from_wasm_package(
+        &conns,
+        "weir-rest-dest-pkg",
+        &Config { json: guest_json },
+        policy,
+        &[],
+    )
+    .expect("load hubspot dest");
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path().join("retl.db").to_str().unwrap()).unwrap();
+    let engine = Engine::new(&store);
+    let cs = ConfiguredStream {
+        stream: "contacts".to_string(),
+        sync_mode: SyncMode::FullRefresh,
+        cursor_field: None,
+        primary_key: Some(vec!["email".to_string()]),
+        write_mode: WriteMode::Upsert {
+            business_keys: vec!["email".to_string()],
+        },
+        mapping: MappingSpec::default(),
+    };
+    for run in 1..=2 {
+        let out = engine
+            .sync("retl-live", &cs, &source, &dest)
+            .unwrap_or_else(|e| panic!("rETL run {run}: {e:?}"));
+        assert_eq!(
+            out.rows_written, 2,
+            "run {run}: both warehouse rows upserted into HubSpot (idempotent PATCH)"
+        );
+    }
+    eprintln!(
+        "\n=== snowflake→hubspot rETL live: 2 contacts upserted from {TABLE}, twice, no failures ==="
+    );
+}

@@ -110,6 +110,11 @@ struct RestCfg {
     page_link_header: bool,
     /// Record field whose max advances the incremental cursor (None = full refresh).
     cursor_field: Option<String>,
+    /// Raw-record dot-path the cursor value is read from when the response is columnar
+    /// ([[WEIR-T-0159]], e.g. GA4's `dimensionValues.0.value`); None = `cursor_field`.
+    cursor_value_path: Option<String>,
+    /// Query/body param the cursor is sent as. None = **track-only** ([[WEIR-T-0159]]):
+    /// the checkpoint advances but nothing is injected (window re-read APIs like GA4).
     cursor_param: Option<String>,
     /// Richer datetime cursor ([[WEIR-T-0070]]): initial lower bound (`cursor_start`, used
     /// only on the first run when there's no state) + an upper bound
@@ -126,6 +131,15 @@ struct RestCfg {
     http_method: String,
     request_body: Option<String>,
     request_headers: Vec<(String, String)>,
+    /// Body injection ([[WEIR-T-0154]]): carry the pagination params / incremental-cursor
+    /// params as dot-path fields of the JSON POST body instead of the query string
+    /// (`page_inject_into` / `cursor_inject_into` = `body`). The body is rebuilt per page.
+    page_inject_body: bool,
+    cursor_inject_body: bool,
+    /// Header-row response shape ([[WEIR-T-0160]], Google-Sheets-style): records are
+    /// row-arrays whose first row is the header — zip the rest into objects (snake_cased
+    /// header cells as keys, ragged rows padded with null) + a `_row` index field.
+    header_row: bool,
     /// Partition router ([[WEIR-T-0064]]): `list` (one request per `partition_values`) or
     /// `substream` (read `parent_path`, one request per `parent_key` of each parent
     /// record). The slice value is templated into the path as `{{ stream_partition.* }}`.
@@ -163,6 +177,7 @@ fn parse_cfg(config: &weir_connector_types::Config) -> RestCfg {
         page_cursor_param: s("page_cursor_param"),
         page_link_header: v.get("page_link_header").and_then(|x| x.as_bool()).unwrap_or(false),
         cursor_field: s("cursor_field"),
+        cursor_value_path: s("cursor_value_path"),
         cursor_param: s("cursor_param"),
         // start/end may be `{{ config['…'] }}` — render against the connection config.
         cursor_start: s("cursor_start").map(|t| render_template(&t, &v)),
@@ -171,6 +186,9 @@ fn parse_cfg(config: &weir_connector_types::Config) -> RestCfg {
         max_retries: v.get("max_retries").and_then(|x| x.as_u64()).unwrap_or(4) as u32,
         http_method: s("http_method").unwrap_or_else(|| "GET".to_string()),
         request_body: s("request_body").map(|t| render_template(&t, &v)),
+        page_inject_body: s("page_inject_into").as_deref() == Some("body"),
+        cursor_inject_body: s("cursor_inject_into").as_deref() == Some("body"),
+        header_row: v.get("header_row").and_then(|x| x.as_bool()).unwrap_or(false),
         request_headers: v
             .get("request_headers")
             .and_then(|x| x.as_object())
@@ -249,11 +267,71 @@ fn render_partition(path: &str, value: &str) -> String {
     out
 }
 
+/// Set `path` (dot-separated, intermediate objects created — or overwritten if not
+/// objects) in `v` to `val` ([[WEIR-T-0154]]): body-injected pagination/cursor params
+/// land at their dot-path in the JSON request body.
+fn set_json_path(v: &mut serde_json::Value, path: &str, val: serde_json::Value) {
+    let segs: Vec<&str> = path.split('.').collect();
+    let Some((last, parents)) = segs.split_last() else { return };
+    let mut cur = v;
+    for seg in parents {
+        if !cur.is_object() {
+            *cur = serde_json::Value::Object(Default::default());
+        }
+        cur = cur
+            .as_object_mut()
+            .expect("just ensured object")
+            .entry(seg.to_string())
+            .or_insert(serde_json::Value::Null);
+    }
+    if !cur.is_object() {
+        *cur = serde_json::Value::Object(Default::default());
+    }
+    cur.as_object_mut()
+        .expect("just ensured object")
+        .insert(last.to_string(), val);
+}
+
 /// Descend `path` into `v` (dpath); empty path returns `v` itself.
 fn navigate<'a>(v: &'a serde_json::Value, path: &[String]) -> Option<&'a serde_json::Value> {
     let mut cur = v;
     for seg in path {
         cur = cur.get(seg)?;
+    }
+    Some(cur)
+}
+
+/// A header cell → a snake_case field name ([[WEIR-T-0160]]): trim, lowercase,
+/// non-alphanumerics → `_`; an empty cell falls back to its column position.
+fn header_name(cell: &serde_json::Value, i: usize) -> String {
+    let raw = cell.as_str().map(str::to_string).unwrap_or_else(|| cell.to_string());
+    let name: String = raw
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if name.chars().all(|ch| ch == '_') {
+        format!("col_{i}")
+    } else {
+        name
+    }
+}
+
+/// Descend a **dot-path** where a numeric segment indexes an array ([[WEIR-T-0159]]):
+/// `dimensionValues.0.value` reaches `{"dimensionValues": [{"value": …}]}`.
+fn get_path<'a>(v: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+    let mut cur = v;
+    for seg in path.split('.') {
+        cur = match (cur, seg.parse::<usize>()) {
+            (serde_json::Value::Array(a), Ok(i)) => a.get(i)?,
+            (x, _) => x.get(seg)?,
+        };
     }
     Some(cur)
 }
@@ -272,20 +350,34 @@ fn retry_after_ms(headers: &[(String, String)]) -> Option<u64> {
         .map(|secs| secs * 1000)
 }
 
-/// Send `url` per the config's method/body/headers ([[WEIR-T-0068]]), retrying transient
+/// Send `url` with an optional POST `body` ([[WEIR-T-0068]]/[[WEIR-T-0154]]: `Some` ⇒ POST —
+/// the caller builds it per page when params inject into the body), retrying transient
 /// failures (429 / 5xx / transport error) up to `max_retries` with exponential backoff,
 /// honoring `Retry-After` ([[WEIR-T-0069]]). A non-retryable status is returned as `Ok` for
 /// the caller to handle; a persistent transient one errors. Auth is injected host-side
 /// ([[WEIR-A-0033]]); static `request_headers` (e.g. `Notion-Version`) are set by the guest.
-fn send_with_retry(c: &RestCfg, url: &str) -> Result<fidius_guest::http::Response, ConnectorError> {
+fn send_with_retry(
+    c: &RestCfg,
+    url: &str,
+    body: Option<&str>,
+) -> Result<fidius_guest::http::Response, ConnectorError> {
     let mut attempt: u32 = 0;
     loop {
-        let mut req = if c.http_method.eq_ignore_ascii_case("POST") {
-            let body = c.request_body.clone().unwrap_or_default().into_bytes();
-            fidius_guest::http::Request::post(url, body)
+        let mut req = if let Some(b) = body {
+            fidius_guest::http::Request::post(url, b.as_bytes().to_vec())
         } else {
             fidius_guest::http::Request::get(url)
         };
+        // Default content-type for a JSON POST body — the manifest's `request_body` /
+        // body-injected params are JSON by construction. `request_headers` overrides it.
+        if body.is_some()
+            && !c
+                .request_headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+        {
+            req = req.header("content-type", "application/json");
+        }
         // Default User-Agent — some APIs (notably GitHub) reject requests without one
         // with a non-JSON error body. A manifest `request_headers` entry overrides it.
         let has_ua = c
@@ -414,8 +506,15 @@ fn fetch_slice(
     let mut offset: u64 = 0;
     let mut page_cursor: Option<String> = None;
     let mut link_next: Option<String> = None;
+    // Header-row shape ([[WEIR-T-0160]]): the first row of this slice is the header
+    // (held across pages); `_row` numbers the data rows.
+    let mut header: Option<Vec<String>> = None;
+    let mut row_n: u64 = 0;
     const MAX_PAGES: u64 = 1000;
     loop {
+        // Params split between the query string and the JSON body ([[WEIR-T-0154]]):
+        // body-injected param names are dot-paths overlaid onto `request_body` per page.
+        let mut body_params: Vec<(String, serde_json::Value)> = Vec::new();
         // A Link-header page carries an absolute next URL; otherwise build base_url+path+query.
         let url = if let Some(u) = link_next.take() {
             u
@@ -423,22 +522,46 @@ fn fetch_slice(
             let mut url = format!("{}{}", c.base_url, path);
             let mut q: Vec<String> = Vec::new();
             if let Some(p) = &c.page_param {
-                q.push(format!("{p}={page}"));
+                if c.page_inject_body {
+                    body_params.push((p.clone(), page.into()));
+                } else {
+                    q.push(format!("{p}={page}"));
+                }
             }
             if let Some(p) = &c.offset_param {
-                q.push(format!("{p}={offset}"));
+                if c.page_inject_body {
+                    body_params.push((p.clone(), offset.into()));
+                } else {
+                    q.push(format!("{p}={offset}"));
+                }
             }
             if let (Some(p), Some(tok)) = (&c.page_cursor_param, &page_cursor) {
-                q.push(format!("{p}={tok}"));
+                if c.page_inject_body {
+                    body_params.push((p.clone(), tok.clone().into()));
+                } else {
+                    q.push(format!("{p}={tok}"));
+                }
             }
             if let (Some(p), Some(sz)) = (&c.page_size_param, c.page_size) {
-                q.push(format!("{p}={sz}"));
+                if c.page_inject_body {
+                    body_params.push((p.clone(), sz.into()));
+                } else {
+                    q.push(format!("{p}={sz}"));
+                }
             }
             if let (Some(p), Some(cur)) = (&c.cursor_param, &cursor) {
-                q.push(format!("{p}={cur}"));
+                if c.cursor_inject_body {
+                    body_params.push((p.clone(), cur.clone().into()));
+                } else {
+                    q.push(format!("{p}={cur}"));
+                }
             }
             if let (Some(p), Some(e)) = (&c.cursor_end_param, &c.cursor_end) {
-                q.push(format!("{p}={e}"));
+                if c.cursor_inject_body {
+                    body_params.push((p.clone(), e.clone().into()));
+                } else {
+                    q.push(format!("{p}={e}"));
+                }
             }
             if !q.is_empty() {
                 url.push('?');
@@ -447,10 +570,29 @@ fn fetch_slice(
             url
         };
 
+        // POST body: the (config-templated) `request_body`, overlaid with body-injected
+        // params at their dot-paths ([[WEIR-T-0154]]) — rebuilt per page as they advance.
+        // Injected params imply POST even if `http_method` was left unset.
+        let body = if body_params.is_empty() {
+            c.http_method
+                .eq_ignore_ascii_case("POST")
+                .then(|| c.request_body.clone().unwrap_or_default())
+        } else {
+            let mut v: serde_json::Value = c
+                .request_body
+                .as_deref()
+                .and_then(|b| serde_json::from_str(b).ok())
+                .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+            for (path, val) in body_params {
+                set_json_path(&mut v, &path, val);
+            }
+            Some(v.to_string())
+        };
+
         // Auth is injected host-side by the egress policy ([[WEIR-A-0033]]); the guest
         // sends a plain request. Transient failures (429 / 5xx / transport) retry with
         // exponential backoff, honoring `Retry-After` ([[WEIR-T-0069]]).
-        let resp = send_with_retry(c, &url)?;
+        let resp = send_with_retry(c, &url, body.as_deref())?;
         let body = resp.text();
         // Past page 1, a non-JSON body is end-of-data: paginated APIs often answer one
         // page beyond the last with a 404 whose body is an HTML/empty error page.
@@ -488,8 +630,40 @@ fn fetch_slice(
         }
         let n = records.len() as u64;
         for rec in records {
+            // Header-row zip ([[WEIR-T-0160]]): first row-array = the field names;
+            // later row-arrays become objects (ragged rows pad with null) + `_row`.
+            if c.header_row {
+                let Some(cells) = rec.as_array() else { continue };
+                let Some(hdr) = &header else {
+                    header = Some(
+                        cells
+                            .iter()
+                            .enumerate()
+                            .map(|(i, cell)| header_name(cell, i))
+                            .collect(),
+                    );
+                    continue;
+                };
+                row_n += 1;
+                let mut obj = serde_json::Map::new();
+                obj.insert("_row".to_string(), row_n.into());
+                for (i, name) in hdr.iter().enumerate() {
+                    obj.insert(
+                        name.clone(),
+                        cells.get(i).cloned().unwrap_or(serde_json::Value::Null),
+                    );
+                }
+                rows.push(serde_json::Value::Object(obj).to_string());
+                continue;
+            }
             if let Some(cf) = &c.cursor_field {
-                if let Some(cv) = rec.get(cf) {
+                // Columnar responses carry the cursor nested ([[WEIR-T-0159]]) — read it
+                // at `cursor_value_path` when set, else at the flat `cursor_field`.
+                let cv = match &c.cursor_value_path {
+                    Some(path) => get_path(rec, path),
+                    None => rec.get(cf),
+                };
+                if let Some(cv) = cv {
                     let cs = cv.as_str().map(str::to_string).unwrap_or_else(|| cv.to_string());
                     if cursor.as_deref().map_or(true, |cur| cs.as_str() > cur) {
                         cursor = Some(cs);

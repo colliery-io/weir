@@ -25,9 +25,10 @@ Run any through the **preview** (`POST /catalog/preview`) to see its tier / conf
 / runtime gaps before onboarding. **Auth** (bearer, header + query-param api-key) is
 applied by the runtime ([[WEIR-I-0008]]) — the manifest declares the scheme, and the
 secret (`api_key`) is supplied per-connection. **Templated `url_base`** (`{{ config[…] }}`
-tenant subdomain / account id), **page / offset / opaque-cursor pagination**, and
-**single-object** (non-array) responses are all handled. Remaining gaps: POST-with-body
-requests (e.g. Notion's body cursor) and `Link`-header pagination (e.g. GitHub).
+tenant subdomain / account id), **page / offset / opaque-cursor pagination** — carried in
+the query string or **injected into the POST body** ([[WEIR-T-0154]], e.g. Notion's
+`start_cursor`) — **POST-with-body requests**, **`Link`-header pagination**, and
+**single-object** (non-array) responses are all handled.
 
 ## Known gaps (authored, but beyond the runtime today)
 

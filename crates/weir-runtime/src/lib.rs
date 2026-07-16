@@ -285,6 +285,14 @@ pub enum Credential {
         region: String,
         service: String,
     },
+    /// Google service account ([[WEIR-T-0155]]) — the host builds the RS256 JWT-bearer
+    /// assertion from the SA JSON key, exchanges it for a scoped access token, caches +
+    /// refreshes it, and injects `Authorization: Bearer <token>`.
+    GoogleServiceAccount(GoogleSaProvider),
+    /// Snowflake key-pair JWT ([[WEIR-T-0156]]) — the host signs a self-issued RS256 JWT
+    /// (no token endpoint) and injects it as a bearer plus the
+    /// `X-Snowflake-Authorization-Token-Type: KEYPAIR_JWT` header.
+    SnowflakeKeypairJwt(SnowflakeKeypairProvider),
 }
 
 impl Credential {
@@ -322,6 +330,11 @@ impl Credential {
             "session_inject_header".into(),
             "basic_username_key".into(),
             "basic_password_key".into(),
+            "google_sa_key_key".into(),
+            "google_scopes".into(),
+            "snowflake_account_key".into(),
+            "snowflake_user_key".into(),
+            "snowflake_private_key_key".into(),
         ];
 
         let cred = match get(obj, "auth_scheme").as_deref() {
@@ -409,6 +422,62 @@ impl Credential {
                     value: format!("Basic {encoded}"),
                 })
             }
+            Some("google_service_account") => {
+                let key_key =
+                    get(obj, "google_sa_key_key").unwrap_or_else(|| "service_account_key".into());
+                // The SA JSON key arrives as a JSON object or a JSON-encoded string.
+                let sa: Option<serde_json::Value> = match obj.get(&key_key) {
+                    Some(serde_json::Value::Object(_)) => obj.get(&key_key).cloned(),
+                    Some(serde_json::Value::String(s)) => serde_json::from_str(s).ok(),
+                    _ => None,
+                };
+                strip.push(key_key);
+                let scopes: Vec<String> = obj
+                    .get("google_scopes")
+                    .and_then(|s| s.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                sa.map(|sa| {
+                    let f = |k: &str| {
+                        sa.get(k)
+                            .and_then(|x| x.as_str())
+                            .unwrap_or_default()
+                            .to_string()
+                    };
+                    let token_uri = match f("token_uri") {
+                        t if t.is_empty() => "https://oauth2.googleapis.com/token".to_string(),
+                        t => t,
+                    };
+                    Credential::GoogleServiceAccount(GoogleSaProvider::new(
+                        f("client_email"),
+                        f("private_key"),
+                        token_uri,
+                        scopes,
+                    ))
+                })
+            }
+            Some("snowflake_keypair_jwt") => {
+                let acct_key =
+                    get(obj, "snowflake_account_key").unwrap_or_else(|| "account".into());
+                let user_key = get(obj, "snowflake_user_key").unwrap_or_else(|| "user".into());
+                let pk_key =
+                    get(obj, "snowflake_private_key_key").unwrap_or_else(|| "private_key".into());
+                let account = get(obj, &acct_key).unwrap_or_default();
+                let user = get(obj, &user_key).unwrap_or_default();
+                let private_key = get(obj, &pk_key);
+                // Only the private key is a secret — account/user stay in the guest
+                // config (the manifest templates them into `url_base`, [[WEIR-T-0157]]).
+                strip.push(pk_key);
+                private_key.map(|pk| {
+                    Credential::SnowflakeKeypairJwt(SnowflakeKeypairProvider::new(
+                        account, user, pk,
+                    ))
+                })
+            }
             Some("aws_sigv4") => {
                 let ak_key =
                     get(obj, "aws_access_key_id_key").unwrap_or_else(|| "access_key_id".into());
@@ -456,6 +525,15 @@ impl Credential {
             Credential::Session(p) => {
                 let token = p.token()?;
                 inject_header(parts, &p.inject_header, &token)
+            }
+            Credential::GoogleServiceAccount(p) => {
+                let token = p.bearer()?;
+                inject_header(parts, "Authorization", &format!("Bearer {token}"))
+            }
+            Credential::SnowflakeKeypairJwt(p) => {
+                let token = p.bearer()?;
+                inject_header(parts, "Authorization", &format!("Bearer {token}"))?;
+                inject_header(parts, "X-Snowflake-Authorization-Token-Type", "KEYPAIR_JWT")
             }
             Credential::AwsSigV4 {
                 access_key,
@@ -729,6 +807,286 @@ impl OAuth2Provider {
     }
 }
 
+/// Google service-account JWT-bearer grant ([[WEIR-T-0155]]): the host builds the RS256
+/// assertion from the SA JSON key's `client_email`/`private_key`, exchanges it at the
+/// key's `token_uri` for an access token scoped to `scopes`, and injects it as a bearer.
+/// Tokens are cached **process-wide** per `(client_email, scopes)` with the same
+/// [`REFRESH_MARGIN`] as OAuth2 — concurrent streams, and connections sharing one key,
+/// share one token. The key material never leaves the host.
+pub struct GoogleSaProvider {
+    client_email: String,
+    private_key_pem: String,
+    token_uri: String,
+    scopes: Vec<String>,
+}
+
+/// Process-wide minted-token cache shared by the JWT-based schemes ([[WEIR-T-0155]] /
+/// [[WEIR-T-0156]]), keyed `<scheme>|<identity>|<scopes>` so concurrent streams — and
+/// connections sharing one key — share one token.
+static MINTED_TOKENS: std::sync::OnceLock<Mutex<std::collections::HashMap<String, CachedToken>>> =
+    std::sync::OnceLock::new();
+
+impl GoogleSaProvider {
+    pub fn new(
+        client_email: String,
+        private_key_pem: String,
+        token_uri: String,
+        scopes: Vec<String>,
+    ) -> Self {
+        Self {
+            client_email,
+            private_key_pem,
+            token_uri,
+            scopes,
+        }
+    }
+
+    /// A valid bearer token — cached per `(client_email, scopes)`, re-minted when within
+    /// [`REFRESH_MARGIN`] of expiry.
+    fn bearer(&self) -> Result<String, EgressDenied> {
+        let cache_key = format!("google|{}|{}", self.client_email, self.scopes.join(" "));
+        cached_bearer(&cache_key, || self.mint())
+    }
+
+    /// Sign the assertion and run the JWT-bearer grant `POST` (on a dedicated thread —
+    /// see [`run_blocking`]); parse `{ access_token, expires_in }`.
+    fn mint(&self) -> Result<(String, Duration), EgressDenied> {
+        let assertion = sa_assertion(
+            &self.client_email,
+            &self.scopes.join(" "),
+            &self.token_uri,
+            unix_now_secs(),
+            &self.private_key_pem,
+        )
+        .map_err(EgressDenied::new)?;
+        let token_uri = self.token_uri.clone();
+        run_blocking(move || {
+            let resp = ureq::post(&token_uri)
+                .send_form(&[
+                    ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
+                    ("assertion", &assertion),
+                ])
+                .map_err(|e| format!("google service-account token grant failed: {e}"))?;
+            let body: serde_json::Value = resp
+                .into_json()
+                .map_err(|e| format!("google token response not JSON: {e}"))?;
+            let token = body
+                .get("access_token")
+                .and_then(|t| t.as_str())
+                .ok_or("google token response missing `access_token`")?
+                .to_string();
+            let ttl = body
+                .get("expires_in")
+                .and_then(|e| e.as_u64())
+                .unwrap_or(3600);
+            Ok((token, Duration::from_secs(ttl)))
+        })
+    }
+}
+
+/// Serve a bearer from the process-wide [`MINTED_TOKENS`] cache, minting via `mint` when
+/// absent or within [`REFRESH_MARGIN`] of expiry. The lock is released during the mint (it
+/// may be a network call); a concurrent racer minting the same token twice is benign —
+/// last write wins.
+fn cached_bearer(
+    cache_key: &str,
+    mint: impl FnOnce() -> Result<(String, Duration), EgressDenied>,
+) -> Result<String, EgressDenied> {
+    let cache = MINTED_TOKENS.get_or_init(Default::default);
+    {
+        let map = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(c) = map.get(cache_key)
+            && Instant::now() + REFRESH_MARGIN < c.expires_at
+        {
+            return Ok(c.token.clone());
+        }
+    }
+    let (token, ttl) = mint()?;
+    let mut map = cache.lock().unwrap_or_else(|e| e.into_inner());
+    map.insert(
+        cache_key.to_string(),
+        CachedToken {
+            token: token.clone(),
+            expires_at: Instant::now() + ttl,
+        },
+    );
+    Ok(token)
+}
+
+/// Build the signed RS256 JWT-bearer assertion for a Google service account
+/// ([[WEIR-T-0155]]). Pure — tests fix `iat`. Claims per Google's server-to-server
+/// OAuth2 flow: `iss` = the SA email, `scope`, `aud` = the token endpoint, 1h validity
+/// (Google's maximum; the short window also bounds clock-skew exposure).
+fn sa_assertion(
+    client_email: &str,
+    scope: &str,
+    aud: &str,
+    iat: u64,
+    private_key_pem: &str,
+) -> Result<String, String> {
+    let key = parse_pkcs8_keypair(private_key_pem)?;
+    rs256_sign_jwt(
+        &key,
+        &serde_json::json!({
+            "iss": client_email,
+            "scope": scope,
+            "aud": aud,
+            "iat": iat,
+            "exp": iat + 3600,
+        })
+        .to_string(),
+    )
+}
+
+/// Parse a PKCS#8 PEM private key into a ring RSA keypair.
+fn parse_pkcs8_keypair(private_key_pem: &str) -> Result<ring::signature::RsaKeyPair, String> {
+    let der = pkcs8_pem_to_der(private_key_pem)?;
+    ring::signature::RsaKeyPair::from_pkcs8(&der).map_err(|e| format!("private key rejected: {e}"))
+}
+
+/// Assemble + RS256-sign a JWT (`header.claims.signature`, base64url-no-pad) over the
+/// given claims JSON ([[WEIR-T-0155]] / [[WEIR-T-0156]]).
+fn rs256_sign_jwt(key: &ring::signature::RsaKeyPair, claims_json: &str) -> Result<String, String> {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let header = b64.encode(r#"{"alg":"RS256","typ":"JWT"}"#);
+    let claims = b64.encode(claims_json);
+    let signing_input = format!("{header}.{claims}");
+    let mut sig = vec![0u8; key.public().modulus_len()];
+    key.sign(
+        &ring::signature::RSA_PKCS1_SHA256,
+        &ring::rand::SystemRandom::new(),
+        signing_input.as_bytes(),
+        &mut sig,
+    )
+    .map_err(|e| format!("RS256 signing failed: {e}"))?;
+    Ok(format!("{signing_input}.{}", b64.encode(sig)))
+}
+
+/// Snowflake key-pair JWT auth ([[WEIR-T-0156]]): the host signs a **self-issued** RS256
+/// JWT — there is no token endpoint; the JWT *is* the bearer. Claims per Snowflake's
+/// key-pair spec: `iss` = `ACCOUNT.USER.SHA256:<public-key fingerprint>`, `sub` =
+/// `ACCOUNT.USER` (both uppercased), 1h validity. Injected as `Authorization: Bearer`
+/// **plus** `X-Snowflake-Authorization-Token-Type: KEYPAIR_JWT`. The private key stays
+/// host-side; minting is a local sign (no network), cached per `(account, user)`.
+pub struct SnowflakeKeypairProvider {
+    /// Uppercased at construction (Snowflake matches identifiers uppercase).
+    account: String,
+    user: String,
+    private_key_pem: String,
+}
+
+impl SnowflakeKeypairProvider {
+    pub fn new(account: String, user: String, private_key_pem: String) -> Self {
+        Self {
+            account: account.to_uppercase(),
+            user: user.to_uppercase(),
+            private_key_pem,
+        }
+    }
+
+    /// A valid self-signed bearer — cached per `(account, user)`, re-signed when within
+    /// [`REFRESH_MARGIN`] of its 1h expiry.
+    fn bearer(&self) -> Result<String, EgressDenied> {
+        let cache_key = format!("snowflake|{}.{}", self.account, self.user);
+        cached_bearer(&cache_key, || {
+            let jwt = snowflake_jwt(
+                &self.account,
+                &self.user,
+                unix_now_secs(),
+                &self.private_key_pem,
+            )
+            .map_err(EgressDenied::new)?;
+            Ok((jwt, Duration::from_secs(3600)))
+        })
+    }
+}
+
+/// Build Snowflake's self-signed key-pair JWT ([[WEIR-T-0156]]). Pure — tests fix `iat`.
+fn snowflake_jwt(
+    account: &str,
+    user: &str,
+    iat: u64,
+    private_key_pem: &str,
+) -> Result<String, String> {
+    let key = parse_pkcs8_keypair(private_key_pem)?;
+    let fingerprint = snowflake_fingerprint(&key);
+    rs256_sign_jwt(
+        &key,
+        &serde_json::json!({
+            "iss": format!("{account}.{user}.{fingerprint}"),
+            "sub": format!("{account}.{user}"),
+            "iat": iat,
+            "exp": iat + 3600,
+        })
+        .to_string(),
+    )
+}
+
+/// Snowflake's public-key fingerprint: `SHA256:` + base64 of the SHA-256 over the
+/// **SubjectPublicKeyInfo** DER — the same encoding `ALTER USER … SET RSA_PUBLIC_KEY`
+/// stores (what `openssl rsa -pubout -outform DER` emits). ring exposes the public key
+/// as PKCS#1, so wrap it into SPKI first.
+fn snowflake_fingerprint(key: &ring::signature::RsaKeyPair) -> String {
+    use base64::Engine;
+    use sha2::Digest;
+    let spki = spki_from_pkcs1(ring::signature::KeyPair::public_key(key).as_ref());
+    let digest = sha2::Sha256::digest(&spki);
+    format!(
+        "SHA256:{}",
+        base64::engine::general_purpose::STANDARD.encode(digest)
+    )
+}
+
+/// Wrap a PKCS#1 `RSAPublicKey` DER into an X.509 `SubjectPublicKeyInfo` DER:
+/// `SEQUENCE { AlgorithmIdentifier(rsaEncryption, NULL), BIT STRING { 0, pkcs1 } }`.
+fn spki_from_pkcs1(pkcs1: &[u8]) -> Vec<u8> {
+    // DER definite-length encoding for `len` bytes of content.
+    fn der_len(len: usize) -> Vec<u8> {
+        match len {
+            0..=0x7f => vec![len as u8],
+            0x80..=0xff => vec![0x81, len as u8],
+            _ => vec![0x82, (len >> 8) as u8, (len & 0xff) as u8],
+        }
+    }
+    // AlgorithmIdentifier for rsaEncryption (OID 1.2.840.113549.1.1.1) + NULL params.
+    const ALG_ID: [u8; 15] = [
+        0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05, 0x00,
+    ];
+    let mut bit_string = vec![0x03];
+    bit_string.extend(der_len(pkcs1.len() + 1)); // +1 for the leading unused-bits byte
+    bit_string.push(0x00);
+    bit_string.extend_from_slice(pkcs1);
+    let content_len = ALG_ID.len() + bit_string.len();
+    let mut spki = vec![0x30];
+    spki.extend(der_len(content_len));
+    spki.extend_from_slice(&ALG_ID);
+    spki.extend(bit_string);
+    spki
+}
+
+/// Decode a PKCS#8 PEM (`-----BEGIN PRIVATE KEY-----`) body to DER. SA JSON keys embed
+/// the PEM with `\n` escapes — serde unescapes them before this sees the string.
+fn pkcs8_pem_to_der(pem: &str) -> Result<Vec<u8>, String> {
+    use base64::Engine;
+    let body: String = pem
+        .lines()
+        .filter(|l| !l.starts_with("-----"))
+        .collect::<Vec<_>>()
+        .join("");
+    base64::engine::general_purpose::STANDARD
+        .decode(body.trim())
+        .map_err(|e| format!("service-account private key is not valid PEM base64: {e}"))
+}
+
+/// Current Unix time (seconds) for JWT `iat`/`exp` claims.
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// Run a blocking closure on a dedicated OS thread and wait for it. The egress hook
 /// (`authorize`) can be invoked on the wasmtime async-executor thread, where blocking
 /// `ureq` socket I/O fails with `EINVAL`; offloading to a fresh thread gives a clean
@@ -838,11 +1196,229 @@ mod sigv4_credential_tests {
 }
 
 #[cfg(test)]
+mod google_sa_tests {
+    use super::*;
+
+    /// A throwaway 2048-bit PKCS#8 RSA key generated for these tests — never a real
+    /// credential.
+    const TEST_KEY_PEM: &str = include_str!("../tests/fixtures/google_sa_test_key.pem");
+
+    #[test]
+    fn assertion_has_rs256_header_and_google_claims() {
+        let jwt = sa_assertion(
+            "sa@x.iam.gserviceaccount.com",
+            "scope-a scope-b",
+            "https://oauth2.googleapis.com/token",
+            1_700_000_000,
+            TEST_KEY_PEM,
+        )
+        .expect("sign assertion");
+        let parts: Vec<&str> = jwt.split('.').collect();
+        assert_eq!(parts.len(), 3, "header.claims.signature");
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let header: serde_json::Value =
+            serde_json::from_slice(&b64.decode(parts[0]).unwrap()).unwrap();
+        assert_eq!(header["alg"], "RS256");
+        assert_eq!(header["typ"], "JWT");
+        let claims: serde_json::Value =
+            serde_json::from_slice(&b64.decode(parts[1]).unwrap()).unwrap();
+        assert_eq!(claims["iss"], "sa@x.iam.gserviceaccount.com");
+        assert_eq!(claims["scope"], "scope-a scope-b");
+        assert_eq!(claims["aud"], "https://oauth2.googleapis.com/token");
+        assert_eq!(claims["iat"], 1_700_000_000u64);
+        assert_eq!(claims["exp"], 1_700_003_600u64, "1h validity");
+        // RS256 over a 2048-bit key → a 256-byte signature.
+        assert_eq!(b64.decode(parts[2]).unwrap().len(), 256);
+    }
+
+    #[test]
+    fn google_sa_credential_parses_and_strips_key_material() {
+        let cfg = serde_json::json!({
+            "auth_scheme": "google_service_account",
+            "google_sa_key_key": "service_account_key",
+            "google_scopes": ["https://www.googleapis.com/auth/analytics.readonly"],
+            "service_account_key": {
+                "client_email": "sa@x.iam.gserviceaccount.com",
+                "private_key": TEST_KEY_PEM,
+            },
+            "property_id": "123",
+        })
+        .to_string();
+        let (cred, sanitized) = Credential::from_auth_config(&cfg);
+        assert!(matches!(cred, Some(Credential::GoogleServiceAccount(_))));
+        // Key material + every auth key is gone; the harmless config field survives.
+        assert!(!sanitized.contains("PRIVATE KEY"));
+        assert!(!sanitized.contains("client_email"));
+        assert!(!sanitized.contains("auth_scheme"));
+        assert!(!sanitized.contains("google_scopes"));
+        assert!(sanitized.contains("\"property_id\":\"123\""));
+
+        // The SA key also arrives as a JSON-encoded **string** (how a secret bundle
+        // field usually lands) — same result.
+        let cfg2 = serde_json::json!({
+            "auth_scheme": "google_service_account",
+            "service_account_key":
+                r#"{"client_email":"sa@x.iam.gserviceaccount.com","private_key":"k"}"#,
+        })
+        .to_string();
+        let (cred2, sanitized2) = Credential::from_auth_config(&cfg2);
+        assert!(matches!(cred2, Some(Credential::GoogleServiceAccount(_))));
+        assert!(!sanitized2.contains("client_email"));
+    }
+
+    /// Read one HTTP request (headers + content-length body) and answer with `body`.
+    fn respond_json(s: &mut std::net::TcpStream, body: &str) -> String {
+        use std::io::{Read as _, Write as _};
+        s.set_read_timeout(Some(std::time::Duration::from_millis(500)))
+            .ok();
+        let mut data = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            match s.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    data.extend_from_slice(&buf[..n]);
+                    if let Some(end) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&data[..end]);
+                        let clen = head
+                            .lines()
+                            .find_map(|l| {
+                                l.split_once(':')
+                                    .filter(|(k, _)| {
+                                        k.trim().eq_ignore_ascii_case("content-length")
+                                    })
+                                    .map(|(_, v)| v)
+                            })
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if data.len() >= end + 4 + clen {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = std::io::Write::write_all(s, resp.as_bytes());
+        String::from_utf8_lossy(&data).into_owned()
+    }
+
+    /// A counting mock token endpoint: records each grant request, returns `body`.
+    fn mock_token_endpoint(body: &'static str) -> (String, std::sync::mpsc::Receiver<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { break };
+                let req = respond_json(&mut s, body);
+                let _ = tx.send(req);
+            }
+        });
+        (format!("http://{addr}"), rx)
+    }
+
+    /// Mocked token exchange ([[WEIR-T-0155]] AC): the JWT-bearer grant mints, the
+    /// process-wide cache serves the second call without a second HTTP round-trip.
+    #[test]
+    fn google_sa_mints_via_jwt_bearer_grant_and_caches() {
+        let (token_url, rx) = mock_token_endpoint(r#"{"access_token":"tok-sa","expires_in":3600}"#);
+        let p = GoogleSaProvider::new(
+            "mint-test@x.iam.gserviceaccount.com".into(), // unique per test: cache is process-wide
+            TEST_KEY_PEM.into(),
+            token_url,
+            vec!["s1".into()],
+        );
+        assert_eq!(p.bearer().expect("mint"), "tok-sa");
+        let grant = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("grant request");
+        assert!(
+            grant.contains("grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer"),
+            "JWT-bearer grant type; got:\n{grant}"
+        );
+        assert!(
+            grant.contains("assertion=eyJ"),
+            "signed assertion in the form"
+        );
+        // Second call: served from the cache — the endpoint sees no second request.
+        assert_eq!(p.bearer().expect("cached"), "tok-sa");
+        assert!(
+            rx.try_recv().is_err(),
+            "second bearer() must not re-mint inside the token lifetime"
+        );
+    }
+
+    /// A token whose `expires_in` is inside [`REFRESH_MARGIN`] is re-minted on the next
+    /// call (refresh-ahead-of-expiry).
+    #[test]
+    fn google_sa_refreshes_ahead_of_expiry() {
+        let (token_url, rx) =
+            mock_token_endpoint(r#"{"access_token":"tok-short","expires_in":30}"#);
+        let p = GoogleSaProvider::new(
+            "refresh-test@x.iam.gserviceaccount.com".into(),
+            TEST_KEY_PEM.into(),
+            token_url,
+            vec![],
+        );
+        assert_eq!(p.bearer().expect("mint 1"), "tok-short");
+        assert_eq!(p.bearer().expect("mint 2"), "tok-short");
+        // 30s expiry < 60s refresh margin → both calls minted.
+        assert!(rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok());
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok(),
+            "inside the refresh margin the second call must re-mint"
+        );
+    }
+}
+
+#[cfg(test)]
 mod egress_tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener};
     use std::thread;
+
+    /// Read a full request (headers + content-length body) before responding —
+    /// responding after a single `read` races the client's form-body write and resets
+    /// the connection mid-exchange (the flaky-mock failure the engine tests fixed the
+    /// same way).
+    fn read_request(s: &mut std::net::TcpStream) {
+        s.set_read_timeout(Some(std::time::Duration::from_millis(500)))
+            .ok();
+        let mut data = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            match s.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    data.extend_from_slice(&buf[..n]);
+                    if let Some(end) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&data[..end]);
+                        let clen = head
+                            .lines()
+                            .find_map(|l| {
+                                l.split_once(':')
+                                    .filter(|(k, _)| {
+                                        k.trim().eq_ignore_ascii_case("content-length")
+                                    })
+                                    .map(|(_, v)| v)
+                            })
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if data.len() >= end + 4 + clen {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     /// `OAuth2Provider::mint` performs a real token grant over the wire (the host path)
     /// and returns the access token + caches it — isolated from the wasm guest.
@@ -852,8 +1428,7 @@ mod egress_tests {
         let addr = listener.local_addr().unwrap();
         thread::spawn(move || {
             if let Ok((mut s, _)) = listener.accept() {
-                let mut b = [0u8; 4096];
-                let _ = s.read(&mut b);
+                read_request(&mut s);
                 let body = r#"{"access_token":"tok-xyz","expires_in":3600}"#;
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
@@ -884,8 +1459,7 @@ mod egress_tests {
         let addr = listener.local_addr().unwrap();
         thread::spawn(move || {
             if let Ok((mut s, _)) = listener.accept() {
-                let mut b = [0u8; 4096];
-                let _ = s.read(&mut b);
+                read_request(&mut s);
                 let body = r#"{"data":{"token":"sess-9"}}"#;
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
@@ -924,5 +1498,122 @@ mod egress_tests {
             credential: None,
         };
         assert!(listed.authorize_tcp(&addr).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod snowflake_keypair_tests {
+    use super::*;
+
+    /// The same throwaway test key as the google tests — any RSA key works here.
+    const TEST_KEY_PEM: &str = include_str!("../tests/fixtures/google_sa_test_key.pem");
+    /// Known answer for the fixture key, computed independently:
+    /// `openssl rsa -pubout -outform DER | openssl dgst -sha256 -binary | base64`.
+    const TEST_KEY_FP: &str = "SHA256:BgiJGcINPQuBjB0MFoHV/SW8vP5pzN90TXJe8SpDZtI=";
+
+    #[test]
+    fn fingerprint_matches_openssl_spki_known_answer() {
+        let key = parse_pkcs8_keypair(TEST_KEY_PEM).expect("parse key");
+        assert_eq!(snowflake_fingerprint(&key), TEST_KEY_FP);
+    }
+
+    #[test]
+    fn jwt_claims_match_snowflake_spec() {
+        // Lowercase in → uppercased identifiers out (via the provider's constructor rule).
+        let jwt =
+            snowflake_jwt("myorg-acct1", "WEIR_DEMO", 1_700_000_000, TEST_KEY_PEM).expect("sign");
+        let parts: Vec<&str> = jwt.split('.').collect();
+        assert_eq!(parts.len(), 3);
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let header: serde_json::Value =
+            serde_json::from_slice(&b64.decode(parts[0]).unwrap()).unwrap();
+        assert_eq!(header["alg"], "RS256");
+        let claims: serde_json::Value =
+            serde_json::from_slice(&b64.decode(parts[1]).unwrap()).unwrap();
+        // `snowflake_jwt` signs what it's given; uppercasing happens in the provider.
+        assert_eq!(
+            claims["iss"],
+            format!("myorg-acct1.WEIR_DEMO.{TEST_KEY_FP}"),
+            "iss = account.user.fingerprint"
+        );
+        assert_eq!(claims["sub"], "myorg-acct1.WEIR_DEMO");
+        assert_eq!(claims["iat"], 1_700_000_000u64);
+        assert_eq!(claims["exp"], 1_700_003_600u64, "1h validity");
+    }
+
+    #[test]
+    fn provider_uppercases_identifiers_and_self_signs() {
+        let p = SnowflakeKeypairProvider::new(
+            "myorg-acct1".into(),
+            "weir_demo".into(),
+            TEST_KEY_PEM.into(),
+        );
+        let jwt = p.bearer().expect("self-signed bearer needs no endpoint");
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let claims: serde_json::Value =
+            serde_json::from_slice(&b64.decode(jwt.split('.').nth(1).unwrap()).unwrap()).unwrap();
+        assert_eq!(claims["sub"], "MYORG-ACCT1.WEIR_DEMO", "uppercased");
+        // Cached: a second call returns the identical token (same iat).
+        assert_eq!(p.bearer().unwrap(), jwt);
+    }
+
+    #[test]
+    fn snowflake_credential_strips_only_the_private_key() {
+        let cfg = serde_json::json!({
+            "auth_scheme": "snowflake_keypair_jwt",
+            "snowflake_account_key": "account",
+            "snowflake_user_key": "user",
+            "snowflake_private_key_key": "private_key",
+            "account": "myorg-acct1",
+            "user": "weir_demo",
+            "private_key": TEST_KEY_PEM,
+            "warehouse": "COMPUTE_XS",
+        })
+        .to_string();
+        let (cred, sanitized) = Credential::from_auth_config(&cfg);
+        assert!(matches!(cred, Some(Credential::SnowflakeKeypairJwt(_))));
+        // The secret + metadata are gone…
+        assert!(!sanitized.contains("PRIVATE KEY"));
+        assert!(!sanitized.contains("auth_scheme"));
+        assert!(!sanitized.contains("snowflake_private_key_key"));
+        // …but account/user stay: the manifest templates them into url_base ([[WEIR-T-0157]]).
+        assert!(sanitized.contains("\"account\":\"myorg-acct1\""));
+        assert!(sanitized.contains("\"user\":\"weir_demo\""));
+        assert!(sanitized.contains("\"warehouse\":\"COMPUTE_XS\""));
+    }
+
+    /// Both headers land on the outbound request — the bearer and Snowflake's
+    /// token-type marker ([[WEIR-T-0156]] AC).
+    #[test]
+    fn apply_injects_bearer_and_token_type_headers() {
+        let (cred, _) = Credential::from_auth_config(
+            // A unique account: the token cache is process-wide, so tests sharing a
+            // (account, user) key race each other's re-mints.
+            &serde_json::json!({
+                "auth_scheme": "snowflake_keypair_jwt",
+                "account": "apply-test-acct",
+                "user": "weir_demo",
+                "private_key": TEST_KEY_PEM,
+            })
+            .to_string(),
+        );
+        let policy = HostAllowList::allow_all().with_credential(cred.expect("credential"));
+        let req = weir_connector::fidius::http_types::Request::builder()
+            .uri("https://myorg-acct1.snowflakecomputing.com/api/v2/statements")
+            .body(())
+            .unwrap();
+        let (mut parts, _) = req.into_parts();
+        policy.authorize(&mut parts).expect("authorize");
+        let auth = parts.headers.get("authorization").expect("bearer header");
+        assert!(auth.to_str().unwrap().starts_with("Bearer eyJ"));
+        assert_eq!(
+            parts
+                .headers
+                .get("x-snowflake-authorization-token-type")
+                .expect("token-type header"),
+            "KEYPAIR_JWT"
+        );
     }
 }

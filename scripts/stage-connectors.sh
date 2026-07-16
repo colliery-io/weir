@@ -39,7 +39,9 @@ EOF
 # real postgres sink, needs tcp) + the self-contained demo sources.
 stage "$ROOT/crates/connectors/rest" weir_rest_wasm.wasm   weir-rest-pkg   http
 stage "$ROOT/crates/connectors/rest-dest" weir_rest_dest_wasm.wasm weir-rest-dest-pkg http
+stage "$ROOT/crates/connectors/snowflake" weir_snowflake_wasm.wasm weir-snowflake-pkg http
 stage "$ROOT/crates/connectors/postgres" weir_postgres_wasm.wasm weir-postgres-pkg tcp
+stage "$ROOT/crates/connectors/mssql" weir_mssql_wasm.wasm weir-mssql-pkg tcp
 stage "$ROOT/wasm-fixtures/arrow-sink"   weir_arrow_sink_wasm.wasm weir-arrow-sink-pkg
 stage "$ROOT/wasm-fixtures/echo"         weir_echo_wasm.wasm       weir-echo-pkg
 stage "$ROOT/wasm-fixtures/slow"         weir_slow_wasm.wasm       weir-slow-pkg

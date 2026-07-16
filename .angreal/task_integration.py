@@ -23,7 +23,7 @@ def _run(cmd):
 
 
 @integration()
-@angreal.command(name="up", about="start integration resources (Postgres) and wait until healthy")
+@angreal.command(name="up", about="start integration resources (Postgres, MSSQL, MinIO, Dex) and wait until healthy")
 def up():
     raise SystemExit(_run(["docker", "compose", "up", "-d", "--wait"]))
 

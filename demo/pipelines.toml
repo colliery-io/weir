@@ -1,0 +1,126 @@
+# Demo pipelines — the estate as data ([[WEIR-T-0162]] / [[WEIR-I-0041]]).
+#
+# `angreal demo pipelines` reads this to onboard the connectors and create six
+# representative end-to-end connections against a running weir over the control-plane
+# HTTP API — a showcase of weir's connectors working together. Point it at a different
+# estate by editing this file.
+#
+# Secret bundles (SOPS, WEIR-S-0018) are decrypted at run time and their fields spliced
+# into per-side connection config by `[[connection]].source_secrets` / `dest_secrets`
+# (`config_key = "bundle_slug.field"`). Nothing secret lives in this file.
+
+# ── Connectors to onboard (POST /catalog/import) ────────────────────────────────
+# kind: manifest (source yaml) | dest_manifest (rETL yaml) | package (compiled guest)
+[[connector]]
+name = "hubspot"
+kind = "manifest"
+
+[[connector]]
+name = "stripe"
+kind = "manifest"
+
+[[connector]]
+name = "google-sheets"
+kind = "manifest"
+
+[[connector]]
+name = "google-analytics"
+kind = "manifest"
+
+[[connector]]
+name = "snowflake"
+kind = "package"
+package = "weir-snowflake-pkg"
+
+[[connector]]
+name = "mssql"
+kind = "package"
+package = "weir-mssql-pkg"
+
+[[connector]]
+name = "hubspot-dest"
+kind = "dest_manifest"
+
+# ── The six connections (POST /connections) ─────────────────────────────────────
+# Snowflake is the warehouse for pipelines 1–5 (upsert-by-key so re-syncs are
+# idempotent); pipeline 6 is the reverse-ETL flow (Snowflake → HubSpot). The set is
+# representative — SaaS, spreadsheet, analytics, and database sources into a warehouse,
+# plus a reverse-ETL loop back out.
+
+[[connection]]
+name = "hubspot-to-snowflake"
+source = "hubspot"
+dest = "snowflake"
+stream = "contacts"
+sync_mode = "full_refresh"
+write_mode = "upsert"
+business_keys = ["id"]
+dest_extra = { table = "hubspot_contacts", auth_scheme = "snowflake_keypair_jwt" }
+source_secrets = { api_key = "hubspot.api_key" }
+dest_secrets = { account = "snowflake.account", user = "snowflake.user", private_key = "snowflake.private_key", database = "snowflake.database", schema = "snowflake.schema", warehouse = "snowflake.warehouse" }
+
+[[connection]]
+name = "stripe-to-snowflake"
+source = "stripe"
+dest = "snowflake"
+stream = "customers"
+sync_mode = "full_refresh"
+write_mode = "upsert"
+business_keys = ["id"]
+dest_extra = { table = "stripe_customers", auth_scheme = "snowflake_keypair_jwt" }
+source_secrets = { api_key = "stripe.api_key" }
+dest_secrets = { account = "snowflake.account", user = "snowflake.user", private_key = "snowflake.private_key", database = "snowflake.database", schema = "snowflake.schema", warehouse = "snowflake.warehouse" }
+
+[[connection]]
+name = "sheets-to-snowflake"
+source = "google-sheets"
+dest = "snowflake"
+stream = "rows"
+sync_mode = "full_refresh"
+write_mode = "upsert"
+business_keys = ["_row"]
+dest_extra = { table = "sheet_rows", auth_scheme = "snowflake_keypair_jwt" }
+source_secrets = { service_account_key = "google-sheets.service_account_key" }
+source_extra_secrets = { spreadsheet_id = "google-sheets.spreadsheet_id", tab = "google-sheets.tab" }
+dest_secrets = { account = "snowflake.account", user = "snowflake.user", private_key = "snowflake.private_key", database = "snowflake.database", schema = "snowflake.schema", warehouse = "snowflake.warehouse" }
+
+[[connection]]
+name = "ga4-to-snowflake"
+source = "google-analytics"
+dest = "snowflake"
+stream = "traffic"
+sync_mode = "incremental"
+write_mode = "upsert"
+business_keys = ["date", "channel"]
+cursor_field = "date"
+dest_extra = { table = "ga4_traffic", auth_scheme = "snowflake_keypair_jwt" }
+source_secrets = { service_account_key = "google-analytics.service_account_key" }
+source_extra_secrets = { property_id = "google-analytics.property_id", start_date = "google-analytics.start_date" }
+dest_secrets = { account = "snowflake.account", user = "snowflake.user", private_key = "snowflake.private_key", database = "snowflake.database", schema = "snowflake.schema", warehouse = "snowflake.warehouse" }
+
+[[connection]]
+name = "mssql-to-snowflake"
+source = "mssql"
+dest = "snowflake"
+stream = "dbo.contacts"
+sync_mode = "incremental"
+write_mode = "upsert"
+business_keys = ["id"]
+cursor_field = "updated_at"
+dest_extra = { table = "mssql_contacts", auth_scheme = "snowflake_keypair_jwt" }
+# MSSQL creds come from the integration compose service, not a SOPS bundle.
+source_extra = { host = "localhost", port = 1433, database = "weir_demo", user = "sa", password = "weirStrong!Pass1", table = "dbo.contacts" }
+dest_secrets = { account = "snowflake.account", user = "snowflake.user", private_key = "snowflake.private_key", database = "snowflake.database", schema = "snowflake.schema", warehouse = "snowflake.warehouse" }
+
+[[connection]]
+name = "snowflake-to-hubspot"
+source = "snowflake"
+dest = "hubspot-dest"
+stream = "contacts"
+sync_mode = "full_refresh"
+write_mode = "upsert"
+business_keys = ["email"]
+# The rETL source reads a warehouse table/query; the dest upserts HubSpot contacts by email.
+source_extra = { table = "hubspot_contacts", auth_scheme = "snowflake_keypair_jwt" }
+source_secrets = { account = "snowflake.account", user = "snowflake.user", private_key = "snowflake.private_key", database = "snowflake.database", schema = "snowflake.schema", warehouse = "snowflake.warehouse" }
+dest_secrets = { api_key = "hubspot.api_key" }

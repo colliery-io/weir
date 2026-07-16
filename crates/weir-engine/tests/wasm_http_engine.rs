@@ -11,7 +11,7 @@ use std::path::Path;
 use std::thread;
 
 use weir_connector::{
-    CompareOp, Config, ConfiguredStream, MappingOp, MappingSpec, SyncMode, WriteMode,
+    CompareOp, ComputeExpr, Config, ConfiguredStream, MappingOp, MappingSpec, SyncMode, WriteMode,
 };
 use weir_engine::{Engine, Store};
 use weir_runtime::{ConnectorHandle, Credential, HostAllowList};
@@ -51,6 +51,17 @@ fn read_full_request(stream: &mut std::net::TcpStream) -> String {
                 data.extend_from_slice(&buf[..n]);
                 if let Some(end) = data.windows(4).position(|w| w == b"\r\n\r\n") {
                     let head = String::from_utf8_lossy(&data[..end]);
+                    // A chunked body (the guest's `wasi:http` POSTs, [[WEIR-T-0154]]) has no
+                    // content-length — it's complete at the zero-size terminator chunk.
+                    if head
+                        .to_ascii_lowercase()
+                        .contains("transfer-encoding: chunked")
+                    {
+                        if data.ends_with(b"0\r\n\r\n") {
+                            break;
+                        }
+                        continue;
+                    }
                     let clen = head
                         .lines()
                         .find_map(|l| {
@@ -1103,5 +1114,677 @@ fn engine_applies_transform_mapping_over_wasm_source() {
     assert_eq!(
         out.rows_written, 2,
         "the filter kept only the keep=yes records"
+    );
+}
+
+/// A captured request's body: content-length bodies pass through; chunked bodies (the
+/// guest's `wasi:http` POSTs, [[WEIR-T-0154]]) have their chunk framing stripped.
+fn request_body(req: &str) -> String {
+    let Some((head, raw)) = req.split_once("\r\n\r\n") else {
+        return String::new();
+    };
+    if !head
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
+        return raw.to_string();
+    }
+    // De-chunk: `<hex-size>\r\n<data>\r\n` … terminated by a zero-size chunk.
+    let mut out = String::new();
+    let mut rest = raw;
+    loop {
+        let Some((size_line, tail)) = rest.split_once("\r\n") else {
+            break;
+        };
+        let Ok(size) = usize::from_str_radix(size_line.trim(), 16) else {
+            break;
+        };
+        if size == 0 || tail.len() < size {
+            break;
+        }
+        out.push_str(&tail[..size]);
+        rest = tail.get(size + 2..).unwrap_or(""); // skip data + trailing CRLF
+    }
+    out
+}
+
+/// Serves Notion-style POST body-cursor pages ([[WEIR-T-0154]]): the opaque cursor
+/// arrives as `start_cursor` **in the JSON body** (never the query string), the next
+/// token in the response `next_cursor`. A page is served only when the request is a
+/// POST whose static `filter` (from `request_body`) survived the per-page rebuild.
+fn mock_http_body_cursor() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let req = read_full_request(&mut stream);
+            let body_json: serde_json::Value =
+                serde_json::from_str(&request_body(&req)).unwrap_or(serde_json::Value::Null);
+            let well_formed = req.starts_with("POST")
+                && !req.lines().next().unwrap_or("").contains("start_cursor=")
+                && body_json["filter"]["value"] == "page";
+            let cursor = body_json["start_cursor"].as_str().unwrap_or("");
+            let body = match (well_formed, cursor) {
+                (false, _) => r#"{"results":[],"next_cursor":null}"#,
+                (true, "") => r#"{"results":[{"id":1},{"id":2}],"next_cursor":"c2"}"#,
+                (true, "c2") => r#"{"results":[{"id":3},{"id":4}],"next_cursor":"c3"}"#,
+                (true, _) => r#"{"results":[{"id":5}],"next_cursor":null}"#,
+            };
+            respond_ok(&mut stream, body);
+            if !well_formed || (!cursor.is_empty() && cursor != "c2") {
+                break; // last page (next_cursor null) served → guest stops
+            }
+        }
+    });
+    format!("http://{addr}")
+}
+
+/// Body-injected opaque-cursor pagination ([[WEIR-T-0154]], the Notion shape): POST with a
+/// static body filter, the cursor advancing **inside the body**, all 3 pages collected.
+#[test]
+fn wasm_http_source_walks_body_cursor_pagination() {
+    let base = mock_http_body_cursor();
+
+    let pkg_root = tempfile::TempDir::new().unwrap();
+    build_and_stage(pkg_root.path());
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let store = Store::open(db_dir.path().join("weir.db").to_str().unwrap()).unwrap();
+    let engine = Engine::new(&store);
+
+    let src_cfg = Config {
+        json: serde_json::json!({
+            "base_url": base, "path": "/v1/search",
+            "http_method": "POST",
+            "request_body": r#"{"filter":{"property":"object","value":"page"}}"#,
+            "record_path": "results",
+            "page_cursor_path": "next_cursor",
+            "page_cursor_param": "start_cursor",
+            "page_inject_into": "body",
+        })
+        .to_string(),
+    };
+    let policy = HostAllowList {
+        allowed_hosts: vec!["127.0.0.1".to_string()],
+        inject_headers: vec![],
+        credential: None,
+    };
+    let source =
+        ConnectorHandle::from_wasm_package(pkg_root.path(), "weir-rest-pkg", &src_cfg, policy, &[])
+            .expect("load wasm rest http source");
+    let dest = weir_wasm_testkit::load(
+        "ArrowSink",
+        &Config {
+            json: "{}".to_string(),
+        },
+    )
+    .unwrap();
+
+    let out = engine
+        .sync("body-cursor-conn", &items_stream(), &source, &dest)
+        .expect("engine sync over body-cursor-paginated wasm http source");
+    assert_eq!(
+        out.rows_written, 5,
+        "all 3 body-cursor pages collected (2+2+1)"
+    );
+}
+
+/// Serves GA4-style offset pagination **in the POST body** ([[WEIR-T-0154]]): `offset` +
+/// `limit` are read from the JSON body, pages of 2, 2, 1 records (ids 1..=5).
+fn mock_http_body_offset() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let req = read_full_request(&mut stream);
+            let body_json: serde_json::Value =
+                serde_json::from_str(&request_body(&req)).unwrap_or(serde_json::Value::Null);
+            // Both params must ride the body as JSON numbers; the query must stay clean.
+            let well_formed = req.starts_with("POST")
+                && !req.lines().next().unwrap_or("").contains("offset=")
+                && body_json["limit"].as_u64() == Some(2);
+            let offset = body_json["offset"].as_u64().unwrap_or(0);
+            let body = match (well_formed, offset) {
+                (false, _) => r#"[]"#,
+                (true, 0) => r#"[{"id":1},{"id":2}]"#,
+                (true, 2) => r#"[{"id":3},{"id":4}]"#,
+                (true, 4) => r#"[{"id":5}]"#,
+                _ => r#"[]"#,
+            };
+            respond_ok(&mut stream, body);
+            if !well_formed || offset >= 4 {
+                break; // short page served → guest will stop
+            }
+        }
+    });
+    format!("http://{addr}")
+}
+
+/// Body-injected offset pagination ([[WEIR-T-0154]], the GA4 `runReport` shape): offset +
+/// limit advance inside the POST body as JSON numbers; the guest walks to the short page.
+#[test]
+fn wasm_http_source_walks_offset_pagination_in_body() {
+    let base = mock_http_body_offset();
+
+    let pkg_root = tempfile::TempDir::new().unwrap();
+    build_and_stage(pkg_root.path());
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let store = Store::open(db_dir.path().join("weir.db").to_str().unwrap()).unwrap();
+    let engine = Engine::new(&store);
+
+    let src_cfg = Config {
+        json: serde_json::json!({
+            "base_url": base, "path": "/v1beta/properties/123:runReport",
+            "http_method": "POST",
+            "offset_param": "offset",
+            "page_size_param": "limit",
+            "page_size": 2,
+            "page_inject_into": "body",
+        })
+        .to_string(),
+    };
+    let policy = HostAllowList {
+        allowed_hosts: vec!["127.0.0.1".to_string()],
+        inject_headers: vec![],
+        credential: None,
+    };
+    let source =
+        ConnectorHandle::from_wasm_package(pkg_root.path(), "weir-rest-pkg", &src_cfg, policy, &[])
+            .expect("load wasm rest http source");
+    let dest = weir_wasm_testkit::load(
+        "ArrowSink",
+        &Config {
+            json: "{}".to_string(),
+        },
+    )
+    .unwrap();
+
+    let out = engine
+        .sync("body-offset-conn", &items_stream(), &source, &dest)
+        .expect("engine sync over body-offset-paginated wasm http source");
+    assert_eq!(
+        out.rows_written, 5,
+        "all 3 body-offset pages collected (2+2+1)"
+    );
+}
+
+/// Body-injected datetime cursor ([[WEIR-T-0154]]): the incremental lower bound lands at a
+/// nested **dot-path** of the POST body (`filter.timestamp_after`), merged into the static
+/// `request_body` without clobbering its sibling fields.
+#[test]
+fn wasm_http_source_sends_datetime_cursor_in_body() {
+    let (base, rx) = mock_http_capture(r#"[{"id":1,"updated_at":"2026-02-01T00:00:00Z"}]"#);
+
+    let pkg_root = tempfile::TempDir::new().unwrap();
+    build_and_stage(pkg_root.path());
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let store = Store::open(db_dir.path().join("weir.db").to_str().unwrap()).unwrap();
+    let engine = Engine::new(&store);
+
+    let src_cfg = Config {
+        json: serde_json::json!({
+            "base_url": base, "path": "/query",
+            "http_method": "POST",
+            "request_body": r#"{"filter":{"scope":"all"}}"#,
+            "cursor_field": "updated_at",
+            "cursor_param": "filter.timestamp_after",
+            "cursor_start": "2026-01-01T00:00:00Z",
+            "cursor_inject_into": "body",
+        })
+        .to_string(),
+    };
+    let policy = HostAllowList {
+        allowed_hosts: vec!["127.0.0.1".to_string()],
+        inject_headers: vec![],
+        credential: None,
+    };
+    let source =
+        ConnectorHandle::from_wasm_package(pkg_root.path(), "weir-rest-pkg", &src_cfg, policy, &[])
+            .expect("load wasm rest http source");
+    let dest = weir_wasm_testkit::load(
+        "ArrowSink",
+        &Config {
+            json: "{}".to_string(),
+        },
+    )
+    .unwrap();
+
+    let out = engine
+        .sync("body-datetime-conn", &posts_stream(), &source, &dest)
+        .expect("engine sync with a body-injected datetime cursor");
+    assert_eq!(out.rows_written, 1);
+
+    let req = rx.recv().expect("captured request");
+    assert!(req.starts_with("POST"), "cursor-in-body implies POST");
+    let body_json: serde_json::Value = serde_json::from_str(&request_body(&req))
+        .unwrap_or_else(|_| panic!("JSON request body; raw request: {req:?}"));
+    assert_eq!(
+        body_json["filter"]["timestamp_after"], "2026-01-01T00:00:00Z",
+        "cursor start injected at the nested dot-path"
+    );
+    assert_eq!(
+        body_json["filter"]["scope"], "all",
+        "static request_body fields survive the overlay"
+    );
+    assert!(
+        !req.lines().next().unwrap_or("").contains("timestamp_after"),
+        "the cursor must not leak into the query string"
+    );
+}
+
+/// Serves page-increment pagination **in the POST body** ([[WEIR-T-0154]]): `page` +
+/// `size` read from the JSON body, pages of 2, 2, 1 records (ids 1..=5).
+fn mock_http_body_page() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let req = read_full_request(&mut stream);
+            let body_json: serde_json::Value =
+                serde_json::from_str(&request_body(&req)).unwrap_or(serde_json::Value::Null);
+            let well_formed = req.starts_with("POST")
+                && !req.lines().next().unwrap_or("").contains("page=")
+                && body_json["size"].as_u64() == Some(2);
+            let page = body_json["page"].as_u64().unwrap_or(0);
+            let body = match (well_formed, page) {
+                (false, _) => r#"[]"#,
+                (true, 1) => r#"[{"id":1},{"id":2}]"#,
+                (true, 2) => r#"[{"id":3},{"id":4}]"#,
+                (true, 3) => r#"[{"id":5}]"#,
+                _ => r#"[]"#,
+            };
+            respond_ok(&mut stream, body);
+            if !well_formed || page >= 3 {
+                break; // short page served → guest will stop
+            }
+        }
+    });
+    format!("http://{addr}")
+}
+
+/// Body-injected page-increment pagination ([[WEIR-T-0154]]): `page`/`size` advance inside
+/// the POST body as JSON numbers; the guest walks to the short page.
+#[test]
+fn wasm_http_source_walks_page_pagination_in_body() {
+    let base = mock_http_body_page();
+
+    let pkg_root = tempfile::TempDir::new().unwrap();
+    build_and_stage(pkg_root.path());
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let store = Store::open(db_dir.path().join("weir.db").to_str().unwrap()).unwrap();
+    let engine = Engine::new(&store);
+
+    let src_cfg = Config {
+        json: serde_json::json!({
+            "base_url": base, "path": "/list",
+            "http_method": "POST",
+            "page_param": "page",
+            "page_size_param": "size",
+            "page_size": 2,
+            "page_inject_into": "body",
+        })
+        .to_string(),
+    };
+    let policy = HostAllowList {
+        allowed_hosts: vec!["127.0.0.1".to_string()],
+        inject_headers: vec![],
+        credential: None,
+    };
+    let source =
+        ConnectorHandle::from_wasm_package(pkg_root.path(), "weir-rest-pkg", &src_cfg, policy, &[])
+            .expect("load wasm rest http source");
+    let dest = weir_wasm_testkit::load(
+        "ArrowSink",
+        &Config {
+            json: "{}".to_string(),
+        },
+    )
+    .unwrap();
+
+    let out = engine
+        .sync("body-page-conn", &items_stream(), &source, &dest)
+        .expect("engine sync over body-page-paginated wasm http source");
+    assert_eq!(
+        out.rows_written, 5,
+        "all 3 body-page pages collected (2+2+1)"
+    );
+}
+
+/// Google service-account auth end-to-end ([[WEIR-T-0155]] / [[WEIR-A-0033]]): the **host**
+/// signs the RS256 JWT-bearer assertion, exchanges it at the mock token endpoint, and
+/// injects `Authorization: Bearer <minted token>` on the guest's request. The SA key
+/// never enters the sandbox — asserted against the sanitized guest config.
+#[test]
+fn wasm_http_source_google_sa_host_mints_and_injects_bearer() {
+    // A throwaway test key — never a real credential.
+    const TEST_KEY_PEM: &str = include_str!("fixtures/google_sa_test_key.pem");
+    // The host hits this to exchange the assertion (not subject to the guest egress policy).
+    let (token_url, grant_rx) = mock_http_capture(r#"{"access_token":"tok-sa","expires_in":3600}"#);
+    // The guest hits this; we capture the host-injected Authorization header.
+    let (base, req_rx) =
+        mock_http_capture(r#"[{"id":1,"title":"hi","updated_at":"2026-01-01T00:00:00Z"}]"#);
+
+    let pkg_root = tempfile::TempDir::new().unwrap();
+    build_and_stage(pkg_root.path());
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let store = Store::open(db_dir.path().join("weir.db").to_str().unwrap()).unwrap();
+    let engine = Engine::new(&store);
+
+    let cfg_json = serde_json::json!({
+        "base_url": base, "path": "/posts",
+        "auth_scheme": "google_service_account",
+        "google_sa_key_key": "service_account_key",
+        "google_scopes": ["https://www.googleapis.com/auth/analytics.readonly"],
+        "service_account_key": {
+            "client_email": "engine-test@x.iam.gserviceaccount.com",
+            "private_key": TEST_KEY_PEM,
+            "token_uri": token_url,
+        },
+    })
+    .to_string();
+    // The credential split must leave no key material in what reaches the guest.
+    let (_, guest_json) = Credential::from_auth_config(&cfg_json);
+    assert!(
+        !guest_json.contains("PRIVATE KEY") && !guest_json.contains("client_email"),
+        "SA key material must never reach the guest config; got: {guest_json}"
+    );
+    let source = host_auth_source(pkg_root.path(), &cfg_json);
+    let dest = weir_wasm_testkit::load(
+        "ArrowSink",
+        &Config {
+            json: "{}".to_string(),
+        },
+    )
+    .unwrap();
+
+    let out = engine
+        .sync("google-sa-conn", &posts_stream(), &source, &dest)
+        .expect("engine sync over google-sa wasm http source");
+    assert_eq!(
+        out.rows_written, 1,
+        "the host-authed request returned the record"
+    );
+
+    let grant = grant_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("captured token-grant request");
+    assert!(
+        grant.contains("grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer")
+            && grant.contains("assertion=eyJ"),
+        "host must run the signed JWT-bearer grant; got:\n{grant}"
+    );
+    let req = req_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("captured outbound request");
+    assert!(
+        req.to_ascii_lowercase()
+            .contains("authorization: bearer tok-sa"),
+        "host must mint + inject the google bearer; got:\n{req}"
+    );
+}
+
+/// Snowflake key-pair JWT end-to-end ([[WEIR-T-0156]] / [[WEIR-A-0033]]): the **host**
+/// signs the self-issued RS256 JWT (no token endpoint — the JWT is the bearer) and
+/// injects it plus `X-Snowflake-Authorization-Token-Type: KEYPAIR_JWT` on the guest's
+/// request. The private key never enters the sandbox; account/user stay in the guest
+/// config for `{{ config['account'] }}` templating.
+#[test]
+fn wasm_http_source_snowflake_keypair_host_signs_and_injects() {
+    const TEST_KEY_PEM: &str = include_str!("fixtures/google_sa_test_key.pem");
+    let (base, req_rx) =
+        mock_http_capture(r#"[{"id":1,"title":"hi","updated_at":"2026-01-01T00:00:00Z"}]"#);
+
+    let pkg_root = tempfile::TempDir::new().unwrap();
+    build_and_stage(pkg_root.path());
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let store = Store::open(db_dir.path().join("weir.db").to_str().unwrap()).unwrap();
+    let engine = Engine::new(&store);
+
+    let cfg_json = serde_json::json!({
+        "base_url": base, "path": "/api/v2/statements",
+        "auth_scheme": "snowflake_keypair_jwt",
+        "account": "myorg-acct1",
+        "user": "weir_demo",
+        "private_key": TEST_KEY_PEM,
+    })
+    .to_string();
+    // The split strips ONLY the private key — account/user remain for URL templating.
+    let (_, guest_json) = Credential::from_auth_config(&cfg_json);
+    assert!(
+        !guest_json.contains("PRIVATE KEY"),
+        "key material must never reach the guest config; got: {guest_json}"
+    );
+    assert!(
+        guest_json.contains("\"account\":\"myorg-acct1\""),
+        "account stays templatable in the guest config"
+    );
+    let source = host_auth_source(pkg_root.path(), &cfg_json);
+    let dest = weir_wasm_testkit::load(
+        "ArrowSink",
+        &Config {
+            json: "{}".to_string(),
+        },
+    )
+    .unwrap();
+
+    let out = engine
+        .sync("snowflake-kp-conn", &posts_stream(), &source, &dest)
+        .expect("engine sync over snowflake-keypair wasm http source");
+    assert_eq!(out.rows_written, 1);
+
+    let req = req_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("captured outbound request");
+    let lower = req.to_ascii_lowercase();
+    assert!(
+        lower.contains("authorization: bearer eyj"),
+        "host must inject the self-signed JWT bearer; got:\n{req}"
+    );
+    assert!(
+        lower.contains("x-snowflake-authorization-token-type: keypair_jwt"),
+        "host must inject the token-type header alongside the bearer; got:\n{req}"
+    );
+}
+
+/// Serves GA4-style **columnar** pages ([[WEIR-T-0159]]): body-injected offset/limit
+/// pagination, rows as `{dimensionValues:[{value},…], metricValues:[{value},…]}`.
+/// Asserts the static `dateRanges` window survives the per-page body rebuild and no
+/// cursor is injected anywhere (the cursor is track-only).
+fn mock_http_ga4() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let req = read_full_request(&mut stream);
+            let body_json: serde_json::Value =
+                serde_json::from_str(&request_body(&req)).unwrap_or(serde_json::Value::Null);
+            let well_formed = req.starts_with("POST")
+                && body_json["limit"].as_u64() == Some(2)
+                && body_json["dateRanges"][0]["startDate"] == "30daysAgo"
+                && body_json.get("date").is_none(); // track-only: never injected
+            let offset = body_json["offset"].as_u64().unwrap_or(0);
+            let body = match (well_formed, offset) {
+                (false, _) => r#"{"rows":[]}"#,
+                (true, 0) => {
+                    r#"{"rows":[
+                        {"dimensionValues":[{"value":"20260701"},{"value":"Direct"}],"metricValues":[{"value":"12"}]},
+                        {"dimensionValues":[{"value":"20260702"},{"value":"Organic Search"}],"metricValues":[{"value":"9"}]}
+                    ],"rowCount":3}"#
+                }
+                (true, 2) => {
+                    r#"{"rows":[
+                        {"dimensionValues":[{"value":"20260703"},{"value":"Referral"}],"metricValues":[{"value":"4"}]}
+                    ],"rowCount":3}"#
+                }
+                _ => r#"{"rows":[]}"#,
+            };
+            respond_ok(&mut stream, body);
+            if !well_formed || offset >= 2 {
+                break; // short page served → guest will stop
+            }
+        }
+    });
+    format!("http://{addr}")
+}
+
+/// GA4 end-to-end shape ([[WEIR-T-0159]]): POST-body offset pagination over a columnar
+/// response, flattened to schema fields by dot-path Compute mappings, with a
+/// **track-only** cursor extracted from `dimensionValues.0.value` and checkpointed.
+#[test]
+fn wasm_http_source_flattens_ga4_columnar_and_checkpoints_track_only_cursor() {
+    let base = mock_http_ga4();
+
+    let pkg_root = tempfile::TempDir::new().unwrap();
+    build_and_stage(pkg_root.path());
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let store = Store::open(db_dir.path().join("weir.db").to_str().unwrap()).unwrap();
+    let engine = Engine::new(&store);
+
+    let src_cfg = Config {
+        json: serde_json::json!({
+            "base_url": base, "path": "/v1beta/properties/123:runReport",
+            "http_method": "POST",
+            "request_body": r#"{"dimensions":[{"name":"date"}],"dateRanges":[{"startDate":"30daysAgo","endDate":"today"}]}"#,
+            "record_path": "rows",
+            "offset_param": "offset",
+            "page_size_param": "limit",
+            "page_size": 2,
+            "page_inject_into": "body",
+            "cursor_field": "date",
+            "cursor_value_path": "dimensionValues.0.value",
+            // no cursor_param → track-only: checkpoint advances, nothing injected
+        })
+        .to_string(),
+    };
+    let policy = HostAllowList {
+        allowed_hosts: vec!["127.0.0.1".to_string()],
+        inject_headers: vec![],
+        credential: None,
+    };
+    let source =
+        ConnectorHandle::from_wasm_package(pkg_root.path(), "weir-rest-pkg", &src_cfg, policy, &[])
+            .expect("load wasm rest http source");
+    let dest = weir_wasm_testkit::load(
+        "ArrowSink",
+        &Config {
+            json: "{}".to_string(),
+        },
+    )
+    .unwrap();
+
+    // Flatten the columnar rows to the schema fields with dot-path Computes.
+    let stream = ConfiguredStream {
+        stream: "traffic".to_string(),
+        sync_mode: SyncMode::Incremental,
+        cursor_field: Some("date".to_string()),
+        primary_key: Some(vec!["date".to_string(), "channel".to_string()]),
+        write_mode: WriteMode::Append,
+        mapping: MappingSpec {
+            ops: vec![
+                MappingOp::Compute {
+                    field: "date".to_string(),
+                    value: ComputeExpr::Field("dimensionValues.0.value".to_string()),
+                },
+                MappingOp::Compute {
+                    field: "channel".to_string(),
+                    value: ComputeExpr::Field("dimensionValues.1.value".to_string()),
+                },
+                MappingOp::Compute {
+                    field: "sessions".to_string(),
+                    value: ComputeExpr::Field("metricValues.0.value".to_string()),
+                },
+                MappingOp::Drop {
+                    fields: vec!["dimensionValues".to_string(), "metricValues".to_string()],
+                },
+            ],
+        },
+    };
+
+    let out = engine
+        .sync("ga4-conn", &stream, &source, &dest)
+        .expect("engine sync over the GA4-shaped wasm http source");
+    assert_eq!(
+        out.rows_written, 3,
+        "both body-offset pages collected (2+1)"
+    );
+    assert_eq!(
+        store.cursor("ga4-conn", "traffic").expect("state"),
+        Some("20260703".to_string()),
+        "track-only cursor checkpointed from dimensionValues.0.value"
+    );
+}
+
+/// Header-row zip ([[WEIR-T-0160]], the Google Sheets shape): `values` is row-arrays
+/// whose first row is the header. The guest zips data rows into objects — snake_cased
+/// header cells as field names, **ragged rows padded with null**, a `_row` index — so
+/// a mapping can filter on a zipped field name.
+#[test]
+fn wasm_http_source_zips_header_row_values() {
+    let base = mock_http_once(
+        r#"{"range":"Sheet1!A1:C4","majorDimension":"ROWS","values":[
+            ["Email Address","Full Name","Score"],
+            ["a@x.com","Ada","10"],
+            ["drop@x.com","Dee","3"],
+            ["c@x.com","Cy"]
+        ]}"#,
+    );
+
+    let pkg_root = tempfile::TempDir::new().unwrap();
+    build_and_stage(pkg_root.path());
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let store = Store::open(db_dir.path().join("weir.db").to_str().unwrap()).unwrap();
+    let engine = Engine::new(&store);
+
+    let src_cfg = Config {
+        json: serde_json::json!({
+            "base_url": base,
+            "path": "/v4/spreadsheets/1AbC/values/Sheet1",
+            "record_path": "values",
+            "header_row": true,
+        })
+        .to_string(),
+    };
+    let policy = HostAllowList {
+        allowed_hosts: vec!["127.0.0.1".to_string()],
+        inject_headers: vec![],
+        credential: None,
+    };
+    let source =
+        ConnectorHandle::from_wasm_package(pkg_root.path(), "weir-rest-pkg", &src_cfg, policy, &[])
+            .expect("load wasm rest http source");
+    let dest = weir_wasm_testkit::load(
+        "ArrowSink",
+        &Config {
+            json: "{}".to_string(),
+        },
+    )
+    .unwrap();
+
+    // Filtering on the snake_cased header name proves the zip produced named fields;
+    // the ragged row (no Score cell) must still arrive, padded — not error.
+    let stream = ConfiguredStream {
+        stream: "rows".to_string(),
+        sync_mode: SyncMode::FullRefresh,
+        cursor_field: None,
+        primary_key: Some(vec!["_row".to_string()]),
+        write_mode: WriteMode::Append,
+        mapping: MappingSpec {
+            ops: vec![MappingOp::Filter {
+                field: "email_address".to_string(),
+                op: CompareOp::Ne,
+                value: "drop@x.com".to_string(),
+            }],
+        },
+    };
+
+    let out = engine
+        .sync("sheets-conn", &stream, &source, &dest)
+        .expect("engine sync over the header-row wasm http source");
+    assert_eq!(
+        out.rows_written, 2,
+        "3 data rows (header consumed, ragged row padded) minus the filtered one"
     );
 }
