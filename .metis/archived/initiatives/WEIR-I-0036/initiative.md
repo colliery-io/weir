@@ -6,9 +6,8 @@ short_code: "WEIR-I-0036"
 created_at: 2026-07-09T03:19:40.475625+00:00
 updated_at: 2026-07-09T03:19:40.475625+00:00
 parent: WEIR-V-0001
-blocked_by:
-  - WEIR-I-0035
-archived: false
+blocked_by: [WEIR-I-0035]
+archived: true
 
 tags:
   - "#initiative"
@@ -86,6 +85,10 @@ built into the core destination. Keeping this line clean is what protects the ve
   pluggable-destination interface.
 - **Baking signal semantics into the core destination.** Rejected — violates the open-core boundary; fabric meaning
   is the extension's job.
+
+## Acceptance Criteria
+
+## Acceptance Criteria
 
 ## Acceptance Criteria
 

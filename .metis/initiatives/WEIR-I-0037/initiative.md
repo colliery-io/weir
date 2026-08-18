@@ -21,14 +21,17 @@ initiative_id: f3-freshness-triple-on-the
 
 # F3 — Freshness triple on the connector contract Initiative
 
-> **Feature request — Signal Fabric enablement (F3 of 6).** **Home: open-core.** No hard dependency, but only fully
-> meaningful together with [[WEIR-I-0035]] (F1, live sources) and consumed via [[WEIR-I-0036]] (F2). Amends the
-> connector contract ([[WEIR-A-0014]] / [[WEIR-A-0029]] / [[WEIR-S-0006]]). Filed in **discovery**.
+> **Re-scoped 2026-08-04 ([[WEIR-A-0040]]).** Originally F3 of the six-part Signal Fabric program; the
+> delivery-plane half of that program (F2/F4/F5/F6, the Signal Broker) was withdrawn. F3 is **retained as an
+> F1-supporting connector-contract amendment** — the freshness triple serves **resident sources** ([[WEIR-I-0035]])
+> directly (a heartbeat + value-timestamp is useful whether or not anything downstream subscribes) and carries the
+> deferred F1 `spec()` resident-capability fields (below). The former "fabric shape" framing — snapshot+delta channels,
+> subscribe-mid-stream, the [[WEIR-S-0017]] state/delta contract — is **dropped**; freshness is a property a source
+> stamps on records and a destination/consumer reads, nothing more.
 >
-> **Fabric shape (per [[WEIR-A-0038]]).** The delivery plane is push-based with no replay, so signals present a
-> **current-state (snapshot) + delta** shape: a subscriber connects → gets current state + deltas → goes. The
-> freshness triple rides the value/state; a **delta-only source must define its snapshot**. The state/delta contract
-> representation is an open decision to work jointly with [[WEIR-S-0017]].
+> **Feature request — connector-contract amendment.** **Home: open-core.** No hard dependency, but only fully
+> meaningful together with [[WEIR-I-0035]] (F1, live sources). Amends the connector contract
+> ([[WEIR-A-0014]] / [[WEIR-A-0029]] / [[WEIR-S-0006]]). Filed in **discovery**.
 >
 > **Inherited from F1.1 ([[WEIR-T-0137]]).** The connector `spec()` **resident-capability** fields
 > (`resident_capable`, `event_reader`) were deferred from F1 into this contract amendment — `ConnectorSpec` is a
@@ -81,8 +84,8 @@ interprets.** Missing-signal *mapping* is a Swish concern and is not filed again
   populated-but-value-unchanged record) so liveness can flow without new data.
 - **Versionable + defaulted.** Connectors that don't set freshness are valid; the contract signals
   "freshness-unsupported" explicitly rather than fabricating values.
-- **Uniform read surface.** A destination/consumer reads freshness identically across connector types — this is the
-  property F5 ([[WEIR-I-0039]]) records in the catalog and F2 ([[WEIR-I-0036]]) delivers.
+- **Uniform read surface.** A destination/consumer reads freshness identically across connector types — the same
+  fields regardless of source, read off the record like any other value.
 
 ## Alternatives Considered
 

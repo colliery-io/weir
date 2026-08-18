@@ -7,7 +7,7 @@ created_at: 2026-07-09T12:46:42.490914+00:00
 updated_at: 2026-07-09T12:46:42.490914+00:00
 parent: WEIR-V-0001
 blocked_by: []
-archived: false
+archived: true
 
 tags:
   - "#specification"

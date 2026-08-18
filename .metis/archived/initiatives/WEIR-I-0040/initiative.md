@@ -6,11 +6,8 @@ short_code: "WEIR-I-0040"
 created_at: 2026-07-09T03:19:40.666618+00:00
 updated_at: 2026-07-09T03:19:40.666618+00:00
 parent: WEIR-V-0001
-blocked_by:
-  - WEIR-I-0035
-  - WEIR-I-0037
-  - WEIR-I-0039
-archived: false
+blocked_by: [WEIR-I-0035, WEIR-I-0037, WEIR-I-0039]
+archived: true
 
 tags:
   - "#initiative"
@@ -85,6 +82,10 @@ must not bake the Swish signal contract into this source type.
   single-purpose service isn't a heavyweight connector exercise.
 - **Host the computation inside weir (a transform/compute stage).** Rejected — violates the charter boundary; weir
   carries, the service computes.
+
+## Acceptance Criteria
+
+## Acceptance Criteria
 
 ## Acceptance Criteria
 

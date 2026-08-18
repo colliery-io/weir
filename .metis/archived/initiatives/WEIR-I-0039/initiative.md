@@ -6,10 +6,8 @@ short_code: "WEIR-I-0039"
 created_at: 2026-07-09T03:19:40.617875+00:00
 updated_at: 2026-07-09T03:19:40.617875+00:00
 parent: WEIR-V-0001
-blocked_by:
-  - WEIR-I-0035
-  - WEIR-I-0037
-archived: false
+blocked_by: [WEIR-I-0035, WEIR-I-0037]
+archived: true
 
 tags:
   - "#initiative"
@@ -75,6 +73,10 @@ canonical identity, venue, counterparty) is a **Swish** concern and is not filed
   catalog; a parallel registry duplicates discovery and drifts.
 - **Deriving liveness by probing producers at query time.** Rejected — violates read-cheap; liveness comes from
   registration + heartbeat state, not query-time probing.
+
+## Acceptance Criteria
+
+## Acceptance Criteria
 
 ## Acceptance Criteria
 

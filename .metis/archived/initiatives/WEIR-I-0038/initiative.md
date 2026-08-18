@@ -6,10 +6,8 @@ short_code: "WEIR-I-0038"
 created_at: 2026-07-09T03:19:40.569295+00:00
 updated_at: 2026-07-09T03:19:40.569295+00:00
 parent: WEIR-V-0001
-blocked_by:
-  - WEIR-I-0035
-  - WEIR-I-0036
-archived: false
+blocked_by: [WEIR-I-0035, WEIR-I-0036]
+archived: true
 
 tags:
   - "#initiative"
@@ -78,6 +76,10 @@ sources with many consumers. No fabric-specific logic lives here.
   readiness rather than being a sub-check of it.
 - **Per-consumer source reads (status quo of naive designs).** Rejected — this is exactly the read amplification the
   feature exists to collapse.
+
+## Acceptance Criteria
+
+## Acceptance Criteria
 
 ## Acceptance Criteria
 
