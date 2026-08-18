@@ -1,15 +1,15 @@
 ---
-id: 001-delivery-plane-execution-model
+id: 038-delivery-plane-execution-model
 level: adr
 title: "Delivery-plane execution model (resident, inbound, host-side)"
 number: 38
 short_code: "WEIR-A-0038"
 created_at: 2026-07-09T12:46:34.939915+00:00
 updated_at: 2026-07-09T12:46:34.939915+00:00
-decision_date: 2026-07-09
+decision_date:
 decision_maker: Dylan Storey
 parent:
-archived: false
+archived: true
 
 tags:
   - "#adr"

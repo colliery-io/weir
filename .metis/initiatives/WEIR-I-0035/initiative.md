@@ -25,6 +25,13 @@ initiative_id: f1-long-lived-source-runtime
 > Signal Fabric" (Swish Exchange ADR-007 realizes the Signal Fabric *as* weir). **Home: open-core.** This is the
 > foundational feature — [[WEIR-I-0036]] (F2), [[WEIR-I-0038]] (F4), [[WEIR-I-0039]] (F5), [[WEIR-I-0040]] (F6)
 > all assume it. **Phase: design** — design proposed below, pending ratification, then decompose.
+>
+> **Superseded framing — the delivery-plane half of this program was withdrawn 2026-08-04 ([[WEIR-A-0040]]).** F1
+> itself **stands, completed** — resident sources that stay up and emit are in scope and shipped. But the downstream
+> initiatives listed above (F2/F4/F5/F6, the pub/sub delivery plane / Signal Broker) are **archived**: weir carries a
+> signal *in* and lands it; it is **not** a subscribable fabric. Read the "all assume it" / fan-out references below
+> as historical program context, not live downstream work. F3 ([[WEIR-I-0037]]) survives, re-scoped to the connector
+> contract.
 
 ## Context
 

@@ -1,22 +1,22 @@
 ---
-id: client-demo-parity-ga4-sheets
+id: end-to-end-pipeline-demo-set-ga4
 level: initiative
 title: "End-to-end pipeline demo set — GA4/Sheets/MSSQL/Snowflake/HubSpot/Stripe"
 short_code: "WEIR-I-0041"
 created_at: 2026-07-15T02:06:55.291441+00:00
-updated_at: 2026-07-15T02:12:50.555394+00:00
+updated_at: 2026-07-17T02:09:28.171135+00:00
 parent: WEIR-V-0001
 blocked_by: []
 archived: false
 
 tags:
   - "#initiative"
-  - "#phase/active"
+  - "#phase/completed"
 
 
 exit_criteria_met: false
 estimated_complexity: L
-initiative_id: client-demo-parity-ga4-sheets
+initiative_id: end-to-end-pipeline-demo-set-ga4
 ---
 
 # End-to-end pipeline demo set — GA4/Sheets/MSSQL/Snowflake/HubSpot/Stripe Initiative
