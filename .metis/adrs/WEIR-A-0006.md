@@ -5,7 +5,7 @@ title: "API protocol & versioning"
 number: 1
 short_code: "WEIR-A-0006"
 created_at: 2026-06-17T02:11:54.870508+00:00
-updated_at: 2026-06-17T02:11:54.870508+00:00
+updated_at: 2026-08-18T01:59:23.056168+00:00
 decision_date:
 decision_maker:
 parent:
@@ -13,7 +13,7 @@ archived: false
 
 tags:
   - "#adr"
-  - "#phase/draft"
+  - "#phase/decided"
 
 
 exit_criteria_met: false
@@ -22,7 +22,7 @@ initiative_id: NULL
 
 # ADR-0006: API protocol & versioning
 
-**Status:** Proposed. *Raised by: [[WEIR-S-0002]] Control Plane, [[WEIR-S-0013]] Integration Adapters.*
+**Status:** Decided (2026-08-17, Dylan Storey). *Raised by: [[WEIR-S-0002]] Control Plane, [[WEIR-S-0013]] Integration Adapters.*
 
 ## Context **[REQUIRED]**
 
@@ -30,7 +30,7 @@ The Control Plane API is the single surface for the UI and all integration adapt
 
 ## Decision **[REQUIRED]**
 
-*Proposed:* REST/JSON as the primary, broadly-consumable surface; evaluate gRPC for internal/high-throughput paths. Backward-compatible within a major version; explicit deprecation policy.
+**Decided:** REST/JSON is the API surface. **Alpha stability statement (2026-08-17):** the API is **v0/unstable** — breaking changes are allowed between releases and must be called out in the CHANGELOG; no compatibility promise is made to integrators during alpha. Freezing a backward-compatible `/api/v1` is a **beta gate**, not an alpha requirement. The gRPC question (internal/high-throughput paths) is explicitly deferred until after the v1 freeze. Once `/api/v1` exists: backward-compatible within a major version, explicit deprecation policy, adapters version against it.
 
 ## Alternatives Analysis **[CONDITIONAL: Complex Decision]**
 

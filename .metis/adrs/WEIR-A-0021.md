@@ -5,7 +5,7 @@ title: "Secrets backend abstraction"
 number: 1
 short_code: "WEIR-A-0021"
 created_at: 2026-06-17T02:12:25.845948+00:00
-updated_at: 2026-06-17T02:12:25.845948+00:00
+updated_at: 2026-08-18T01:59:25.782515+00:00
 decision_date:
 decision_maker:
 parent:
@@ -13,7 +13,7 @@ archived: false
 
 tags:
   - "#adr"
-  - "#phase/draft"
+  - "#phase/superseded"
 
 
 exit_criteria_met: false
@@ -22,7 +22,9 @@ initiative_id: NULL
 
 # ADR-0021: Secrets backend abstraction
 
-**Status:** Proposed. *Raised by: [[WEIR-S-0010]] Secrets Manager.*
+**Status:** Superseded by [[WEIR-A-0037]] (closed 2026-08-17, Dylan Storey). *Raised by: [[WEIR-S-0010]] Secrets Manager.*
+
+> **Closure note (2026-08-17):** [[WEIR-A-0037]] decided that secrets are **off-platform — consumed, not managed**: weir reads secrets from where the operator's secret system already puts them (env / mounted file / injected connection config) and re-reads per run. Under that decision there is no secrets *backend* to abstract — env/file consumption **is** the interface, and Vault/KMS integration belongs to the operator's tooling (external-secrets, mounted files), not to weir. The pluggable-backend trait proposed below is therefore not built. The user-facing follow-through (redact-on-read, write-only secret fields, `env:`/`file:` references) is scoped in [[WEIR-I-0047]].
 
 ## Context **[REQUIRED]**
 

@@ -65,5 +65,9 @@ surface + per-connector fixtures; the payoff is locality and one harness that ch
 ## Implementation Plan
 
 Single step — **decide**:
-- [ ] **Make a decision to promote for fix**: either (a) promote to a fix initiative (build the [[WEIR-A-0031]]
+- [x] **Make a decision to promote for fix**: either (a) promote to a fix initiative (build the [[WEIR-A-0031]]
   conformance kit), or (b) close, recording the reason in an ADR so future architecture reviews don't re-suggest it.
+
+## Decision (2026-08-17)
+
+**Promote — post-alpha.** Build a **thin v1** of the [[WEIR-A-0031]] conformance kit (spec/check/discover/read against author fixtures + golden outputs, on the existing `weir-wasm-testkit` build/stage seam) as the trust gate for community connectors when the catalog opens. It is explicitly **not alpha-gating**: the alpha catalog is first-party, and the alpha's misconfiguration pain is addressed by creation-time validation ([[WEIR-T-0166]]) and the live suite ([[WEIR-I-0014]]). Sequencing: after the alpha-cut initiatives ([[WEIR-I-0042]]–[[WEIR-I-0047]]); the fix initiative should be created from [[WEIR-A-0031]]'s open design questions (fixture/golden format, record/replay, publish-gate policy). Additional consumer discovered since filing: [[WEIR-A-0041]] names the conformance kit as the compensating control for guest-side TLS verification. This ticket's exit criterion is met.
