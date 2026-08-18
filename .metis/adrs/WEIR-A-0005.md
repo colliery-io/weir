@@ -5,7 +5,7 @@ title: "Open-core / periphery boundary"
 number: 1
 short_code: "WEIR-A-0005"
 created_at: 2026-06-17T02:11:53.128898+00:00
-updated_at: 2026-06-17T02:11:53.128898+00:00
+updated_at: 2026-08-18T01:59:21.662050+00:00
 decision_date:
 decision_maker:
 parent:
@@ -13,7 +13,7 @@ archived: false
 
 tags:
   - "#adr"
-  - "#phase/draft"
+  - "#phase/decided"
 
 
 exit_criteria_met: false
@@ -22,7 +22,7 @@ initiative_id: NULL
 
 # ADR-0005: Open-core / periphery boundary
 
-**Status:** Proposed (the moat boundary; see [[WEIR-V-0001]] §6). *Raised by: all.*
+**Status:** Decided (2026-08-17, Dylan Storey) — ratified as proposed. *Raised by: all. Ratification recorded during the alpha decision-closure pass; the drafted decision below stands unchanged.*
 
 ## Context **[REQUIRED]**
 

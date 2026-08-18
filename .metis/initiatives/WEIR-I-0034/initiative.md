@@ -65,6 +65,10 @@ vocabulary into one typed schema alongside [[WEIR-I-0033]], addressing the coupl
 ## Implementation Plan
 
 Single step — **decide**:
-- [ ] **Make a decision to promote for fix**: either (a) promote to a fix initiative (per-connection allow-list, or
+- [x] **Make a decision to promote for fix**: either (a) promote to a fix initiative (per-connection allow-list, or
   the typed auth-scheme schema with [[WEIR-I-0033]]), or (b) close, recording in an ADR that `allow_all` is
   intentional until scoped egress is needed — so future reviews don't re-suggest it.
+
+## Decision (2026-08-17)
+
+**Split decision, as the ticket itself anticipated.** (1) The **seam stays as-is**: `allow_all` remains the intentional production policy until scoped egress has a concrete driver (multi-tenant hardening beyond the alpha posture of [[WEIR-I-0046]]); do **not** build the per-connection allow-list speculatively. (2) The **real action — the shared `auth_scheme` vocabulary — merges into the promoted [[WEIR-I-0033]] refactor** (one typed schema, one writer, one reader). (3) New fact since filing: hostname-keyed TCP allow-lists are *impossible* today regardless of policy depth (`authorize_tcp` sees only the resolved `SocketAddr`; weir matches IP strings) — a **hostname-carrying TCP egress FR was filed with fidius on 2026-08-17** (`TcpTarget { host, addr }` + resolve-and-pin; see [[WEIR-A-0041]] Neutral consequences). When that lands, `HostAllowList` grows name matching, and any future per-connection allow-list becomes honest. This ticket's exit criterion is met.

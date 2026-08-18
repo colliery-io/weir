@@ -63,5 +63,9 @@ alongside [[WEIR-I-0034]] since they share the auth-scheme vocabulary.
 ## Implementation Plan
 
 Single step — **decide**:
-- [ ] **Make a decision to promote for fix**: either (a) promote to a fix initiative (extract the manifest compiler,
+- [x] **Make a decision to promote for fix**: either (a) promote to a fix initiative (extract the manifest compiler,
   likely with [[WEIR-I-0034]]), or (b) close, recording the reason in an ADR so future reviews don't re-suggest it.
+
+## Decision (2026-08-17)
+
+**Promote — post-alpha, combined with [[WEIR-I-0034]]'s auth-vocabulary consolidation** as one typed-contract refactor: `manifest::compile(manifest, stream, user_cfg) -> (GuestConfig, MappingSpec, credential scheme)` with typed outputs, killing the `__mapping` side-channel and giving the duplicated auth `match` blocks one home. The 2026-08-16 alpha review independently re-identified this stringly-typed plumbing as the root cause of the silent-typo failure class — the third time it has surfaced, confirming promotion. **Not alpha-gating:** the alpha mitigation is creation-time validation ([[WEIR-T-0166]], which rejects unknown connectors and config-shape errors at POST /connections). Sequence the refactor after the alpha-cut initiatives, before opening manifest authoring to outside contributors. This ticket's exit criterion is met.
