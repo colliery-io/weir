@@ -66,6 +66,14 @@ jobs:
       - name: Install trunk (embedded-UI build)
         run: cargo install trunk --locked
 
+      # diesel's pq-sys links libpq dynamically; the Linux runner images ship it
+      # but macOS runners keep brew's libpq keg-only and off the linker path.
+      - name: Install libpq (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew list libpq >/dev/null 2>&1 || brew install libpq
+          echo "PQ_LIB_DIR=$(brew --prefix libpq)/lib" >> "$GITHUB_ENV"
+
       - name: Build the web UI
         run: trunk build --release
         working-directory: weir-ui
@@ -90,6 +98,10 @@ jobs:
             export WEIR_MANIFESTS_DIR="$PWD/manifests"
             export WEIR_DEST_MANIFESTS_DIR="$PWD/dest-manifests"
             ./weir api --port 8080   # first run on a fresh store prints the admin key ONCE
+
+          Runtime libraries (dynamically linked): libpq, sqlite3, bzip2.
+            Debian/Ubuntu: apt install libpq5 libsqlite3-0 libbz2-1.0
+            macOS:         brew install libpq
 
           Docs: https://github.com/colliery-io/weir/tree/main/docs
           EOF
