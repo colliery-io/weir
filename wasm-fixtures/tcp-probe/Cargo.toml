@@ -1,0 +1,33 @@
+# Standalone (own [workspace]) so the parent weir workspace doesn't try to build
+# this wasm-only crate natively. A minimal **TCP probe** connector for egress-policy
+# tests ([[WEIR-T-0175]] hostname-carrying TCP egress): dials `host:port` over the
+# host-brokered `fidius_guest::sockets::tcp` tier and returns the server's FIRST
+# bytes — enough to prove a name-keyed allow-list end-to-end against any
+# server-speaks-first wire protocol (MySQL's handshake greeting, notably) without
+# implementing the protocol.
+[workspace]
+
+[package]
+name = "weir-tcp-probe-wasm"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+fidius-guest = "0.5.8"
+fidius-macro = "0.5.8"
+wit-bindgen = "0.44"
+weir-connector-types = { path = "../../crates/weir-connector-types" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[build-dependencies]
+fidius-build = "0.5.8"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true

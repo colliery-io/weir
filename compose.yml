@@ -13,7 +13,7 @@
 #
 # Host ports are overridable to coexist with local services (weir's is the only
 # non-loopback publish): WEIR_HTTP_HOST_PORT (8080), WEIR_PG_HOST_PORT (5432),
-# WEIR_MSSQL_HOST_PORT (1433), WEIR_MINIO_HOST_PORT (9000).
+# WEIR_MSSQL_HOST_PORT (1433), WEIR_MINIO_HOST_PORT (9000), WEIR_MYSQL_HOST_PORT (3306).
 # Postgres is NOT exposed to the network; the weir service reaches it over the
 # compose network at `postgres:5432` (never localhost).
 name: weir
@@ -74,6 +74,23 @@ services:
       - >
         /opt/mssql-tools18/bin/sqlcmd -S mssql -U sa -P "weirStrong!Pass1" -C -b -i /fixtures/seed.sql &&
         echo "seeded weir_demo"
+
+  # MySQL — a server-speaks-first wire target for the TCP egress-policy probe
+  # ([[WEIR-T-0175]] hostname-carrying egress; `wasm_tcp_probe_engine.rs`). No
+  # weir MySQL connector exists yet ([[WEIR-I-0043]] post-alpha) — the probe only
+  # reads the unsolicited handshake greeting. Loopback-only; port overridable.
+  mysql:
+    profiles: ["integration"]
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: "weir"
+    ports:
+      - "127.0.0.1:${WEIR_MYSQL_HOST_PORT:-3306}:3306"
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -uroot -pweir || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
 
   # Dex — OIDC provider for the auth integration/e2e ([[WEIR-T-0088]]). Test-only.
   dex:
