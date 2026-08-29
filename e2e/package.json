@@ -1,1 +1,1 @@
-{"name":"weir-e2e","private":true,"version":"0.0.0","devDependencies":{"@playwright/test":"^1.61.1"}}
+{"name":"weir-e2e","private":true,"version":"0.0.1-alpha","devDependencies":{"@playwright/test":"^1.61.1"}}

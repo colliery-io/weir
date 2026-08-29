@@ -29,6 +29,9 @@ opentelemetry-otlp = { version = "0.31", optional = true, features = ["grpc-toni
 opentelemetry_sdk = { version = "0.31", optional = true, features = ["rt-tokio"] }
 tracing-opentelemetry = { version = "0.32", optional = true }
 
+[dev-dependencies]
+tempfile = "3"
+
 [features]
 telemetry = ["dep:opentelemetry", "dep:opentelemetry-otlp", "dep:opentelemetry_sdk", "dep:tracing-opentelemetry"]
 # The k8s actuator/autoscaler ([[WEIR-I-0021]]) — enables `weir autoscaler`.

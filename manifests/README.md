@@ -13,26 +13,31 @@ carries a header naming the docs it was written from. License: Apache-2.0 (this 
 
 ## The set
 
-34 connectors, each importing cleanly through `weir-importer` onto the shared runtime:
+36 connectors (the count is `ls *.yaml | wc -l` — keep this line honest), each importing
+cleanly through `weir-importer` onto the shared runtime:
 
 `airtable` `asana` `coingecko` `coinpaprika` `exchangerate` `frankfurter` `github`
-`gitlab` `hubspot` `intercom` `jira` `jsonplaceholder` `mediawiki` `nasa` `newsapi`
-`notion` `nps` `omdb` `openaq` `openfda` `openlibrary` `openweather` `pagerduty`
-`pokeapi` `rickandmorty` `slack` `spotify` `square` `stripe` `ticketmaster` `tmdb`
-`todoist` `xkcd` `zendesk`
+`gitlab` `google-analytics` `google-sheets` `hubspot` `intercom` `jira`
+`jsonplaceholder` `mediawiki` `nasa` `newsapi` `notion` `nps` `omdb` `openaq`
+`openfda` `openlibrary` `openweather` `pagerduty` `pokeapi` `rickandmorty` `slack`
+`spotify` `square` `stripe` `ticketmaster` `tmdb` `todoist` `xkcd` `zendesk`
 
 Run any through the **preview** (`POST /catalog/preview`) to see its tier / confidence
-/ runtime gaps before onboarding. **Auth** (bearer, header + query-param api-key) is
-applied by the runtime ([[WEIR-I-0008]]) — the manifest declares the scheme, and the
-secret (`api_key`) is supplied per-connection. **Templated `url_base`** (`{{ config[…] }}`
-tenant subdomain / account id), **page / offset / opaque-cursor pagination** — carried in
-the query string or **injected into the POST body** ([[WEIR-T-0154]], e.g. Notion's
-`start_cursor`) — **POST-with-body requests**, **`Link`-header pagination**, and
-**single-object** (non-array) responses are all handled.
+/ runtime gaps before onboarding. **Auth** (bearer, header + query-param api-key,
+OAuth2 refresh/client-credentials, Google service-account + Snowflake key-pair JWT) is
+applied **host-side** ([[WEIR-A-0033]]) — the manifest declares the scheme, and the
+secret is supplied per-connection, never entering the connector sandbox. **Templated
+`url_base`** (`{{ config[…] }}` tenant subdomain / account id), **page / offset /
+opaque-cursor pagination** — carried in the query string or **injected into the POST
+body** ([[WEIR-T-0154]], e.g. Notion's `start_cursor`) — **cursor-from-last-record +
+`has_more` stop** ([[WEIR-T-0168]], Stripe's `starting_after`), **POST-with-body
+requests**, **`Link`-header pagination**, and **single-object** (non-array) responses
+are all handled.
 
-## Known gaps (authored, but beyond the runtime today)
+## Verification honesty
 
-Manifests also exist for `restcountries`, `youtube`, `usgs`, `weatherapi`, and
-`dogceo`, but they don't yet import — they need features the shared runtime doesn't
-cover (response envelopes, cursor pagination, etc.). They get vendored here as the
-runtime grows.
+Importing cleanly is not the same as verified against the live API: the no-auth set
+(`coinpaprika`, `frankfurter`, `jsonplaceholder`, `rickandmorty`, `xkcd`) runs live in
+the test suite; keyed connectors run live only where a secret bundle exists
+(`angreal test connectors-live`). Treat un-live-tested manifests as
+well-founded-but-unverified until the live suite covers them.

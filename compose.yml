@@ -1,15 +1,21 @@
-# weir stack — one Postgres, two entrypoints.
+# weir stack — one Postgres, two profiles ([[WEIR-T-0173]]).
 #
-#   Demo (control plane + Postgres SoR):   docker compose --profile demo up --build
-#                                          (or: angreal docker up)  → http://localhost:8080
-#   Integration tests (Postgres only):     docker compose up -d --wait
-#                                          (or: angreal integration up/test)
+#   Demo (weir + Postgres ONLY):            docker compose --profile demo up --build
+#                                           (or: angreal docker up)  → http://localhost:8080
+#   Integration estate (pg/mssql/dex/minio): docker compose --profile integration up -d --wait
+#                                           (or: angreal integration up/test)
 #
-# Postgres is the single SoR. It's only published on loopback (127.0.0.1) for the
-# host-run integration tests; it is NOT exposed to the network, and the weir
-# service reaches it over the compose network at `postgres:5432` (never localhost).
-# The `weir` service is gated behind the `demo` profile, so a bare `up` (integration)
-# starts only Postgres and never builds the image.
+# Postgres is the single SoR and stays unprofiled (both paths need it; a bare `up`
+# starts only Postgres). The test-only services (MSSQL + seed, Dex, MinIO + seed)
+# carry the `integration` profile so the demo never pulls the ~1.5GB SQL Server
+# image. Explicitly targeting a profiled service still works without the flag
+# (compose activates its profile), so `docker compose up -d dex` is fine.
+#
+# Host ports are overridable to coexist with local services (weir's is the only
+# non-loopback publish): WEIR_HTTP_HOST_PORT (8080), WEIR_PG_HOST_PORT (5432),
+# WEIR_MSSQL_HOST_PORT (1433), WEIR_MINIO_HOST_PORT (9000).
+# Postgres is NOT exposed to the network; the weir service reaches it over the
+# compose network at `postgres:5432` (never localhost).
 name: weir
 
 services:
@@ -36,6 +42,7 @@ services:
   # ([[WEIR-T-0161]]). Loopback-only; host port overridable to coexist. Test-only;
   # plaintext login (Force Encryption off by default) is the pre-authorized demo path.
   mssql:
+    profiles: ["integration"]
     image: mcr.microsoft.com/mssql/server:2022-latest
     environment:
       ACCEPT_EULA: "Y"
@@ -54,6 +61,7 @@ services:
 
   # Seed the demo database + table the integration test reads, then exit.
   mssql-seed:
+    profiles: ["integration"]
     image: mcr.microsoft.com/mssql/server:2022-latest
     depends_on:
       mssql:
@@ -69,6 +77,7 @@ services:
 
   # Dex — OIDC provider for the auth integration/e2e ([[WEIR-T-0088]]). Test-only.
   dex:
+    profiles: ["integration"]
     image: dexidp/dex:v2.41.1
     command: ["dex", "serve", "/etc/dex/config.yaml"]
     volumes:
@@ -90,6 +99,7 @@ services:
   # MinIO — an S3-compatible object store for the `s3` connector's integration test
   # ([[WEIR-T-0109]]). Loopback-only; host port overridable to coexist. Test-only.
   minio:
+    profiles: ["integration"]
     image: minio/minio:RELEASE.2024-09-13T20-26-02Z
     command: ["server", "/data"]
     environment:
@@ -105,6 +115,7 @@ services:
 
   # Seed the `weir-test` bucket with the NDJSON fixtures, then exit.
   minio-seed:
+    profiles: ["integration"]
     image: minio/mc:RELEASE.2024-09-16T17-43-14Z
     depends_on:
       minio:
@@ -134,4 +145,5 @@ services:
       # Postgres is the SoR; weir connects via libpq over the compose network.
       WEIR_DB: "postgres://weir:weir@postgres:5432/weir"
     ports:
-      - "8080:8080"
+      # Overridable so the demo can coexist with another service on 8080.
+      - "${WEIR_HTTP_HOST_PORT:-8080}:8080"

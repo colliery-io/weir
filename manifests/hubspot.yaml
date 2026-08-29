@@ -23,9 +23,22 @@ streams:
         extractor:
           type: DpathExtractor
           field_path: ["results"]       # ⚠ unconfirmed — see Open questions
-      # Paginator omitted: HubSpot uses opaque-cursor pagination (after=<token>),
-      # which cannot be expressed as PageIncrement or OffsetIncrement.
-      # See Open questions #1.
+      # Opaque-cursor pagination ([[WEIR-T-0168]]): ?after=<paging.next.after>, limit=100 —
+      # developers.hubspot.com/docs/api/crm/contacts (paging section).
+      paginator:
+        type: DefaultPaginator
+        page_size_option:
+          type: RequestOption
+          inject_into: request_parameter
+          field_name: limit
+        page_token_option:
+          type: RequestOption
+          inject_into: request_parameter
+          field_name: after
+        pagination_strategy:
+          type: CursorPagination
+          page_size: 100
+          cursor_value: "{{ response['paging']['next']['after'] }}"
     schema_loader:
       type: InlineSchemaLoader
       schema:
@@ -54,7 +67,21 @@ streams:
         extractor:
           type: DpathExtractor
           field_path: ["results"]            # ⚠ unconfirmed — see Open questions #3
-      # Paginator omitted: same cursor-pagination caveat as contacts.
+      # Opaque-cursor pagination ([[WEIR-T-0168]]) — same after/limit model as contacts.
+      paginator:
+        type: DefaultPaginator
+        page_size_option:
+          type: RequestOption
+          inject_into: request_parameter
+          field_name: limit
+        page_token_option:
+          type: RequestOption
+          inject_into: request_parameter
+          field_name: after
+        pagination_strategy:
+          type: CursorPagination
+          page_size: 100
+          cursor_value: "{{ response['paging']['next']['after'] }}"
     schema_loader:
       type: InlineSchemaLoader
       schema:
@@ -83,7 +110,21 @@ streams:
         extractor:
           type: DpathExtractor
           field_path: ["results"]            # ⚠ unconfirmed — see Open questions #3
-      # Paginator omitted: same cursor-pagination caveat as contacts.
+      # Opaque-cursor pagination ([[WEIR-T-0168]]) — same after/limit model as contacts.
+      paginator:
+        type: DefaultPaginator
+        page_size_option:
+          type: RequestOption
+          inject_into: request_parameter
+          field_name: limit
+        page_token_option:
+          type: RequestOption
+          inject_into: request_parameter
+          field_name: after
+        pagination_strategy:
+          type: CursorPagination
+          page_size: 100
+          cursor_value: "{{ response['paging']['next']['after'] }}"
     schema_loader:
       type: InlineSchemaLoader
       schema:

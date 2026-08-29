@@ -283,8 +283,16 @@ enum PaginationStrategy {
         page_size: Option<u32>,
     },
     CursorPagination {
-        /// e.g. `{{ response['response_metadata']['next_cursor'] }}` — the next-page token.
+        /// e.g. `{{ response['response_metadata']['next_cursor'] }}` — the next-page token —
+        /// or `{{ last_record['id'] }}` for Stripe-style cursor-from-last-record.
         cursor_value: String,
+        /// e.g. `{{ not response['has_more'] }}` — stop when the referenced response bool
+        /// is false ([[WEIR-T-0168]]); only that idiom is expressible.
+        #[serde(default)]
+        stop_condition: Option<String>,
+        /// Airbyte carries the cursor strategy's page size on the strategy itself.
+        #[serde(default)]
+        page_size: Option<u32>,
     },
     #[serde(other)]
     Other,
@@ -998,16 +1006,48 @@ fn map_paginator(p: &Option<Paginator>) -> Option<Pagination> {
             size: page_size.unwrap_or(50),
             inject_into,
         }),
-        PaginationStrategy::CursorPagination { cursor_value } => {
+        PaginationStrategy::CursorPagination {
+            cursor_value,
+            stop_condition,
+            page_size,
+        } => {
             // Link-header form: the cursor references the response `Link` header (rel="next"),
-            // not a body path → follow the header ([[WEIR-T-0070]]). Otherwise a body cursor.
+            // not a body path → follow the header ([[WEIR-T-0070]]). Otherwise a body cursor —
+            // sourced from the response, or from the LAST record ([[WEIR-T-0168]] Stripe form).
             let lc = cursor_value.to_ascii_lowercase();
             if lc.contains("headers") && lc.contains("link") {
                 Some(Pagination::LinkHeader)
             } else {
+                let cursor_record_field = lc
+                    .contains("last_record")
+                    .then(|| bracket_path(cursor_value, "last_record"))
+                    .filter(|p| !p.is_empty());
+                let cursor_path = if cursor_record_field.is_some() {
+                    String::new()
+                } else {
+                    response_path(cursor_value)
+                };
+                // `{{ not response['has_more'] }}` (or `… is false`) — the only stop idiom
+                // the runtime expresses: stop when the response bool is false. Airbyte's
+                // contract is "stop when the template is TRUE", so ONLY the negated idiom
+                // lowers; a positive condition (`{{ response['is_last_page'] }}`) would
+                // invert — stopping after page 1 exactly when it should continue — so it
+                // is dropped and cursor-absence terminates pagination instead.
+                let stop_on_false_path = stop_condition
+                    .as_ref()
+                    .filter(|s| {
+                        let l = s.to_ascii_lowercase();
+                        l.contains("not ") || l.contains("is false")
+                    })
+                    .map(|s| bracket_path(s, "response"))
+                    .filter(|p| !p.is_empty());
                 Some(Pagination::Cursor {
-                    cursor_path: response_path(cursor_value),
+                    cursor_path,
                     token_param: page_param.unwrap_or_else(|| "cursor".into()),
+                    cursor_record_field,
+                    stop_on_false_path,
+                    size_param: size_param.clone(),
+                    size: *page_size,
                     inject_into,
                 })
             }
@@ -1019,15 +1059,34 @@ fn map_paginator(p: &Option<Paginator>) -> Option<Pagination> {
 /// Extract the dpath from a `{{ response['a']['b'] }}` cursor template → `"a.b"`
 /// (the bracketed keys after `response`). Returns "" if no brackets found.
 fn response_path(template: &str) -> String {
+    bracket_path(template, "response")
+}
+
+/// The dotted path of the bracketed keys after `root` in a `{{ root['a']['b'] }}` template
+/// (e.g. `bracket_path("{{ last_record['id'] }}", "last_record")` → `"id"`). Returns ""
+/// when `root` isn't referenced or carries no bracketed keys.
+fn bracket_path(template: &str, root: &str) -> String {
+    let Some(start) = template.find(root) else {
+        return String::new();
+    };
     let mut parts: Vec<&str> = Vec::new();
-    let mut rest = template;
+    let mut rest = &template[start + root.len()..];
     while let Some(i) = rest.find('[') {
+        // Brackets must follow contiguously (allowing whitespace) — stop at the first
+        // non-bracket so `response['a'] and other['b']` doesn't merge paths.
+        if !rest[..i].trim().is_empty() {
+            break;
+        }
         rest = &rest[i + 1..];
         let key = rest.trim_start_matches([' ', '\'', '"']);
         match key.find(['\'', '"']) {
             Some(end) => {
                 parts.push(&key[..end]);
                 rest = &key[end..];
+                // Skip the closing quote+bracket before looking for the next '['.
+                if let Some(close) = rest.find(']') {
+                    rest = &rest[close + 1..];
+                }
             }
             None => break,
         }
@@ -1757,10 +1816,15 @@ streams:
             Pagination::Cursor {
                 cursor_path,
                 token_param,
+                cursor_record_field,
+                stop_on_false_path,
                 inject_into,
+                ..
             } => {
                 assert_eq!(cursor_path, "next_cursor");
                 assert_eq!(token_param, "start_cursor");
+                assert!(cursor_record_field.is_none());
+                assert!(stop_on_false_path.is_none());
                 assert_eq!(*inject_into, InjectInto::Body);
             }
             other => panic!("expected cursor pagination, got {other:?}"),
@@ -1768,6 +1832,142 @@ streams:
         let inc = s.incremental.as_ref().expect("incremental");
         assert_eq!(inc.cursor_param, "filter.timestamp_after");
         assert_eq!(inc.inject_into, InjectInto::Body);
+    }
+
+    #[test]
+    fn imports_stripe_style_last_record_cursor() {
+        // [[WEIR-T-0168]]: cursor-from-last-record + has_more stop + the strategy's page
+        // size lower onto the runtime's Stripe-shaped pagination keys.
+        let yaml = r#"
+type: DeclarativeSource
+streams:
+  - type: DeclarativeStream
+    name: charges
+    retriever:
+      type: SimpleRetriever
+      requester:
+        type: HttpRequester
+        url_base: "https://api.stripe.com"
+        path: "/v1/charges"
+      record_selector:
+        type: RecordSelector
+        extractor:
+          type: DpathExtractor
+          field_path: ["data"]
+      paginator:
+        type: DefaultPaginator
+        page_size_option:
+          type: RequestOption
+          inject_into: request_parameter
+          field_name: limit
+        page_token_option:
+          type: RequestOption
+          inject_into: request_parameter
+          field_name: starting_after
+        pagination_strategy:
+          type: CursorPagination
+          page_size: 100
+          cursor_value: "{{ last_record['id'] }}"
+          stop_condition: "{{ not response['has_more'] }}"
+    schema_loader:
+      type: InlineSchemaLoader
+      schema:
+        type: object
+        properties:
+          id: { type: string }
+"#;
+        let m = import_yaml("stripeish", yaml).expect("import");
+        match m.streams[0].pagination.as_ref().expect("pagination") {
+            Pagination::Cursor {
+                cursor_path,
+                token_param,
+                cursor_record_field,
+                stop_on_false_path,
+                size_param,
+                size,
+                inject_into,
+            } => {
+                assert_eq!(cursor_path, "");
+                assert_eq!(token_param, "starting_after");
+                assert_eq!(cursor_record_field.as_deref(), Some("id"));
+                assert_eq!(stop_on_false_path.as_deref(), Some("has_more"));
+                assert_eq!(size_param.as_deref(), Some("limit"));
+                assert_eq!(*size, Some(100));
+                assert_eq!(*inject_into, InjectInto::Query);
+            }
+            other => panic!("expected cursor pagination, got {other:?}"),
+        }
+    }
+
+    /// Polarity guard: the runtime's `stop_on_false_path` stops when the field is
+    /// FALSE, but Airbyte's `stop_condition` stops when the template is TRUE — so a
+    /// POSITIVE condition (`{{ response['is_last_page'] }}`) must NOT lower (it would
+    /// invert: stop after page 1 exactly when it should continue). Only the negated
+    /// idiom (`not …` / `… is false`) lowers.
+    #[test]
+    fn positive_stop_condition_is_dropped_not_inverted() {
+        let paginator = |stop: &str| {
+            format!(
+                r#"
+type: DeclarativeSource
+streams:
+  - type: DeclarativeStream
+    name: things
+    retriever:
+      type: SimpleRetriever
+      requester:
+        type: HttpRequester
+        url_base: "https://api.example.com"
+        path: "/things"
+      record_selector:
+        type: RecordSelector
+        extractor:
+          type: DpathExtractor
+          field_path: ["data"]
+      paginator:
+        type: DefaultPaginator
+        page_token_option:
+          type: RequestOption
+          inject_into: request_parameter
+          field_name: starting_after
+        pagination_strategy:
+          type: CursorPagination
+          cursor_value: "{{{{ last_record['id'] }}}}"
+          stop_condition: "{stop}"
+    schema_loader:
+      type: InlineSchemaLoader
+      schema:
+        type: object
+        properties:
+          id: {{ type: string }}
+"#
+            )
+        };
+        let stop_path = |yaml: &str| match import_yaml("ex", yaml).expect("import").streams[0]
+            .pagination
+            .as_ref()
+            .expect("pagination")
+        {
+            Pagination::Cursor {
+                stop_on_false_path, ..
+            } => stop_on_false_path.clone(),
+            other => panic!("expected cursor pagination, got {other:?}"),
+        };
+
+        // Positive condition: dropped (cursor-absence terminates), never inverted.
+        assert_eq!(
+            stop_path(&paginator("{{ response['is_last_page'] }}")),
+            None
+        );
+        // Both negated idioms still lower.
+        assert_eq!(
+            stop_path(&paginator("{{ not response['has_more'] }}")).as_deref(),
+            Some("has_more")
+        );
+        assert_eq!(
+            stop_path(&paginator("{{ response['has_more'] is false }}")).as_deref(),
+            Some("has_more")
+        );
     }
 
     #[test]

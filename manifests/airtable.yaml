@@ -27,8 +27,23 @@ streams:
           type: DpathExtractor
           field_path: ["records"]
 
-      # Paginator OMITTED — Airtable uses an opaque string offset cursor.
-      # Neither PageIncrement nor OffsetIncrement can model it. See Open Questions #2.
+      # Opaque-cursor pagination ([[WEIR-T-0168]]): the response's `offset` token is passed
+      # back as `?offset=<token>` until absent; pageSize=100 (max) —
+      # airtable.com/developers/web/api/list-records.
+      paginator:
+        type: DefaultPaginator
+        page_size_option:
+          type: RequestOption
+          inject_into: request_parameter
+          field_name: pageSize
+        page_token_option:
+          type: RequestOption
+          inject_into: request_parameter
+          field_name: offset
+        pagination_strategy:
+          type: CursorPagination
+          page_size: 100
+          cursor_value: "{{ response['offset'] }}"
 
     # incremental_sync OMITTED — no time-based query parameter exists. See Open Questions #3.
 

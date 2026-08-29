@@ -78,10 +78,31 @@ def write_version(new_version):
                         f.write(updated)
                     print(f"  Updated {os.path.relpath(cargo_path, cwd)}")
 
+    # Update connector guest crates (standalone workspaces, excluded from the host
+    # workspace): both their own [package] version AND their weir-connector-types
+    # path-dep pin — a stale pin hard-fails cargo resolution after a bump.
+    for cargo_path in connector_cargo_paths():
+        with open(cargo_path, "r") as f:
+            content = f.read()
+        updated = re.sub(
+            r'(\[package\]\s*\n(?:.*\n)*?version\s*=\s*")[^"]+(")',
+            rf'\g<1>{new_version}\2',
+            content,
+        )
+        updated = re.sub(
+            r'(weir-connector-types\s*=\s*\{[^}]*version\s*=\s*")[^"]+(")',
+            rf'\g<1>{new_version}\2',
+            updated,
+        )
+        if updated != content:
+            with open(cargo_path, "w") as f:
+                f.write(updated)
+            print(f"  Updated {os.path.relpath(cargo_path, cwd)}")
+
 
 def bump(version, part):
-    """Bump a semver version string."""
-    major, minor, patch = [int(x) for x in version.split(".")]
+    """Bump a semver version string (a pre-release suffix like `-alpha` is dropped)."""
+    major, minor, patch = [int(x) for x in version.split("-")[0].split(".")]
     if part == "major":
         return f"{major + 1}.0.0"
     elif part == "minor":
@@ -90,6 +111,18 @@ def bump(version, part):
         return f"{major}.{minor}.{patch + 1}"
     else:
         raise ValueError(f"Unknown version part: {part}")
+
+
+def connector_cargo_paths():
+    """Cargo.toml of every standalone connector guest crate (crates/connectors/*)."""
+    paths = []
+    connectors_dir = os.path.join(cwd, "crates", "connectors")
+    if os.path.isdir(connectors_dir):
+        for name in sorted(os.listdir(connectors_dir)):
+            cargo_path = os.path.join(connectors_dir, name, "Cargo.toml")
+            if os.path.isfile(cargo_path):
+                paths.append(cargo_path)
+    return paths
 
 
 def find_all_versions():
@@ -126,6 +159,18 @@ def find_all_versions():
                 if match:
                     rel = os.path.relpath(cargo_path, cwd)
                     versions[rel] = match.group(1)
+
+    # Check connector guest crates: own version + the weir-connector-types pin.
+    for cargo_path in connector_cargo_paths():
+        with open(cargo_path, "r") as f:
+            content = f.read()
+        rel = os.path.relpath(cargo_path, cwd)
+        match = re.search(r'\[package\]\s*\n(?:.*\n)*?version\s*=\s*"([^"]+)"', content)
+        if match:
+            versions[rel] = match.group(1)
+        match = re.search(r'weir-connector-types\s*=\s*\{[^}]*version\s*=\s*"([^"]+)"', content)
+        if match:
+            versions[f"{rel} (weir-connector-types pin)"] = match.group(1)
 
     return versions
 

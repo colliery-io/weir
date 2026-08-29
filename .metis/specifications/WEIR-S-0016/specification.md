@@ -83,9 +83,10 @@ All auth is now injected **host-side** ([[WEIR-A-0033]]); the secret never enter
 | No pagination (single page) | — | ✅ | done | xkcd, frankfurter |
 | `PageIncrement` | `Pagination::Page` | ✅ | done | rickandmorty (~7 pages) |
 | `OffsetIncrement` | `Pagination::Offset` | ✅ | done | ~16 manifests |
-| `CursorPagination` (response-body token) | `Pagination::Cursor` | ✅ | done | slack, square, intercom |
+| `CursorPagination` (response-body token) | `Pagination::Cursor` | ✅ | done | slack, square, intercom, hubspot, airtable |
 | `CursorPagination` via `Link` header | `Pagination::LinkHeader` (rest follows `rel="next"`) | ✅ | [[WEIR-T-0070]] | github |
-| `DefaultPaginator` page-size param | (param mapping) | ✅ | done | — |
+| `CursorPagination` from `last_record[...]` + `stop_condition` (`not response[...]` idiom) | `Pagination::Cursor` (`cursor_record_field` + `stop_on_false_path`) | ✅ | [[WEIR-T-0168]] | stripe |
+| `DefaultPaginator` page-size param | (param mapping; incl. cursor strategies) | ✅ | done | stripe, hubspot, airtable |
 
 ### Incremental (cursors)
 
@@ -125,7 +126,7 @@ All auth is now injected **host-side** ([[WEIR-A-0033]]); the secret never enter
 | `request_headers` (static) | rest: static headers on the request | ✅ | [[WEIR-T-0068]] | notion (`Notion-Version`) |
 | `request_body_json` / `request_body_data` (POST body) | rest: POST body (config-templated) | ✅ | [[WEIR-T-0068]] | notion |
 | HTTP method `POST` | rest: `http_method` | ✅ | [[WEIR-T-0068]] | notion |
-| Body-cursor pagination (cursor in the POST body — full Notion) | — | ❌ | later (reported) | notion |
+| Body-cursor pagination (cursor in the POST body — full Notion) | rest: `page_inject_into: body` ([[WEIR-T-0154]]) | ✅ | [[WEIR-T-0154]] | notion (engine test: body-cursor walk) |
 
 ### Error handling
 
@@ -176,3 +177,4 @@ All auth is now injected **host-side** ([[WEIR-A-0033]]); the secret never enter
 | 2026-06-28 | Initial ledger seeded from current state (commit `06e48a1` + demo arc). | Establish the target/current map driving [[WEIR-I-0008]]. |
 | 2026-06-29 | OAuth2 + session-token rows ❌→✅; bearer/header/query rows moved host-side ([[WEIR-T-0063]] / [[WEIR-A-0033]]). | Auth coverage landed + migrated to host-side injection. |
 | 2026-06-30 | List + substream partition-router rows ❌→✅ ([[WEIR-T-0064]]). | Partition routing landed (connector-internal in the `rest` runtime). |
+| 2026-08-25 | New row ✅: `last_record[...]` cursor + `stop_condition` (Stripe's `starting_after`/`has_more`) — runtime `page_cursor_record_field`/`page_stop_on_false_path` + importer lowering ([[WEIR-T-0168]]). Body-cursor row ❌→✅ (landed with [[WEIR-T-0154]], proven by the engine body-cursor test). stripe/hubspot/airtable manifests now paginate. | Flagship-manifest fidelity work. |

@@ -5,7 +5,7 @@
 
 [package]
 name = "weir-postgres-wasm"
-version = "0.0.1"
+version = "0.0.1-alpha"
 edition = "2024"
 description = "weir Postgres source/destination connector (WASM component): a sync wire client (no libpq) — full-refresh / incremental-by-cursor / CDC reads and append / overwrite / upsert writes."
 license = "Apache-2.0"
@@ -22,7 +22,7 @@ crate-type = ["cdylib"]
 fidius-guest = "0.5.4"
 fidius-macro = "0.5.4"
 wit-bindgen = "0.44"
-weir-connector-types = { path = "../../weir-connector-types", version = "0.0.1" }
+weir-connector-types = { path = "../../weir-connector-types", version = "0.0.1-alpha" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Transport-agnostic Postgres wire codec + md5/SCRAM auth (pure-Rust → wasm-ok).

@@ -148,31 +148,52 @@ mod tests {
         assert!(contract.contains("pub enum ReadMessage"));
     }
 
-    /// Drift guard ([[WEIR-I-0031]] / [[WEIR-T-0136]]): every checked-in guest carries a
-    /// `weir_guest_types.rs` byte-identical to the one canonical block. If this fails, the fix is
-    /// `angreal connectors sync-contract` (after intentionally editing `guest_contract.rs.in`).
+    /// Drift guard ([[WEIR-I-0031]] / [[WEIR-T-0136]] / [[WEIR-T-0172]]): every checked-in
+    /// guest carries a `weir_guest_types.rs` byte-identical to the one canonical block.
+    /// Guests are discovered by GLOB over the two guest roots — a new guest crate can never
+    /// silently escape the guard the way mssql/snowflake/resident once did (they sat outside
+    /// the old hand-list). If this fails, the fix is `angreal connectors sync-contract`
+    /// (after intentionally editing `guest_contract.rs.in`).
     #[test]
     fn contract_drift() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let guests = [
-            "../connectors/postgres",
-            "../connectors/rest",
-            "../connectors/rest-dest",
-            "../connectors/s3",
-            "../../wasm-fixtures/echo",
-            "../../wasm-fixtures/slow",
-            "../../wasm-fixtures/faulty",
-            "../../wasm-fixtures/arrow-sink",
-        ];
-        for g in guests {
-            let f = root.join(g).join("src/weir_guest_types.rs");
-            let got =
-                std::fs::read_to_string(&f).unwrap_or_else(|e| panic!("read {}: {e}", f.display()));
-            assert_eq!(
-                got,
-                crate::wasm::GUEST_CONTRACT,
-                "{g} drifted from the canonical — run `angreal connectors sync-contract`"
-            );
+        let roots = [root.join("../connectors"), root.join("../../wasm-fixtures")];
+        let mut checked = 0;
+        for dir in roots {
+            for entry in
+                std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+            {
+                let path = entry.expect("dir entry").path();
+                // A guest crate = a directory with Cargo.toml + src/ (skips the shared
+                // workspace's Cargo.{toml,lock} files and target/).
+                if !path.is_dir()
+                    || !path.join("Cargo.toml").is_file()
+                    || !path.join("src").is_dir()
+                {
+                    continue;
+                }
+                let f = path.join("src/weir_guest_types.rs");
+                assert!(
+                    f.is_file(),
+                    "guest crate {} carries no src/weir_guest_types.rs — run `angreal connectors sync-contract`",
+                    path.display()
+                );
+                let got = std::fs::read_to_string(&f)
+                    .unwrap_or_else(|e| panic!("read {}: {e}", f.display()));
+                assert_eq!(
+                    got,
+                    crate::wasm::GUEST_CONTRACT,
+                    "{} drifted from the canonical — run `angreal connectors sync-contract`",
+                    path.display()
+                );
+                checked += 1;
+            }
         }
+        // 6 connectors (postgres, rest, rest-dest, s3, mssql, snowflake) + 5 fixtures
+        // (echo, slow, faulty, arrow-sink, resident) at the time of writing.
+        assert!(
+            checked >= 11,
+            "glob found only {checked} guests — roots moved?"
+        );
     }
 }

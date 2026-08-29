@@ -4,14 +4,14 @@ level: task
 title: "Bootstrap admin key on fresh-DB `weir api` (kill the demo lockout)"
 short_code: "WEIR-T-0164"
 created_at: 2026-08-16T15:24:00.282038+00:00
-updated_at: 2026-08-16T15:24:00.282038+00:00
+updated_at: 2026-08-18T02:14:33.936947+00:00
 parent: WEIR-I-0042
 blocked_by: []
 archived: false
 
 tags:
   - "#task"
-  - "#phase/todo"
+  - "#phase/completed"
 
 
 exit_criteria_met: false
@@ -38,10 +38,10 @@ initiative_id: WEIR-I-0042
 
 ## Acceptance Criteria **[REQUIRED]**
 
-- [ ] Fresh store + `weir api` (and `weir serve`): admin key minted and printed exactly once with a save-this-now notice; restarts neither re-mint nor re-print
-- [ ] Cold-start docker demo works: up → sign in with the printed key → UI usable, no repo clone required
-- [ ] Docs (installation + secure-control-plane guide) describe the behavior and the `weir init` pre-mint path
-- [ ] CLI/serve test covers fresh-start mint + idempotent restart
+- [x] Fresh store + `weir api` (and `weir serve`): admin key minted and printed exactly once with a save-this-now notice; restarts neither re-mint nor re-print
+- [x] Cold-start docker demo works: up → sign in with the printed key → UI usable, no repo clone required *(verified 2026-08-25 under [[WEIR-T-0163]]: fresh compose stack minted + printed the key in the weir service logs; the key authenticated `/auth/me` as admin; UI served. "No repo clone" lands when [[WEIR-T-0165]]'s image publish first runs on a tag)*
+- [x] Docs (installation + secure-control-plane guide) describe the behavior and the `weir init` pre-mint path
+- [x] CLI/serve test covers fresh-start mint + idempotent restart
 
 ## Implementation Notes
 
@@ -49,4 +49,9 @@ Mint server-side at startup (weir-app serve path or weir-api::serve) rather than
 
 ## Status Updates **[REQUIRED]**
 
-*To be added during implementation*
+**2026-08-18 — implemented, tested, docs updated (ralph run).**
+
+- `crates/weir-cli/src/main.rs`: new `announce_bootstrap_key(&App)` helper — calls the already-idempotent `App::bootstrap_admin_key()` and prints the plaintext banner only when a key was newly minted; wired into both the `Serve` and `Api` arms right after `App::open` (the `Api` arm is the Docker entrypoint). `Init` unchanged; `Runner` deliberately not wired (worker pods shouldn't mint).
+- New integration test `crates/weir-cli/tests/bootstrap.rs` (`serve_mints_bootstrap_key_once_then_never_again`): spawns the real `weir` binary on a fresh temp store, asserts the `weirk_` line appears; restarts on the same store, asserts the serving banner is reached with no key line. Passes in ~2s. `tempfile` added as weir-cli dev-dependency.
+- Docs: `docs/guides/secure-control-plane.md` leads with mint-on-first-serve, keeps `weir init` as the pre-mint path; `docs/reference/installation.md` gains a "First run" section.
+- `angreal check all` green (one `cargo fmt` pass applied). Work left uncommitted for end-of-ralph review.

@@ -22,17 +22,30 @@ def _pascal(name):
 
 # Every guest (full-code connector + test fixture) carries the WIT contract as a
 # `src/weir_guest_types.rs` module, generated from the one canonical block ([[WEIR-I-0031]]).
+# Guests are DISCOVERED by glob ([[WEIR-T-0172]]) — a new guest crate is covered the moment
+# it exists; the old hand-list silently skipped mssql/snowflake/resident.
 CANONICAL = os.path.join(root, "crates", "weir-codegen", "src", "guest_contract.rs.in")
-GUESTS = [
-    os.path.join(root, "crates", "connectors", "postgres"),
-    os.path.join(root, "crates", "connectors", "rest"),
-    os.path.join(root, "crates", "connectors", "rest-dest"),
-    os.path.join(root, "crates", "connectors", "s3"),
-    os.path.join(root, "wasm-fixtures", "echo"),
-    os.path.join(root, "wasm-fixtures", "slow"),
-    os.path.join(root, "wasm-fixtures", "faulty"),
-    os.path.join(root, "wasm-fixtures", "arrow-sink"),
-]
+
+
+def _guest_dirs():
+    """Every guest crate dir under the two guest roots (has Cargo.toml + src/)."""
+    dirs = []
+    for parent in (
+        os.path.join(root, "crates", "connectors"),
+        os.path.join(root, "wasm-fixtures"),
+    ):
+        for name in sorted(os.listdir(parent)):
+            d = os.path.join(parent, name)
+            if (
+                os.path.isdir(d)
+                and os.path.isfile(os.path.join(d, "Cargo.toml"))
+                and os.path.isdir(os.path.join(d, "src"))
+            ):
+                dirs.append(d)
+    return dirs
+
+
+GUESTS = _guest_dirs()
 
 
 def _sync_guest(guest_dir, canonical):

@@ -14,12 +14,16 @@
 
 # ---- build ----
 FROM rust:1-bookworm AS build
-RUN rustup target add wasm32-wasip2 wasm32-unknown-unknown && cargo install trunk --locked
 WORKDIR /src
+# rust-toolchain.toml pins the toolchain AND its wasm targets — install it (plus trunk)
+# before the source copy so the layer caches across source changes. A bare `rustup target
+# add` against the image's default toolchain would miss the pinned one entirely.
+COPY rust-toolchain.toml ./
+RUN rustup toolchain install && cargo install trunk --locked
 COPY . .
 # UI → weir-ui/dist (embedded into weir-api by its build.rs), then the host binary.
 RUN cd weir-ui && trunk build --release
-RUN cargo build -p weir-cli --release && strip target/release/weir
+RUN WEIR_REQUIRE_UI=1 cargo build -p weir-cli --release && strip target/release/weir
 # Pre-stage the wasm connectors (built here = built where they run).
 RUN bash scripts/stage-connectors.sh /out/connectors
 

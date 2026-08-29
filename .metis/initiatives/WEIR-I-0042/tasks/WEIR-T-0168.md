@@ -4,14 +4,14 @@ level: task
 title: "Flagship manifest fidelity — pagination (+incremental) for stripe/hubspot"
 short_code: "WEIR-T-0168"
 created_at: 2026-08-16T15:24:06.182973+00:00
-updated_at: 2026-08-16T15:24:06.182973+00:00
+updated_at: 2026-08-25T03:04:07.951973+00:00
 parent: WEIR-I-0042
 blocked_by: []
 archived: false
 
 tags:
   - "#task"
-  - "#phase/todo"
+  - "#phase/completed"
 
 
 exit_criteria_met: false
@@ -37,11 +37,11 @@ The two flagship SaaS manifests silently truncate: stripe.yaml and hubspot.yaml 
 
 ## Acceptance Criteria **[REQUIRED]**
 
-- [ ] stripe.yaml pages through full result sets — mechanism verified against Stripe's actual API shape; any runtime gap (has_more stop condition, id-as-cursor) is either implemented in the shared runtime or filed with evidence — and has an incremental cursor where valid (Stripe's `created` filter model; document what's expressible)
-- [ ] hubspot.yaml pages via the opaque `paging.next.after` cursor
-- [ ] airtable / todoist / openweather checked; paginators added where their APIs page
-- [ ] "⚠ unconfirmed" annotations resolved or corrected; `angreal test manifests` green; a mock-HTTP engine test covers at least the Stripe-shaped pagination pattern
-- [ ] Live verification explicitly recorded as pending the [[WEIR-T-0067]] secret bundles — do not claim live-verified
+- [x] stripe.yaml pages through full result sets — the runtime gap was real and is IMPLEMENTED: `page_cursor_record_field` (token = last record's field, Stripe `starting_after`) + `page_stop_on_false_path` (`has_more` stop, no wasted empty-page request) + `limit=100`. Incremental stays documented-unexpressible (Stripe's `created[gte]` = nested param + epoch ints vs DatetimeBasedCursor's ISO + flat param) — noted in-manifest, unchanged claim
+- [x] hubspot.yaml pages via the opaque `paging.next.after` cursor (`?after=…&limit=100`) on all three streams
+- [x] airtable / todoist / openweather checked: airtable's "not expressible" comment was stale — its response `offset` token is a standard opaque cursor, now configured (`pageSize=100`); todoist (REST v2 full arrays) and openweather (single-object responses) correctly have no paginator
+- [x] `angreal test manifests` green (36/36 tier A incl. the three changed); new engine test `wasm_http_source_walks_stripe_last_record_cursor` proves the Stripe shape wire-level (the mock exits after the `has_more:false` page, so an extra request would fail); the full http suite is 25/25
+- [x] Live verification recorded as pending [[WEIR-T-0067]] secret bundles — nothing here is claimed live-verified
 
 ## Implementation Notes
 
@@ -49,4 +49,15 @@ If a runtime addition is needed for Stripe (cursor-from-last-record-id and/or ha
 
 ## Status Updates **[REQUIRED]**
 
-*To be added during implementation*
+**2026-08-25 — implemented across the full seam (ralph run).**
+
+- **Runtime** (`crates/connectors/rest`): two new config keys — `page_cursor_record_field` (next-page token from the LAST record's dot-path field) and `page_stop_on_false_path` (response bool dpath; false = last page). Last-record token captured before the rows loop consumes the page; stop check runs before the advance; config_schema updated.
+- **Model** (`weir-manifest`): `Pagination::Cursor` gains `cursor_record_field`, `stop_on_false_path`, `size_param`, `size` (all `#[serde(default)]` — stored manifests round-trip unchanged).
+- **Importer** (`weir-importer`): `CursorPagination` accepts `stop_condition` + `page_size`; `{{ last_record['id'] }}` lowers to the record-field cursor and the `not response['has_more']` idiom lowers to the stop path (new `bracket_path` helper generalizing `response_path` with contiguous-bracket parsing). New lowering test `imports_stripe_style_last_record_cursor`; suite 21/21.
+- **Baking** (`weir-app`): the Cursor arm emits the new keys + the page-size pair (the runtime appends `limit` for any strategy).
+- **Manifests**: stripe (both streams: `starting_after`/`has_more`/limit 100), hubspot (all three streams: `after`/limit 100), airtable (`offset` token/pageSize 100 — its "not expressible" comment was stale). todoist/openweather verified correctly unpaginated.
+- **Ledger** ([[WEIR-S-0016]]): new last-record+stop row ✅ (stripe); body-cursor row flipped ❌→✅ (was stale since [[WEIR-T-0154]] — the engine body-cursor test proves it); changelog entry added.
+- Verified: importer 21/21, http engine 25/25 (incl. the new Stripe wire test), manifest corpus 36/36 tier A, `angreal test unit` all green, `angreal check all` clean.
+- Known bound (pre-existing, [[WEIR-I-0044]]'s scope): full pagination buffers the whole stream in memory before one checkpoint; MAX_PAGES=1000 still caps.
+
+**2026-08-28 — post-review fix (pre-v0.0.1 release review).** The adversarial release review confirmed a polarity bug in the importer lowering: `map_paginator` lowered ANY response-referencing `stop_condition` to `stop_on_false_path` — but Airbyte's contract is "stop when the template is TRUE" while the runtime key means "stop when the field is FALSE", so a POSITIVE condition (`{{ response['is_last_page'] }}`, Spring-style paging) would invert and silently truncate every multi-page sync after page 1. Fixed with a polarity guard: only the negated idiom (`not …` / `… is false`) lowers; positive conditions are dropped and cursor-absence terminates. New test `positive_stop_condition_is_dropped_not_inverted` covers all three shapes; importer 22/22. Also aligned the `cursor_record_field` doc in weir-manifest with the runtime's actual precedence (a set `cursor_path` wins, record-field is the fallback).

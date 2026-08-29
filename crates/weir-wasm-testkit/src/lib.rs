@@ -67,6 +67,58 @@ pub fn connectors_dir() -> PathBuf {
                 &dest,
             );
         }
+        // The production connectors, mirroring scripts/stage-connectors.sh: creation-time
+        // validation ([[WEIR-T-0166]]) rightly demands a connection's connectors resolve, so
+        // the test staging carries the same set a real deployment stages (manifest-backed
+        // connections rewrite onto `rest`; CDC/reverse-ETL tests reference postgres/rest-dest).
+        for (dir, wasm_file, pkg, cap) in [
+            (
+                "crates/connectors/rest",
+                "weir_rest_wasm.wasm",
+                "weir-rest-pkg",
+                "http",
+            ),
+            (
+                "crates/connectors/rest-dest",
+                "weir_rest_dest_wasm.wasm",
+                "weir-rest-dest-pkg",
+                "http",
+            ),
+            (
+                "crates/connectors/s3",
+                "weir_s3_wasm.wasm",
+                "weir-s3-pkg",
+                "http",
+            ),
+            (
+                "crates/connectors/snowflake",
+                "weir_snowflake_wasm.wasm",
+                "weir-snowflake-pkg",
+                "http",
+            ),
+            (
+                "crates/connectors/postgres",
+                "weir_postgres_wasm.wasm",
+                "weir-postgres-pkg",
+                "tcp",
+            ),
+            (
+                "crates/connectors/mssql",
+                "weir_mssql_wasm.wasm",
+                "weir-mssql-pkg",
+                "tcp",
+            ),
+        ] {
+            stage(
+                &WasmPackage {
+                    fixture_dir: &root.join(dir),
+                    wasm_file,
+                    pkg_name: pkg,
+                    capabilities: &[cap],
+                },
+                &dest,
+            );
+        }
         dest
     })
     .clone()

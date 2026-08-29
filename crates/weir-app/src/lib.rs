@@ -245,6 +245,23 @@ impl App {
         // Reverse-ETL ([[WEIR-I-0015]]): a dest-manifest bakes onto `rest-dest` in the **dest** config.
         let (dest, dest_config) =
             self.resolve_manifest_dest(tenant, &c.dest, &c.stream, &c.dest_config)?;
+        // Creation-time validation ([[WEIR-T-0166]]): a typo'd connector or config missing the
+        // connector's declared requireds fails NOW with a reason — never 201-then-fail-at-run.
+        self.validate_connector_resolves(tenant, &source, "source")?;
+        self.validate_connector_resolves(tenant, &dest, "dest")?;
+        // Load the spec via the tenant-SCOPED ref (as execution will): the resolver's
+        // fallback runs tenant-dir → shared-dir, so a tenant-private compiled artifact
+        // ([[WEIR-T-0092]]) validates here exactly like it resolves at run time.
+        validate_required_config(
+            &scope_wasm_to_tenant(source.clone(), tenant),
+            &source_config,
+            "source",
+        )?;
+        validate_required_config(
+            &scope_wasm_to_tenant(dest.clone(), tenant),
+            &dest_config,
+            "dest",
+        )?;
         let mut conn = self
             .store
             .pool()
@@ -1015,6 +1032,39 @@ impl App {
             .collect())
     }
 
+    /// A connection may only reference connectors that will actually resolve at run time
+    /// ([[WEIR-T-0166]]): mirror the executor's search order — the tenant's private artifact
+    /// dir, then the shared connectors dir — and 404 with a catalog pointer on a miss.
+    fn validate_connector_resolves(
+        &self,
+        tenant: &str,
+        r: &ConnectorRef,
+        side: &str,
+    ) -> Result<(), AppError> {
+        let ConnectorRef::Wasm {
+            search_path,
+            package,
+            ..
+        } = r;
+        let candidates: Vec<std::path::PathBuf> = if *search_path == connectors_dir() {
+            vec![
+                std::path::Path::new(search_path).join(tenant).join(package),
+                std::path::Path::new(search_path).join(package),
+            ]
+        } else {
+            vec![std::path::Path::new(search_path).join(package)]
+        };
+        if candidates.iter().any(|p| p.join("package.toml").is_file()) {
+            return Ok(());
+        }
+        let name = plugin_name(r);
+        Err(AppError::NotFound(format!(
+            "unknown {side} connector `{name}`: no staged package `{package}` under `{search_path}` \
+             and no catalog manifest by that name — GET /catalog/available lists onboardable \
+             connectors; POST /catalog/import onboards one"
+        )))
+    }
+
     /// A connector's static spec (roles + `config_schema`) by plugin name — loads
     /// it with empty config; for the UI's schema-driven config form ([[WEIR-T-0040]]).
     pub fn connector_spec(&self, plugin: &str) -> Result<ConnectorSpec, AppError> {
@@ -1106,53 +1156,83 @@ impl App {
         Ok(n)
     }
 
-    /// Reconcile the scheduler's schedule set against the current connections
-    /// ([[WEIR-T-0051]]): register newly-scheduled connections, re-register on a
-    /// cadence/cron change, and drop schedules whose connection no longer wants one.
-    /// Called each `serve` loop so UI add/edit/delete is picked up **live** (no
-    /// restart). Returns the number of changes applied.
+    /// Reconcile the scheduler's schedule set against the current connections of **every
+    /// tenant** ([[WEIR-T-0051]] / [[WEIR-T-0171]]): register newly-scheduled connections,
+    /// re-register on ANY change to the built spec (cadence, cron, config, modes — so an
+    /// edited credential takes effect by the next fire, not never), and drop schedules
+    /// whose connection no longer wants one. Called each `serve` loop so UI add/edit/delete
+    /// is picked up **live**. Returns the number of changes applied.
+    ///
+    /// The registry key is tenant-scoped (`{tenant}/{name}`) so same-named connections in
+    /// different tenants hold independent schedules; the scheduler's no-double-start guard
+    /// reads the SPEC's (tenant, connection), never the key. (A tenant id containing `/`
+    /// could alias keys — tenant-id validation is [[WEIR-I-0046]]'s safety bundle.)
     pub fn sync_schedules<C: Clock>(&self, scheduler: &Scheduler<C>) -> Result<usize, AppError> {
         use std::collections::HashMap;
-        // The single-node daemon reconciles the implicit default tenant's connections.
-        let tenant = DEFAULT_TENANT;
-        let conns = self.list_connections(tenant)?;
-        // What each connection *wants*: (every_ms, cron) — scheduled ones only.
-        let mut wanted: HashMap<String, (i64, Option<String>)> = HashMap::new();
-        for c in &conns {
-            if let Some(expr) = &c.cron {
-                wanted.insert(c.name.clone(), (0, Some(expr.clone())));
-            } else if let Some(secs) = c.every_secs {
-                wanted.insert(c.name.clone(), ((secs * 1000.0) as i64, None));
+        struct Want {
+            every_ms: i64,
+            cron: Option<String>,
+            spec: WorkSpec,
+        }
+        let mut wanted: HashMap<String, Want> = HashMap::new();
+        for t in self.list_tenants()? {
+            for c in self.list_connections(&t.id)? {
+                let key = format!("{}/{}", t.id, c.name);
+                if let Some(expr) = &c.cron {
+                    wanted.insert(
+                        key,
+                        Want {
+                            every_ms: 0,
+                            cron: Some(expr.clone()),
+                            spec: work_spec(&t.id, &c),
+                        },
+                    );
+                } else if let Some(secs) = c.every_secs {
+                    wanted.insert(
+                        key,
+                        Want {
+                            every_ms: (secs * 1000.0) as i64,
+                            cron: None,
+                            spec: work_spec(&t.id, &c),
+                        },
+                    );
+                }
             }
         }
-        let existing: HashMap<String, (i64, Option<String>)> = scheduler
+        let existing: HashMap<String, (i64, Option<String>, String)> = scheduler
             .schedules()?
             .into_iter()
-            .map(|(n, ms, cr)| (n, (ms, cr)))
+            .map(|(n, ms, cr, spec_json)| (n, (ms, cr, spec_json)))
             .collect();
 
         let mut changes = 0;
-        for c in &conns {
-            let Some(want) = wanted.get(&c.name) else {
-                continue;
-            };
-            // Re-register only when new or the cadence/cron actually changed — so we
-            // don't reset `next_due_at` (and re-fire) on every reconcile.
-            if existing.get(&c.name) != Some(want) {
-                scheduler.remove(&c.name)?;
-                if let Some(expr) = &c.cron {
-                    scheduler.add_cron(&c.name, &work_spec(tenant, c), expr)?;
-                } else if let Some(secs) = c.every_secs {
-                    scheduler.add(
-                        &c.name,
-                        &work_spec(tenant, c),
-                        Duration::from_secs_f64(secs),
-                    )?;
+        for (key, w) in &wanted {
+            let spec_json = json(&w.spec)?;
+            // Re-register when new OR anything about the schedule changed — cadence, cron,
+            // or the built spec itself ([[WEIR-T-0171]]). Unchanged schedules are left
+            // alone so `next_due_at` isn't reset (no re-fire on every reconcile).
+            let unchanged = existing
+                .get(key)
+                .is_some_and(|(ms, cr, sj)| *ms == w.every_ms && *cr == w.cron && *sj == spec_json);
+            if !unchanged {
+                scheduler.remove(key)?;
+                match &w.cron {
+                    Some(expr) => {
+                        scheduler.add_cron(key, &w.spec, expr)?;
+                    }
+                    None => {
+                        scheduler.add(
+                            key,
+                            &w.spec,
+                            Duration::from_millis(w.every_ms.max(0) as u64),
+                        )?;
+                    }
                 }
                 changes += 1;
             }
         }
         // Drop schedules whose connection no longer wants one (deleted / schedule cleared).
+        // Pre-[[WEIR-T-0171]] unscoped keys (`name`) fall out here and re-register scoped.
         for name in existing.keys() {
             if !wanted.contains_key(name) {
                 scheduler.remove(name)?;
@@ -1187,10 +1267,8 @@ impl App {
         let fleet = Fleet::new(
             self.relay.clone(),
             move || InProcessExecutor::new(Arc::clone(&store), relay.clone()),
-            WorkerConfig {
-                concurrency: concurrency.max(1),
-                ..WorkerConfig::default()
-            },
+            // Retries ON in the daemon ([[WEIR-T-0169]]) — knobs: WEIR_MAX_ATTEMPTS/_RETRY_BASE_MS.
+            production_worker_config(concurrency),
         );
         tokio::pin!(shutdown);
         let mut was_leader = false;
@@ -1227,6 +1305,13 @@ impl App {
                 }
             }
         }
+        // Shutdown ([[WEIR-T-0170]]): fire every live resident's stop token so their
+        // blocking runs end at the next poll boundary — otherwise runtime teardown
+        // waits on the blocking pool forever (the resident_real wedge).
+        let stopped = self.relay.stop_all_residents();
+        if stopped > 0 {
+            tracing::info!(target: "weir_app", stopped, "shutdown: stopped live resident runs");
+        }
         Ok(())
     }
 
@@ -1245,10 +1330,8 @@ impl App {
         let store = Arc::clone(&self.store);
         let relay = self.relay.clone();
         let make_exec = move || InProcessExecutor::new(Arc::clone(&store), relay.clone());
-        let base = WorkerConfig {
-            concurrency: concurrency.max(1),
-            ..WorkerConfig::default()
-        };
+        // Retries ON in the runner ([[WEIR-T-0169]]) — knobs: WEIR_MAX_ATTEMPTS/_RETRY_BASE_MS.
+        let base = production_worker_config(concurrency);
         // Resident claim-headroom ([[WEIR-I-0035]] F1.4): if `WEIR_RESIDENT_HIGH_WATER` (a 0.0–1.0
         // mem/cpu fraction) is set, wire a real `SysUsageProbe` so a hot runner stops taking new
         // resident work. Unset → no gate (full headroom), preserving today's behaviour.
@@ -1292,6 +1375,11 @@ impl App {
                     }
                 }
             }
+        }
+        // Shutdown ([[WEIR-T-0170]]): stop live residents so the blocking pool can drain.
+        let stopped = self.relay.stop_all_residents();
+        if stopped > 0 {
+            tracing::info!(target: "weir_app", stopped, "shutdown: stopped live resident runs");
         }
         Ok(())
     }
@@ -1531,10 +1619,27 @@ fn manifest_stream_to_config(m: &weir_manifest::Manifest, stream: &str) -> serde
             Some(Pagination::Cursor {
                 cursor_path,
                 token_param,
+                cursor_record_field,
+                stop_on_false_path,
+                size_param,
+                size,
                 inject_into,
             }) => {
-                cfg.insert("page_cursor_path".to_string(), cursor_path.clone().into());
+                if !cursor_path.is_empty() {
+                    cfg.insert("page_cursor_path".to_string(), cursor_path.clone().into());
+                }
                 cfg.insert("page_cursor_param".to_string(), token_param.clone().into());
+                // Stripe-style cursor-from-last-record + has_more stop ([[WEIR-T-0168]]).
+                if let Some(f) = cursor_record_field {
+                    cfg.insert("page_cursor_record_field".to_string(), f.clone().into());
+                }
+                if let Some(p) = stop_on_false_path {
+                    cfg.insert("page_stop_on_false_path".to_string(), p.clone().into());
+                }
+                if let (Some(p), Some(n)) = (size_param, size) {
+                    cfg.insert("page_size_param".to_string(), p.clone().into());
+                    cfg.insert("page_size".to_string(), (*n).into());
+                }
                 page_inject(&mut cfg, inject_into);
             }
             Some(Pagination::LinkHeader) => {
@@ -1843,6 +1948,75 @@ pub fn dest_object_to_config(
 
 /// Validate a connection's sync/write modes ([[WEIR-I-0028]]) — `upsert` needs business keys,
 /// `incremental` needs a cursor field, and the mode strings must be known.
+/// Config missing the connector's declared requireds fails at creation ([[WEIR-T-0166]]):
+/// read the `required` list from the connector's JSON-Schema `config_schema` and demand
+/// each key is present (and non-null) in the side's resolved config. A connector without
+/// a parseable schema or a `required` list validates vacuously.
+fn validate_required_config(r: &ConnectorRef, config: &str, side: &str) -> Result<(), AppError> {
+    let cfg: serde_json::Value = if config.trim().is_empty() {
+        serde_json::Value::Object(Default::default())
+    } else {
+        serde_json::from_str(config)
+            .map_err(|e| AppError::Config(format!("{side} config is not valid JSON: {e}")))?
+    };
+    let spec = r
+        .spec()
+        .map_err(|e| AppError::Config(format!("could not load {side} connector spec: {e}")))?;
+    let Ok(schema) = serde_json::from_str::<serde_json::Value>(&spec.config_schema) else {
+        return Ok(());
+    };
+    let Some(required) = schema.get("required").and_then(|v| v.as_array()) else {
+        return Ok(());
+    };
+    let missing: Vec<&str> = required
+        .iter()
+        .filter_map(|k| k.as_str())
+        .filter(|k| cfg.get(*k).is_none_or(|v| v.is_null()))
+        .collect();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        let name = plugin_name(r);
+        Err(AppError::Config(format!(
+            "{side} config for `{name}` is missing required field(s): {} — \
+             GET /connectors/{name}/spec shows the config contract",
+            missing.join(", ")
+        )))
+    }
+}
+
+/// Parse the retry knobs ([[WEIR-T-0169]]): `WEIR_MAX_ATTEMPTS` (default 3, min 1) and
+/// `WEIR_RETRY_BASE_MS` (default 1000) — garbage falls back to the defaults.
+fn retry_knobs(max_attempts: Option<String>, base_ms: Option<String>) -> (u32, Duration) {
+    let attempts = max_attempts
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(3);
+    let base = base_ms
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(1_000);
+    (attempts, Duration::from_millis(base))
+}
+
+/// The production worker policy ([[WEIR-T-0169]]): retries ON — transient failures requeue
+/// with exponential backoff instead of landing terminal-red until the next scheduled fire.
+/// Fatal errors still fail immediately (classification is the connector's). Used by the
+/// long-running daemons (`serve`/`api`/`runner`); the one-shot drain path keeps
+/// `WorkerConfig::default()` (max_attempts 1) so `run_until_idle` never returns with a
+/// delayed retry still pending.
+fn production_worker_config(concurrency: usize) -> WorkerConfig {
+    let (max_attempts, base_delay) = retry_knobs(
+        std::env::var("WEIR_MAX_ATTEMPTS").ok(),
+        std::env::var("WEIR_RETRY_BASE_MS").ok(),
+    );
+    WorkerConfig {
+        concurrency: concurrency.max(1),
+        max_attempts,
+        base_delay,
+        ..WorkerConfig::default()
+    }
+}
+
 fn validate_connection_modes(
     sync_mode: &str,
     write_mode: &str,
@@ -1982,6 +2156,36 @@ fn extract_mapping(config_json: &str) -> (MappingSpec, String) {
         .unwrap_or_default();
     let json = serde_json::to_string(&v).unwrap_or_else(|_| config_json.to_string());
     (mapping, json)
+}
+
+#[cfg(test)]
+mod worker_config_tests {
+    use std::time::Duration;
+
+    #[test]
+    fn retry_knobs_defaults_overrides_and_garbage() {
+        // [[WEIR-T-0169]]: defaults 3 attempts / 1s base; overrides parse; garbage and
+        // a zero attempt count fall back to the defaults.
+        assert_eq!(
+            super::retry_knobs(None, None),
+            (3, Duration::from_millis(1_000))
+        );
+        assert_eq!(
+            super::retry_knobs(Some("5".into()), Some("250".into())),
+            (5, Duration::from_millis(250))
+        );
+        assert_eq!(
+            super::retry_knobs(Some("0".into()), Some("nope".into())),
+            (3, Duration::from_millis(1_000))
+        );
+    }
+
+    #[test]
+    fn production_config_carries_retries_and_concurrency() {
+        let cfg = super::production_worker_config(4);
+        assert_eq!(cfg.concurrency, 4);
+        assert!(cfg.max_attempts >= 1, "retries are on in production");
+    }
 }
 
 #[cfg(test)]
@@ -2214,7 +2418,9 @@ mod catalog_tests {
 
     fn pinned(name: &str, version: &str) -> ConnectorRef {
         ConnectorRef::Wasm {
-            search_path: "connectors".to_string(),
+            // The live connectors dir (WEIR_CONNECTORS_DIR) so creation-time existence
+            // validation ([[WEIR-T-0166]]) sees the staged testkit packages.
+            search_path: connectors_dir(),
             package: format!("weir-{name}-pkg"),
             version: version.to_string(),
             origin: Origin::FirstParty,
@@ -2446,6 +2652,10 @@ streams:
 
     #[test]
     fn contract_gate_refuses_incompatible_then_allows_compatible() {
+        // Creation-time existence validation ([[WEIR-T-0166]]) needs real staged packages.
+        unsafe {
+            std::env::set_var("WEIR_CONNECTORS_DIR", weir_wasm_testkit::connectors_dir());
+        }
         let tmp = tempfile::TempDir::new().unwrap();
         let app = App::open(tmp.path().join("weir.db").to_str().unwrap()).unwrap();
 

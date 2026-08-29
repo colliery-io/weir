@@ -15,8 +15,8 @@ field feeds which config key. No code changes.
 ## What you provide
 
 Each pipeline's credentials live in a SOPS-encrypted bundle under `secrets/<slug>.enc.json`
-(see [`the provisioning spec`](https://github.com/colliery-io/weir/blob/main/.metis/specifications/WEIR-S-0018/specification.md)
-and the `secrets/<slug>.example.json` templates). Create them with:
+(the account-provisioning checklist is tracked as WEIR-S-0018 in the project tracker; the
+`secrets/<slug>.example.json` templates show each bundle's shape). Create them with:
 
 ```bash
 angreal secrets edit snowflake      # account, user, private_key, database, schema, warehouse

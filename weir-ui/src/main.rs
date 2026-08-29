@@ -224,6 +224,61 @@ async fn get_json<T: serde::de::DeserializeOwned + Default>(url: String) -> T {
     }
 }
 
+/// The outcome of an authed GET, with failure classes kept distinct ([[WEIR-T-0167]]) —
+/// a 401 flips the sign-in gate, everything else feeds the error banner instead of
+/// masquerading as an empty dashboard.
+enum Fetched<T> {
+    Ok(T),
+    Unauthorized,
+    /// HTTP error or a decode failure: (status, server's error message).
+    Failed(u16, String),
+    /// No answer at all.
+    Network,
+}
+
+async fn get_fetch<T: serde::de::DeserializeOwned>(url: String) -> Fetched<T> {
+    let resp = match areq_get(&url).send().await {
+        Ok(r) => r,
+        Err(_) => return Fetched::Network,
+    };
+    let status = resp.status();
+    if status == 401 {
+        return Fetched::Unauthorized;
+    }
+    if !resp.ok() {
+        return Fetched::Failed(status, server_error(resp).await);
+    }
+    match resp.json::<T>().await {
+        Ok(v) => Fetched::Ok(v),
+        Err(e) => Fetched::Failed(status, format!("bad response: {e}")),
+    }
+}
+
+/// The server's `{"error": …}` body (the API's uniform error shape), else the status line.
+async fn server_error(resp: gloo_net::http::Response) -> String {
+    let fallback = format!("HTTP {}", resp.status());
+    match resp.json::<serde_json::Value>().await {
+        Ok(v) => v
+            .get("error")
+            .and_then(|e| e.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or(fallback),
+        Err(_) => fallback,
+    }
+}
+
+/// Classify a mutation response: `Ok` passes the response through, everything else
+/// becomes a human reason **including the server's error body** ([[WEIR-T-0167]]).
+async fn check(
+    sent: Result<gloo_net::http::Response, gloo_net::Error>,
+) -> Result<gloo_net::http::Response, String> {
+    match sent {
+        Err(_) => Err("server unreachable".into()),
+        Ok(r) if r.ok() => Ok(r),
+        Ok(r) => Err(server_error(r).await),
+    }
+}
+
 /// Fetch a connector's spec + parse its `config_schema` into a flat field list.
 async fn fetch_props(plugin: &str) -> Vec<Prop> {
     if plugin.is_empty() {
@@ -488,7 +543,22 @@ fn App() -> impl IntoView {
     let connections = RwSignal::new(Vec::<Connection>::new());
     let runs = RwSignal::new(Vec::<RunRow>::new());
     let toast = RwSignal::new(Option::<(bool, String)>::None);
-    let flash = move |ok: bool, msg: String| toast.set(Some((ok, msg)));
+    // Auto-dismiss after 6s unless a newer toast replaced this one; also closable in the view.
+    let toast_seq = StoredValue::new(0u64);
+    let flash = move |ok: bool, msg: String| {
+        let id = toast_seq.get_value() + 1;
+        toast_seq.set_value(id);
+        toast.set(Some((ok, msg)));
+        leptos::task::spawn_local(async move {
+            gloo_timers::future::TimeoutFuture::new(6_000).await;
+            if toast_seq.get_value() == id {
+                toast.set(None);
+            }
+        });
+    };
+    // Control-plane reachability ([[WEIR-T-0167]]): Some(reason) renders the error banner —
+    // an outage must never masquerade as "No connections yet".
+    let api_error = RwSignal::new(Option::<String>::None);
 
     // Tenants admin ([[WEIR-T-0096]]) — CRUD tenants + their keys via /tenants/* (never re-scoped).
     let reload_tenants = move || {
@@ -525,11 +595,14 @@ fn App() -> impl IntoView {
         if id.is_empty() { return; }
         leptos::task::spawn_local(async move {
             let body = serde_json::json!({ "id": id, "name": id });
-            let ok = match areq_post("/tenants").json(&body) {
-                Ok(r) => r.send().await.map(|r| r.ok()).unwrap_or(false),
-                Err(_) => false,
+            let sent = match areq_post("/tenants").json(&body) {
+                Ok(r) => check(r.send().await).await,
+                Err(e) => Err(format!("bad request: {e}")),
             };
-            flash(ok, if ok { "tenant created".into() } else { "create failed".into() });
+            match sent {
+                Ok(_) => flash(true, "tenant created".into()),
+                Err(e) => flash(false, format!("create failed: {e}")),
+            }
             new_tenant_id.set(String::new());
             reload_tenants();
         });
@@ -540,26 +613,29 @@ fn App() -> impl IntoView {
         if tid.is_empty() || name.is_empty() { return; }
         leptos::task::spawn_local(async move {
             let body = serde_json::json!({ "name": name, "role": "write" });
-            if let Ok(req) = areq_post(&format!("/tenants/{tid}/keys")).json(&body) {
-                if let Ok(r) = req.send().await {
-                    if r.ok() {
-                        let v = r.json::<serde_json::Value>().await.unwrap_or_default();
-                        minted_key.set(v.get("key").and_then(|k| k.as_str()).map(|s| s.to_string()));
-                        flash(true, "key minted — copy it now".into());
-                        new_key_name.set(String::new());
-                        load_keys(tid);
-                        return;
-                    }
+            let sent = match areq_post(&format!("/tenants/{tid}/keys")).json(&body) {
+                Ok(req) => check(req.send().await).await,
+                Err(e) => Err(format!("bad request: {e}")),
+            };
+            match sent {
+                Ok(r) => {
+                    let v = r.json::<serde_json::Value>().await.unwrap_or_default();
+                    minted_key.set(v.get("key").and_then(|k| k.as_str()).map(|s| s.to_string()));
+                    flash(true, "key minted — copy it now".into());
+                    new_key_name.set(String::new());
+                    load_keys(tid);
                 }
+                Err(e) => flash(false, format!("mint failed: {e}")),
             }
-            flash(false, "mint failed".into());
         });
     };
     let revoke_key = move |kid: String| {
         let tid = sel_tenant.get();
         leptos::task::spawn_local(async move {
-            let ok = areq_delete(&format!("/tenants/{tid}/keys/{kid}")).send().await.map(|r| r.ok()).unwrap_or(false);
-            flash(ok, if ok { "key revoked".into() } else { "revoke failed".into() });
+            match check(areq_delete(&format!("/tenants/{tid}/keys/{kid}")).send().await).await {
+                Ok(_) => flash(true, "key revoked".into()),
+                Err(e) => flash(false, format!("revoke failed: {e}")),
+            }
             load_keys(tid);
         });
     };
@@ -605,16 +681,43 @@ fn App() -> impl IntoView {
     let health = RwSignal::new(Vec::<ConnHealth>::new());
     let platform = RwSignal::new(PlatformHealth::default());
 
-    // Live poll: /connections + /runs + /overview (health) every 800ms; /platform/health for admins.
+    // Live poll: /connections + /runs + /overview (health) every 800ms; /platform/health for
+    // admins. [[WEIR-T-0167]]: /connections is the canary that classifies auth/server/network
+    // state; each fetch only overwrites its signal on success, so an outage shows the error
+    // banner over the last-known data instead of fake empty states — and the loop backs off
+    // to 3.2s while degraded rather than hammering a dead server.
     leptos::task::spawn_local(async move {
         loop {
-            connections.set(get_json::<Vec<Connection>>("/connections".into()).await);
-            runs.set(get_json::<Vec<RunRow>>("/runs".into()).await);
-            health.set(get_json::<Vec<ConnHealth>>("/overview".into()).await);
-            if is_admin.get_untracked() {
-                platform.set(get_json::<PlatformHealth>("/platform/health".into()).await);
+            match get_fetch::<Vec<Connection>>("/connections".into()).await {
+                Fetched::Ok(v) => {
+                    connections.set(v);
+                    api_error.set(None);
+                }
+                Fetched::Unauthorized => {
+                    api_error.set(None);
+                    authed.set(Some(false));
+                }
+                Fetched::Failed(s, m) => api_error.set(Some(format!("{m} · HTTP {s}"))),
+                Fetched::Network => api_error.set(Some("server unreachable — retrying".into())),
             }
-            gloo_timers::future::TimeoutFuture::new(800).await;
+            if let Fetched::Ok(v) = get_fetch::<Vec<RunRow>>("/runs".into()).await {
+                runs.set(v);
+            }
+            if let Fetched::Ok(v) = get_fetch::<Vec<ConnHealth>>("/overview".into()).await {
+                health.set(v);
+            }
+            if is_admin.get_untracked() {
+                if let Fetched::Ok(v) = get_fetch::<PlatformHealth>("/platform/health".into()).await
+                {
+                    platform.set(v);
+                }
+            }
+            let wait = if api_error.get_untracked().is_some() {
+                3_200
+            } else {
+                800
+            };
+            gloo_timers::future::TimeoutFuture::new(wait).await;
         }
     });
 
@@ -645,42 +748,58 @@ fn App() -> impl IntoView {
     // Accept an evolved schema ([[WEIR-T-0121]]): clear the breaking flag, then refetch.
     let accept_schema = Callback::new(move |n: String| {
         leptos::task::spawn_local(async move {
-            let _ = areq_post(&format!("/connections/{n}/schema/accept")).send().await;
+            if let Err(e) = check(
+                areq_post(&format!("/connections/{n}/schema/accept"))
+                    .send()
+                    .await,
+            )
+            .await
+            {
+                flash(false, format!("Couldn't accept schema: {e}"));
+            }
             detail_schema.set(get_json::<SchemaView>(format!("/connections/{n}/schema")).await);
         });
     });
     let run_conn = Callback::new(move |n: String| {
         leptos::task::spawn_local(async move {
-            let ok = areq_post(&format!("/connections/{n}/run")).send().await.map(|r| r.ok()).unwrap_or(false);
-            flash(ok, if ok { format!("Run queued · {n}") } else { format!("Couldn't run {n}") });
+            match check(areq_post(&format!("/connections/{n}/run")).send().await).await {
+                Ok(_) => flash(true, format!("Run queued · {n}")),
+                Err(e) => flash(false, format!("Couldn't run {n}: {e}")),
+            }
         });
     });
     let del_conn = Callback::new(move |n: String| {
         leptos::task::spawn_local(async move {
-            let ok = areq_delete(&format!("/connections/{n}")).send().await.map(|r| r.ok()).unwrap_or(false);
-            flash(ok, if ok { format!("Deleted {n}") } else { format!("Couldn't delete {n}") });
+            match check(areq_delete(&format!("/connections/{n}")).send().await).await {
+                Ok(_) => flash(true, format!("Deleted {n}")),
+                Err(e) => flash(false, format!("Couldn't delete {n}: {e}")),
+            }
         });
     });
     // F1 ([[WEIR-I-0035]]): launch / stop a resident source (enqueue-once + durable stop).
     let start_conn = Callback::new(move |n: String| {
         leptos::task::spawn_local(async move {
-            let ok = areq_post(&format!("/connections/{n}/start")).send().await.map(|r| r.ok()).unwrap_or(false);
-            flash(ok, if ok { format!("Started {n}") } else { format!("Couldn't start {n}") });
-            // Refetch immediately so the pill flips without waiting for the 800ms poll.
-            if ok {
-                connections.set(get_json::<Vec<Connection>>("/connections".into()).await);
-                runs.set(get_json::<Vec<RunRow>>("/runs".into()).await);
+            match check(areq_post(&format!("/connections/{n}/start")).send().await).await {
+                Ok(_) => {
+                    flash(true, format!("Started {n}"));
+                    // Refetch immediately so the pill flips without waiting for the 800ms poll.
+                    connections.set(get_json::<Vec<Connection>>("/connections".into()).await);
+                    runs.set(get_json::<Vec<RunRow>>("/runs".into()).await);
+                }
+                Err(e) => flash(false, format!("Couldn't start {n}: {e}")),
             }
         });
     });
     let stop_conn = Callback::new(move |n: String| {
         leptos::task::spawn_local(async move {
-            let ok = areq_post(&format!("/connections/{n}/stop")).send().await.map(|r| r.ok()).unwrap_or(false);
-            flash(ok, if ok { format!("Stopped {n}") } else { format!("Couldn't stop {n}") });
-            // Refetch immediately so the pill flips without waiting for the 800ms poll.
-            if ok {
-                connections.set(get_json::<Vec<Connection>>("/connections".into()).await);
-                runs.set(get_json::<Vec<RunRow>>("/runs".into()).await);
+            match check(areq_post(&format!("/connections/{n}/stop")).send().await).await {
+                Ok(_) => {
+                    flash(true, format!("Stopped {n}"));
+                    // Refetch immediately so the pill flips without waiting for the 800ms poll.
+                    connections.set(get_json::<Vec<Connection>>("/connections".into()).await);
+                    runs.set(get_json::<Vec<RunRow>>("/runs".into()).await);
+                }
+                Err(e) => flash(false, format!("Couldn't stop {n}: {e}")),
             }
         });
     });
@@ -700,15 +819,18 @@ fn App() -> impl IntoView {
         };
         let label = pkg.clone();
         leptos::task::spawn_local(async move {
-            let ok = match areq_post("/catalog/import").json(&body) {
-                Ok(req) => req.send().await.map(|r| r.ok()).unwrap_or(false),
-                Err(_) => false,
+            let sent = match areq_post("/catalog/import").json(&body) {
+                Ok(req) => check(req.send().await).await,
+                Err(e) => Err(format!("bad request: {e}")),
             };
-            if ok {
-                add_pkg.set(String::new());
-                reload_catalog();
+            match sent {
+                Ok(_) => {
+                    add_pkg.set(String::new());
+                    reload_catalog();
+                    flash(true, format!("Onboarded {label}"));
+                }
+                Err(e) => flash(false, format!("Couldn't onboard {label}: {e}")),
             }
-            flash(ok, if ok { format!("Onboarded {label}") } else { format!("Couldn't onboard {label}") });
         });
     };
     // Preview a pasted manifest.
@@ -719,12 +841,17 @@ fn App() -> impl IntoView {
             return;
         }
         leptos::task::spawn_local(async move {
-            if let Ok(req) = areq_post("/catalog/preview").json(&serde_json::json!({ "manifest": m })) {
-                if let Ok(resp) = req.send().await {
-                    if let Ok(rep) = resp.json::<PreviewReport>().await {
-                        preview.set(Some(rep));
-                    }
-                }
+            let sent = match areq_post("/catalog/preview").json(&serde_json::json!({ "manifest": m }))
+            {
+                Ok(req) => check(req.send().await).await,
+                Err(e) => Err(format!("bad request: {e}")),
+            };
+            match sent {
+                Ok(resp) => match resp.json::<PreviewReport>().await {
+                    Ok(rep) => preview.set(Some(rep)),
+                    Err(e) => flash(false, format!("Couldn't parse preview: {e}")),
+                },
+                Err(e) => flash(false, format!("Couldn't preview: {e}")),
             }
         });
     };
@@ -741,17 +868,20 @@ fn App() -> impl IntoView {
             return;
         };
         leptos::task::spawn_local(async move {
-            let ok = match areq_post("/catalog/import").json(&body) {
-                Ok(req) => req.send().await.map(|r| r.ok()).unwrap_or(false),
-                Err(_) => false,
+            let sent = match areq_post("/catalog/import").json(&body) {
+                Ok(req) => check(req.send().await).await,
+                Err(e) => Err(format!("bad request: {e}")),
             };
-            if ok {
-                preview.set(None);
-                add_manifest.set(String::new());
-                add_path.set(String::new());
-                reload_catalog();
+            match sent {
+                Ok(_) => {
+                    preview.set(None);
+                    add_manifest.set(String::new());
+                    add_path.set(String::new());
+                    reload_catalog();
+                    flash(true, "Onboarded connector".into());
+                }
+                Err(e) => flash(false, format!("Couldn't onboard: {e}")),
             }
-            flash(ok, if ok { "Onboarded connector".into() } else { "Couldn't onboard".to_string() });
         });
     };
     // Save the connection.
@@ -783,12 +913,18 @@ fn App() -> impl IntoView {
             execution_mode: exec_mode.get(),
         };
         leptos::task::spawn_local(async move {
-            let ok = match areq_post("/connections").json(&body) {
-                Ok(req) => req.send().await.map(|r| r.ok()).unwrap_or(false),
-                Err(_) => false,
+            let sent = match areq_post("/connections").json(&body) {
+                Ok(req) => check(req.send().await).await,
+                Err(e) => Err(format!("bad request: {e}")),
             };
-            if ok { name.set(String::new()); }
-            flash(ok, if ok { format!("Saved connection {saved}") } else { format!("Couldn't save {saved}") });
+            match sent {
+                Ok(_) => {
+                    name.set(String::new());
+                    flash(true, format!("Saved connection {saved}"));
+                }
+                // Carries the server's reason — e.g. the [[WEIR-T-0166]] validation messages.
+                Err(e) => flash(false, format!("Couldn't save {saved}: {e}")),
+            }
         });
     };
 
@@ -1296,8 +1432,16 @@ fn App() -> impl IntoView {
             }}
         </Modal>
 
+        // Degraded-control-plane banner ([[WEIR-T-0167]]): persistent while the poll fails.
+        {move || api_error.get().map(|msg| view! {
+            <div class="weir-apierr" title="the dashboards show last-known data until this clears">
+                {format!("⚠ control plane error — {msg}")}
+            </div>
+        })}
+
         {move || toast.get().map(|(ok, msg)| view! {
-            <div class="weir-toast" class:weir-toast--ok=ok class:weir-toast--err=!ok>{msg}</div>
+            <div class="weir-toast" class:weir-toast--ok=ok class:weir-toast--err=!ok
+                title="click to dismiss" on:click=move |_| toast.set(None)>{msg}</div>
         })}
 
         // Sign-in gate ([[WEIR-T-0087]]) — a full-screen overlay until authenticated.
@@ -1495,6 +1639,9 @@ const LAYOUT_CSS: &str = r#"
   font-size: 12.5px; padding: 10px 14px; border-radius: var(--radius-sm4); background: var(--panel);
   border: 1px solid var(--border); box-shadow: 0 8px 28px rgba(0,0,0,.45); }
 .weir-toast--ok { border-color: var(--ok); } .weir-toast--err { border-color: var(--bad); }
+.weir-apierr { position: fixed; top: 0; left: 0; right: 0; z-index: 60; text-align: center;
+  font-family: var(--font-mono); font-size: 12px; padding: 6px 12px;
+  background: #3a1418; color: #ffb4b4; border-bottom: 1px solid var(--bad); cursor: default; }
 .weir-signout { font-family: var(--font-mono); font-size: 11px; letter-spacing: .05em;
   text-transform: uppercase; color: var(--faint); cursor: pointer; }
 .weir-signout:hover { color: var(--fg-2); }

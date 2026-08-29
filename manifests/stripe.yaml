@@ -37,9 +37,23 @@ streams:
           # Source: docs.stripe.com/api/customers/list → Response section
           field_path: ["data"]
 
-      # PAGINATION OMITTED — see Open questions #1
-      # Stripe uses cursor-based pagination (starting_after / has_more),
-      # which is not expressible as PageIncrement or OffsetIncrement.
+      # Cursor pagination ([[WEIR-T-0168]]): starting_after = the LAST record's id,
+      # stop when has_more is false, limit=100 (max) — docs.stripe.com/api/pagination.
+      paginator:
+        type: DefaultPaginator
+        page_size_option:
+          type: RequestOption
+          inject_into: request_parameter
+          field_name: limit
+        page_token_option:
+          type: RequestOption
+          inject_into: request_parameter
+          field_name: starting_after
+        pagination_strategy:
+          type: CursorPagination
+          page_size: 100
+          cursor_value: "{{ last_record['id'] }}"
+          stop_condition: "{{ not response['has_more'] }}"
 
     # INCREMENTAL SYNC OMITTED — see Open questions #2
     # The "created" filter uses nested params (created[gte]) with Unix integer
@@ -142,7 +156,22 @@ streams:
           # Source: docs.stripe.com/api/charges/list → Response section
           field_path: ["data"]
 
-      # PAGINATION OMITTED — same cursor-based reason as customers (Open questions #1)
+      # Cursor pagination ([[WEIR-T-0168]]) — same starting_after/has_more model as customers.
+      paginator:
+        type: DefaultPaginator
+        page_size_option:
+          type: RequestOption
+          inject_into: request_parameter
+          field_name: limit
+        page_token_option:
+          type: RequestOption
+          inject_into: request_parameter
+          field_name: starting_after
+        pagination_strategy:
+          type: CursorPagination
+          page_size: 100
+          cursor_value: "{{ last_record['id'] }}"
+          stop_condition: "{{ not response['has_more'] }}"
 
     # INCREMENTAL SYNC OMITTED — same created[gte] / Unix-timestamp mismatch (Open questions #2)
 

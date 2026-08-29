@@ -199,6 +199,46 @@ fn mock_http_cursor() -> String {
     format!("http://{addr}")
 }
 
+/// Serves Stripe-shaped pages ([[WEIR-T-0168]]): the next-page token is the LAST record's
+/// `id` (`?starting_after=ch_N`) and `has_more:false` marks the final page — the server
+/// thread exits after serving it, so any extra request the guest wrongly issued would fail
+/// the test. Pages: (ch_1,ch_2) → (ch_3,ch_4) → (ch_5, has_more:false).
+fn mock_http_stripe() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]);
+            let after = req
+                .split("starting_after=")
+                .nth(1)
+                .and_then(|s| s.split(['&', ' ']).next())
+                .unwrap_or("");
+            let body = match after {
+                "" => r#"{"object":"list","has_more":true,"data":[{"id":"ch_1"},{"id":"ch_2"}]}"#,
+                "ch_2" => {
+                    r#"{"object":"list","has_more":true,"data":[{"id":"ch_3"},{"id":"ch_4"}]}"#
+                }
+                _ => r#"{"object":"list","has_more":false,"data":[{"id":"ch_5"}]}"#,
+            };
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
+            if !after.is_empty() && after != "ch_2" {
+                break; // has_more:false page served → the guest must stop here
+            }
+        }
+    });
+    format!("http://{addr}")
+}
+
 fn items_stream() -> ConfiguredStream {
     ConfiguredStream {
         stream: "items".to_string(),
@@ -607,6 +647,53 @@ fn wasm_http_source_walks_cursor_pagination() {
         .sync("cursor-conn", &items_stream(), &source, &dest)
         .expect("engine sync over cursor-paginated wasm http source");
     assert_eq!(out.rows_written, 5, "all 3 cursor pages collected (2+2+1)");
+}
+
+/// Stripe-shaped pagination ([[WEIR-T-0168]]): the guest takes the next-page token from the
+/// LAST record's `id` (`?starting_after=…`) and stops when `has_more` is false — collecting
+/// 2+2+1 = 5 records across 3 pages with no wasted empty-page request (the mock's server
+/// thread exits after the final page, so an extra request would fail the run).
+#[test]
+fn wasm_http_source_walks_stripe_last_record_cursor() {
+    let base = mock_http_stripe();
+
+    let pkg_root = tempfile::TempDir::new().unwrap();
+    build_and_stage(pkg_root.path());
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let store = Store::open(db_dir.path().join("weir.db").to_str().unwrap()).unwrap();
+    let engine = Engine::new(&store);
+
+    let src_cfg = Config {
+        json: serde_json::json!({
+            "base_url": base, "path": "/v1/charges",
+            "record_path": "data",
+            "page_cursor_record_field": "id",
+            "page_cursor_param": "starting_after",
+            "page_stop_on_false_path": "has_more",
+            "page_size_param": "limit", "page_size": 2,
+        })
+        .to_string(),
+    };
+    let policy = HostAllowList {
+        allowed_hosts: vec!["127.0.0.1".to_string()],
+        inject_headers: vec![],
+        credential: None,
+    };
+    let source =
+        ConnectorHandle::from_wasm_package(pkg_root.path(), "weir-rest-pkg", &src_cfg, policy, &[])
+            .expect("load wasm rest http source");
+    let dest = weir_wasm_testkit::load(
+        "ArrowSink",
+        &Config {
+            json: "{}".to_string(),
+        },
+    )
+    .unwrap();
+
+    let out = engine
+        .sync("stripe-conn", &items_stream(), &source, &dest)
+        .expect("engine sync over stripe-shaped wasm http source");
+    assert_eq!(out.rows_written, 5, "all 3 starting_after pages collected");
 }
 
 /// Single-object response ([[WEIR-I-0008]]): an endpoint returning a bare JSON object (not
