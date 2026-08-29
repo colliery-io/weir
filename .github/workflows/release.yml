@@ -164,14 +164,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download all artifacts
+      # Pattern-scoped: docker/build-push-action also uploads *.dockerbuild
+      # build-record artifacts, which must not land in (or fail) the release.
+      - name: Download release tarballs
         uses: actions/download-artifact@v4
         with:
           path: artifacts
+          pattern: "weir-*.tar.gz"
           merge-multiple: true
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
+          # A semver pre-release suffix (v0.0.1-alpha) marks the release as such.
+          prerelease: ${{ contains(github.ref_name, '-') }}
           files: artifacts/*
