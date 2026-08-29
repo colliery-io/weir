@@ -189,8 +189,8 @@ mod tests {
                 checked += 1;
             }
         }
-        // 6 connectors (postgres, rest, rest-dest, s3, mssql, snowflake) + 5 fixtures
-        // (echo, slow, faulty, arrow-sink, resident) at the time of writing.
+        // 6 connectors (postgres, rest, rest-dest, s3, mssql, snowflake) + 6 fixtures
+        // (echo, slow, faulty, arrow-sink, resident, tcp-probe) at the time of writing.
         assert!(
             checked >= 11,
             "glob found only {checked} guests — roots moved?"
