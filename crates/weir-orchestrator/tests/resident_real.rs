@@ -139,6 +139,16 @@ async fn resident_does_not_block_runonce_real_executor() {
         Some("leased"),
         "resident should still be running (leased), not completed/failed"
     );
+
+    // Shutdown ([[WEIR-T-0170]]): fire the resident's stop token — exactly what the
+    // serve/runner daemons now do on ctrl-c — so the blocking run ends at its next poll
+    // boundary and runtime teardown doesn't wait on the blocking pool forever (the wedge
+    // this test used to reproduce).
+    assert_eq!(
+        relay.stop_all_residents(),
+        1,
+        "exactly one live resident stopped at shutdown"
+    );
 }
 
 /// A tail (event-reader) unit: the unified `resident` fixture in `mode:tail` with a finite

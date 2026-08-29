@@ -5,13 +5,24 @@ tokens) for programmatic access, and **OIDC** (single sign-on) for the web UI. T
 
 ## API keys
 
-The first key is minted at `init` (save it — it's shown once):
+The first admin key is minted **automatically on a fresh store** — the first `weir api` (or
+`weir serve`) against a store with no keys prints it once and never again:
+
+```bash
+weir --db weir.db api --port 8080
+#   fresh store — admin API key minted; save this, it is not shown again:
+#     weirk_…
+```
+
+To pre-mint it instead (e.g. for scripted setups), run `init` before starting the server:
 
 ```bash
 weir --db weir.db init
 #   admin API key — save this, it is not shown again:
 #     weirk_…
 ```
+
+Restarts never re-mint or re-print: once any key exists, bootstrap is a silent no-op.
 
 Mint more with the CLI — scope them by **role** and **tenant**:
 
@@ -20,7 +31,7 @@ Mint more with the CLI — scope them by **role** and **tenant**:
 weir --db weir.db auth token create --name ci --admin
 
 # a non-admin key scoped to one tenant
-weir --db weir.db auth token create --name acme-ro --role reader --tenant acme
+weir --db weir.db auth token create --name acme-ro --role read --tenant acme
 
 weir --db weir.db auth token list
 weir --db weir.db auth token revoke <ident>
@@ -39,7 +50,7 @@ export WEIR_OIDC_ISSUER="https://your-idp.example/realms/main"
 export WEIR_OIDC_CLIENT_ID="weir"
 export WEIR_OIDC_CLIENT_SECRET="…"
 export WEIR_OIDC_REDIRECT_URI="http://localhost:8080/auth/callback"
-export WEIR_OIDC_SCOPES="openid profile email"   # optional; sensible default otherwise
+export WEIR_OIDC_SCOPES="openid,profile,email"   # optional, comma-separated; sensible default otherwise
 
 weir --db weir.db api --port 8080
 ```

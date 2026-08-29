@@ -83,4 +83,4 @@ The investigation reframed the choice: the host-side capability was priced as an
 - rustls-rustcrypto publishes a non-alpha release or an audit → re-pin and record.
 - A TDS 8.0-capable Rust client matures (Microsoft `mssql-tds-preview` / `mssql-tiberius-bridge`) → add strict mode, revisit the fork.
 - A third wire-protocol connector needs TLS → reassess whether the per-guest duplication justifies a shared fidius surface.
-- The fidius hostname-egress FR lands → wire `authorize_tcp_target` into weir's allow-list.
+- The fidius hostname-egress FR lands → wire `authorize_tcp_target` into weir's allow-list. **FIRED 2026-08-25 — Dylan reports the FR delivered in fidius. Weir-side wiring queued as [[WEIR-I-0043]] follow-up: bump the fidius dep to the version carrying `TcpTarget`, implement `authorize_tcp_target` in `HostAllowList` (`crates/weir-runtime/src/lib.rs:246`), enable hostname entries in allow-lists.**

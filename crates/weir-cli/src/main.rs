@@ -240,6 +240,18 @@ fn init_tracing() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Mint the bootstrap admin key iff the store has none ([[WEIR-T-0164]]) — `weir api` is the
+/// container entrypoint, and a fresh store would otherwise serve an API nobody can sign in to.
+/// Prints the plaintext exactly once (at the mint); restarts are a silent no-op.
+fn announce_bootstrap_key(app: &App) -> anyhow::Result<()> {
+    if let Some(key) = app.bootstrap_admin_key()? {
+        println!(
+            "\n  fresh store — admin API key minted; save this, it is not shown again:\n    {key}\n"
+        );
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_tracing()?;
@@ -376,6 +388,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Serve { poll, concurrency } => {
             let app = App::open(&cli.db)?;
+            announce_bootstrap_key(&app)?;
             println!("weir serving (db {}); ctrl-c to stop", cli.db);
             app.serve(
                 std::time::Duration::from_secs_f64(poll),
@@ -448,6 +461,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Api { port, concurrency } => {
             let app = std::sync::Arc::new(App::open(&cli.db)?);
+            announce_bootstrap_key(&app)?;
             println!("weir control-plane API on :{port}");
             weir_api::serve(app, port, concurrency).await?;
         }

@@ -378,6 +378,10 @@ streams:
         );
 
         // A connection on the manifest connector resolves to rest + baked config.
+        // Creation-time existence validation ([[WEIR-T-0166]]) needs real staged packages.
+        unsafe {
+            std::env::set_var("WEIR_CONNECTORS_DIR", weir_wasm_testkit::connectors_dir());
+        }
         app.add_connection(
             DEFAULT_TENANT,
             &Connection {

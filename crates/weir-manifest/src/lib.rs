@@ -306,8 +306,23 @@ pub enum Pagination {
     /// response) and send it as `?<token_param>=<token>` — or, with `inject_into: body`,
     /// as a dot-path field of the POST body (Notion-style); stop when the token is absent.
     Cursor {
+        /// Response dpath of the next token; empty when `cursor_record_field` sources it.
         cursor_path: String,
         token_param: String,
+        /// Stripe-style ([[WEIR-T-0168]]): the token is a field of the LAST record on the
+        /// page (`starting_after = last id`) instead of a response path. Consulted when
+        /// `cursor_path` is empty — a set `cursor_path` takes precedence.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor_record_field: Option<String>,
+        /// Response bool dpath; `false` there = last page (Stripe `has_more`) — stops
+        /// without wasting an empty-page request.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stop_on_false_path: Option<String>,
+        /// Optional page-size pair appended alongside the cursor (`?limit=N`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        size_param: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        size: Option<u32>,
         /// Where the token param is carried ([[WEIR-T-0154]]).
         #[serde(default)]
         inject_into: InjectInto,

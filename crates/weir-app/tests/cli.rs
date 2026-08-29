@@ -348,6 +348,7 @@ async fn run_captures_stream_schema() {
 #[tokio::test]
 async fn per_side_config_round_trips() {
     // [[WEIR-I-0029]]: a connection's source and destination configs persist + reload independently.
+    use_wasm_connectors(); // creation-time validation ([[WEIR-T-0166]]) resolves the refs
     let tmp = tempfile::TempDir::new().unwrap();
     let app = App::open(tmp.path().join("weir.db").to_str().unwrap()).expect("open store");
     app.add_connection(

@@ -540,6 +540,15 @@ pub struct RunRow {
 #[derive(Clone)]
 pub struct Relay {
     store: Arc<Store>,
+    /// Live resident StopHandles ([[WEIR-T-0170]]): registered by the in-process executor
+    /// for a run's lifetime; fired by heartbeat lease-loss, manual stop, or daemon shutdown
+    /// (`stop_all_residents`). Lives on the relay — shared across every executor the fleet
+    /// spawns — so one shutdown call reaches every live resident. Each entry carries a
+    /// registration generation so a STALE run's deregister (its lease expired and the unit
+    /// was re-claimed in-process) cannot remove — and thereby drop-cancel — the
+    /// replacement run's handle.
+    resident_stops: Arc<Mutex<HashMap<i64, (u64, StopHandle)>>>,
+    stop_generation: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Relay {
@@ -547,7 +556,11 @@ impl Relay {
     pub fn new(store: Arc<Store>) -> Result<Self, ExecutorError> {
         // Schema (work_units + schedules) is created by Store::open →
         // weir_schema::migrate ([[WEIR-T-0061]] / [[WEIR-I-0013]]).
-        let relay = Self { store };
+        let relay = Self {
+            store,
+            resident_stops: Arc::new(Mutex::new(HashMap::new())),
+            stop_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
         Ok(relay)
     }
 
@@ -880,6 +893,61 @@ impl Relay {
         Ok(n == 1)
     }
 
+    /// Register a live resident run's stop token ([[WEIR-T-0170]]). Returns the
+    /// registration's generation — pass it back to `deregister_resident_stop`.
+    /// Overwriting an earlier registration for the same unit drops (= cancels) the
+    /// stale run's handle, which is exactly right for a supervised re-claim.
+    pub fn register_resident_stop(&self, work_unit_id: i64, handle: StopHandle) -> u64 {
+        let generation = self
+            .stop_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.resident_stops
+            .lock()
+            .unwrap()
+            .insert(work_unit_id, (generation, handle));
+        generation
+    }
+
+    /// Deregister a resident's stop token (its run ended). Only the matching
+    /// registration is removed: a stale run returning AFTER its unit was re-claimed
+    /// must not drop — and thereby drop-cancel — the replacement run's handle.
+    /// Dropping the matching handle here is safe: drop-to-cancel only matters while
+    /// the run is still draining.
+    pub fn deregister_resident_stop(&self, work_unit_id: i64, generation: u64) {
+        let mut stops = self.resident_stops.lock().unwrap();
+        if stops
+            .get(&work_unit_id)
+            .is_some_and(|(g, _)| *g == generation)
+        {
+            stops.remove(&work_unit_id);
+        }
+    }
+
+    /// Fire one live resident's stop token, if any (manual stop / lease-loss).
+    pub fn stop_resident(&self, work_unit_id: i64) {
+        if let Some((_, h)) = self.resident_stops.lock().unwrap().remove(&work_unit_id) {
+            h.stop();
+        }
+    }
+
+    /// Fire EVERY live resident's stop token ([[WEIR-T-0170]] daemon shutdown): their
+    /// blocking runs end at the next poll boundary instead of hanging runtime drop.
+    /// Returns how many were live.
+    pub fn stop_all_residents(&self) -> usize {
+        let handles: Vec<StopHandle> = self
+            .resident_stops
+            .lock()
+            .unwrap()
+            .drain()
+            .map(|(_, (_, h))| h)
+            .collect();
+        let n = handles.len();
+        for h in handles {
+            h.stop();
+        }
+        n
+    }
+
     /// Return expired leases (dead workers) to `Pending`. Returns the count.
     pub fn reclaim_expired(&self) -> Result<usize, ExecutorError> {
         let mut conn = self
@@ -963,7 +1031,9 @@ impl Relay {
     }
 
     /// Whether the connection has an in-flight (`pending`/`leased`) unit — the
-    /// scheduler's no-double-start guard.
+    /// scheduler's no-double-start guard. NOTE: name-only — same-named connections in
+    /// different tenants alias each other here; prefer [`has_active_in`](Self::has_active_in)
+    /// wherever the tenant is known ([[WEIR-T-0171]]).
     pub fn has_active(&self, connection: &str) -> Result<bool, ExecutorError> {
         let mut conn = self
             .store
@@ -974,6 +1044,26 @@ impl Relay {
             .filter(
                 work_units::connection
                     .eq(connection)
+                    .and(work_units::state.eq_any(["pending", "leased"])),
+            )
+            .count()
+            .get_result(&mut conn)?;
+        Ok(n > 0)
+    }
+
+    /// Tenant-scoped no-double-start guard ([[WEIR-T-0171]] / [[WEIR-A-0036]] composite
+    /// identity): same-named connections in different tenants schedule independently.
+    pub fn has_active_in(&self, tenant: &str, connection: &str) -> Result<bool, ExecutorError> {
+        let mut conn = self
+            .store
+            .pool()
+            .get()
+            .map_err(|e| ExecutorError::Store(e.to_string()))?;
+        let n: i64 = work_units::table
+            .filter(
+                work_units::tenant_id
+                    .eq(tenant)
+                    .and(work_units::connection.eq(connection))
                     .and(work_units::state.eq_any(["pending", "leased"])),
             )
             .count()
@@ -1025,36 +1115,31 @@ fn from_json<T: for<'de> Deserialize<'de>>(s: &str) -> Result<T, ExecutorError> 
 pub struct InProcessExecutor {
     store: Arc<Store>,
     relay: Relay,
-    /// Live resident runs' stop handles, keyed by work-unit id ([[WEIR-I-0035]] F1.3).
-    /// Lets an external `stop` (manual stop) or `stop_all` (worker/fleet shutdown) cancel
-    /// a resident loop via its [`StopHandle`] (drop-to-cancel). Empty for run-once work.
-    stops: Arc<Mutex<HashMap<i64, StopHandle>>>,
+    // Resident stop handles live on the shared `Relay` ([[WEIR-T-0170]]), not here, so
+    // daemon shutdown can fire every live resident across every per-tenant executor with
+    // one `stop_all_residents` call. NOTE the registry is still transitively reachable
+    // from the blocking run (via its `relay` clone), so drop-to-cancel alone can never
+    // end a live resident — shutdown paths MUST call `stop_all_residents` (serve/runner
+    // do; tests driving real residents must too) or runtime teardown waits on the
+    // blocking pool forever (the wedge `resident_real` reproduces).
 }
 
 impl InProcessExecutor {
     pub fn new(store: Arc<Store>, relay: Relay) -> Self {
-        Self {
-            store,
-            relay,
-            stops: Arc::new(Mutex::new(HashMap::new())),
-        }
+        Self { store, relay }
     }
 
     /// Stop one in-flight resident run (manual stop, [[WEIR-I-0035]] F1.3): fire its
     /// [`StopHandle`] so the resident loop shuts down at its next poll boundary. No-op if
-    /// the unit isn't a live resident run.
+    /// the unit isn't a live resident run. The registry lives on the shared [`Relay`]
+    /// ([[WEIR-T-0170]]) so a daemon shutdown reaches every executor's residents.
     pub fn stop(&self, work_unit_id: i64) {
-        if let Some(h) = self.stops.lock().unwrap().remove(&work_unit_id) {
-            h.stop();
-        }
+        self.relay.stop_resident(work_unit_id);
     }
 
     /// Stop **all** in-flight resident runs (worker/fleet shutdown, [[WEIR-I-0035]] F1.3).
     pub fn stop_all(&self) {
-        let handles: Vec<StopHandle> = self.stops.lock().unwrap().drain().map(|(_, h)| h).collect();
-        for h in handles {
-            h.stop();
-        }
+        self.relay.stop_all_residents();
     }
 }
 
@@ -1063,7 +1148,6 @@ impl WorkExecutor for InProcessExecutor {
     async fn execute(&self, event: WorkReadyEvent) -> Result<ExecutionResult, ExecutorError> {
         let store = Arc::clone(&self.store);
         let relay = self.relay.clone();
-        let stops = Arc::clone(&self.stops);
         let work_unit_id = event.work_unit_id;
         tokio::task::spawn_blocking(move || -> Result<ExecutionResult, ExecutorError> {
             let Some(spec) = relay.load(work_unit_id)? else {
@@ -1089,7 +1173,10 @@ impl WorkExecutor for InProcessExecutor {
             // unchanged.
             let outcome = if spec.execution_mode.is_resident() {
                 let (handle, token) = stop_channel();
-                stops.lock().unwrap().insert(work_unit_id, handle);
+                // Registered on the shared relay ([[WEIR-T-0170]]) — NOT captured by this
+                // closure — so shutdown's `stop_all_residents` reaches it and the blocking
+                // task never keeps its own StopHandle alive.
+                let stop_generation = relay.register_resident_stop(work_unit_id, handle);
                 let out = engine.run_resident(
                     &spec.connection,
                     &spec.stream,
@@ -1102,7 +1189,9 @@ impl WorkExecutor for InProcessExecutor {
                         .cadence_ms()
                         .map(std::time::Duration::from_millis),
                 );
-                stops.lock().unwrap().remove(&work_unit_id); // drops handle if stop() wasn't called
+                // Drops the handle if stop() wasn't called; generation-guarded so a stale
+                // run can't drop a re-claimed replacement's handle.
+                relay.deregister_resident_stop(work_unit_id, stop_generation);
                 out
             } else {
                 engine.sync_with(
@@ -1543,6 +1632,11 @@ impl<E: WorkExecutor + 'static, F: Fn() -> E> Fleet<E, F> {
     /// repeating until no tenant has claimable work. This is the one-shot (`drain`) + per-poll
     /// (`serve`) drive.
     pub async fn run_until_idle(&self) -> Result<(), ExecutorError> {
+        // Sweep expired leases FIRST, independent of due-pending depth ([[WEIR-T-0170]]):
+        // a crashed resident with no other due work anywhere was previously never
+        // reclaimed — workers only ran (and only they swept) when a tenant had due
+        // pending work, so the stranded unit stayed leased-to-a-ghost forever.
+        self.relay.reclaim_expired()?;
         loop {
             let tenants = self.relay.active_tenants()?;
             if tenants.is_empty() {
@@ -1692,12 +1786,16 @@ impl<C: Clock> Scheduler<C> {
         };
 
         let mut fired = 0;
-        for (id, connection, spec_json, every_ms, cron) in due {
+        for (id, _key, spec_json, every_ms, cron) in due {
             let spec: WorkSpec = from_json(&spec_json)?;
             // Resident sources ([[WEIR-I-0035]] F1.3) are NOT interval/cron-fired: they are
             // enqueued once as a standing registration (via `Relay::plan`) and kept alive by the
             // perpetual lease. Firing here would resurrect a deliberately-stopped source.
-            if !spec.execution_mode.is_resident() && !self.relay.has_active(&connection)? {
+            // The guard uses the SPEC's (tenant, connection) — not the registry key, which
+            // may be tenant-scoped (`{tenant}/{name}`, [[WEIR-T-0171]]).
+            if !spec.execution_mode.is_resident()
+                && !self.relay.has_active_in(&spec.tenant, &spec.connection)?
+            {
                 self.relay.plan(&spec)?;
                 fired += 1;
             }
@@ -1721,9 +1819,12 @@ impl<C: Clock> Scheduler<C> {
         Ok(fired)
     }
 
-    /// All enabled schedules as `(connection, every_ms, cron)` — for reconciling the
-    /// schedule set against the live connections ([[WEIR-T-0051]]).
-    pub fn schedules(&self) -> Result<Vec<(String, i64, Option<String>)>, ExecutorError> {
+    /// All enabled schedules as `(connection, every_ms, cron, spec_json)` — for reconciling
+    /// the schedule set against the live connections ([[WEIR-T-0051]]). The stored spec is
+    /// included so the reconciler can re-register on ANY config change, not just a cadence
+    /// change ([[WEIR-T-0171]] — "fixed the credential, still failing" trap).
+    #[allow(clippy::type_complexity)]
+    pub fn schedules(&self) -> Result<Vec<(String, i64, Option<String>, String)>, ExecutorError> {
         let mut conn = self
             .relay
             .store
@@ -1732,8 +1833,13 @@ impl<C: Clock> Scheduler<C> {
             .map_err(|e| ExecutorError::Store(e.to_string()))?;
         Ok(schedules::table
             .filter(schedules::enabled.eq(1))
-            .select((schedules::connection, schedules::every_ms, schedules::cron))
-            .load::<(String, i64, Option<String>)>(&mut conn)?)
+            .select((
+                schedules::connection,
+                schedules::every_ms,
+                schedules::cron,
+                schedules::spec,
+            ))
+            .load::<(String, i64, Option<String>, String)>(&mut conn)?)
     }
 
     /// Remove a connection's schedule(s). Idempotent (no-op if absent).

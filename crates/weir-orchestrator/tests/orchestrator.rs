@@ -268,3 +268,51 @@ fn resident_reclaims_on_runner_death_by_a_different_runner() {
     assert_eq!(b.work_unit_id, id, "same unit re-claimed (no pinning)");
     assert_eq!(b.attempt, 2, "attempt incremented on supervised restart");
 }
+
+/// [[WEIR-T-0170]] generation guard: a STALE resident run's deregister (its lease
+/// expired and the unit was re-claimed + re-registered in-process) must NOT remove —
+/// and thereby drop-cancel — the replacement run's StopHandle.
+#[test]
+fn stale_resident_deregister_cannot_drop_replacement_handle() {
+    let (_tmp, _store, relay) = setup();
+    let (h1, _t1) = weir_engine::stop_channel();
+    let (h2, _t2) = weir_engine::stop_channel();
+    let gen1 = relay.register_resident_stop(7, h1);
+    let gen2 = relay.register_resident_stop(7, h2); // re-claim overwrites (cancels the stale run)
+    assert_ne!(gen1, gen2);
+
+    // The stale run returns late and deregisters with ITS generation — a no-op.
+    relay.deregister_resident_stop(7, gen1);
+    assert_eq!(
+        relay.stop_all_residents(),
+        1,
+        "replacement handle survives the stale deregister"
+    );
+
+    // The matching generation still deregisters cleanly.
+    let (h3, _t3) = weir_engine::stop_channel();
+    let gen3 = relay.register_resident_stop(7, h3);
+    relay.deregister_resident_stop(7, gen3);
+    assert_eq!(relay.stop_all_residents(), 0);
+}
+
+/// [[WEIR-T-0171]] characterization: the name-only guard aliases same-named connections
+/// across tenants; `has_active_in` is the tenant-scoped guard the scheduler now uses.
+#[test]
+fn has_active_is_name_aliased_but_has_active_in_is_tenant_scoped() {
+    let (_tmp, _store, relay) = setup();
+    let mut s = spec("Echo", "echo", "{}");
+    s.connection = "shared-name".to_string();
+    s.tenant = "t1".to_string();
+    relay.plan(&s).unwrap();
+
+    assert!(
+        relay.has_active("shared-name").unwrap(),
+        "name-only sees t1's unit"
+    );
+    assert!(relay.has_active_in("t1", "shared-name").unwrap());
+    assert!(
+        !relay.has_active_in("t2", "shared-name").unwrap(),
+        "t2 must not alias t1's same-named unit"
+    );
+}

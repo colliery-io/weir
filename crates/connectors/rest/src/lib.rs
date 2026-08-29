@@ -36,6 +36,8 @@ impl Connector for Rest {
                 \"offset_param\":{\"type\":\"string\",\"title\":\"Offset query param (offset pagination)\"},\
                 \"page_cursor_path\":{\"type\":\"string\",\"title\":\"Next-cursor response path (dot-sep; cursor pagination)\"},\
                 \"page_cursor_param\":{\"type\":\"string\",\"title\":\"Cursor query param\"},\
+                \"page_cursor_record_field\":{\"type\":\"string\",\"title\":\"Cursor from the LAST record's field (Stripe starting_after)\"},\
+                \"page_stop_on_false_path\":{\"type\":\"string\",\"title\":\"Response bool path; false = last page (has_more)\"},\
                 \"page_size_param\":{\"type\":\"string\",\"title\":\"Page-size query param\"},\
                 \"page_size\":{\"type\":\"integer\",\"title\":\"Page size\"},\
                 \"cursor_field\":{\"type\":\"string\",\"title\":\"Cursor field (blank = full refresh)\"},\
@@ -105,6 +107,13 @@ struct RestCfg {
     /// + the query param to send it as. Stop when the token is absent/empty.
     page_cursor_path: Vec<String>,
     page_cursor_param: Option<String>,
+    /// Stripe-style ([[WEIR-T-0168]]): the next-page token is this field of the LAST
+    /// record on the page (`starting_after = last id`). Wins over `page_cursor_path`
+    /// being empty; dot-paths allowed.
+    page_cursor_record_field: Option<String>,
+    /// Response bool dpath; `false` there = last page (`has_more`) — stops without
+    /// wasting an empty-page request.
+    page_stop_on_false_path: Vec<String>,
     /// Link-header pagination ([[WEIR-T-0070]]): follow `Link: <url>; rel="next"` from the
     /// response headers (GitHub-style) until absent. The next URL is absolute.
     page_link_header: bool,
@@ -175,6 +184,10 @@ fn parse_cfg(config: &weir_connector_types::Config) -> RestCfg {
             .map(|p| p.split('.').map(str::to_string).collect())
             .unwrap_or_default(),
         page_cursor_param: s("page_cursor_param"),
+        page_cursor_record_field: s("page_cursor_record_field"),
+        page_stop_on_false_path: s("page_stop_on_false_path")
+            .map(|p| p.split('.').map(str::to_string).collect())
+            .unwrap_or_default(),
         page_link_header: v.get("page_link_header").and_then(|x| x.as_bool()).unwrap_or(false),
         cursor_field: s("cursor_field"),
         cursor_value_path: s("cursor_value_path"),
@@ -629,6 +642,15 @@ fn fetch_slice(
             break;
         }
         let n = records.len() as u64;
+        // Stripe-style ([[WEIR-T-0168]]): the next-page token is a field of the LAST
+        // record on the page — capture it before the loop consumes `records`.
+        let last_record_cursor = c.page_cursor_record_field.as_ref().and_then(|f| {
+            records.last().and_then(|r| get_path(r, f)).map(|v| {
+                v.as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| v.to_string())
+            })
+        });
         for rec in records {
             // Header-row zip ([[WEIR-T-0160]]): first row-array = the field names;
             // later row-arrays become objects (ragged rows pad with null) + `_row`.
@@ -687,19 +709,33 @@ fn fetch_slice(
                 None => break,
             }
         }
-        // Advance: opaque cursor (`?cursor=<token>` from the response), page-increment
-        // (`?page=N`), or offset (`?offset=N`, by page_size).
-        let cursor_paginating = !c.page_cursor_path.is_empty();
+        // has_more-style stop ([[WEIR-T-0168]]): a false at the configured response path
+        // is the last page — stop now instead of wasting an empty-page request.
+        if !c.page_stop_on_false_path.is_empty()
+            && navigate(&val, &c.page_stop_on_false_path).and_then(|x| x.as_bool()) == Some(false)
+        {
+            break;
+        }
+        // Advance: opaque cursor (`?cursor=<token>` from the response or the last record),
+        // page-increment (`?page=N`), or offset (`?offset=N`, by page_size).
+        let cursor_paginating =
+            !c.page_cursor_path.is_empty() || c.page_cursor_record_field.is_some();
         if c.page_param.is_none() && c.offset_param.is_none() && !cursor_paginating {
             break; // no pagination → single request
         }
         if cursor_paginating {
-            // Read the next-page token from the response; absent/empty → last page.
-            match navigate(&val, &c.page_cursor_path)
-                .and_then(|x| x.as_str())
-                .filter(|s| !s.is_empty())
-            {
-                Some(tok) => page_cursor = Some(tok.to_string()),
+            // Next-page token: the response path when configured, else the captured
+            // last-record field ([[WEIR-T-0168]]); absent/empty → last page.
+            let tok = if !c.page_cursor_path.is_empty() {
+                navigate(&val, &c.page_cursor_path)
+                    .and_then(|x| x.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+            } else {
+                last_record_cursor.clone().filter(|s| !s.is_empty())
+            };
+            match tok {
+                Some(tok) => page_cursor = Some(tok),
                 None => break,
             }
         } else if let Some(sz) = c.page_size {

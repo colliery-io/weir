@@ -575,3 +575,67 @@ async fn two_runners_share_one_store_no_double_run() {
         "resident should still be running under one of the runners"
     );
 }
+
+/// [[WEIR-T-0170]]: a crashed resident — leased, lease expired, and NO other due work
+/// anywhere — must be reclaimed by the fleet drive itself. Previously the fleet returned
+/// before any worker ran (active_tenants counts due PENDING only), so the stranded unit
+/// stayed leased-to-a-ghost forever and a `start` no-op'd against the stale lease.
+#[tokio::test]
+async fn fleet_reclaims_stranded_resident_with_no_due_work() {
+    use weir_orchestrator::{ExecutionMode, Fleet};
+
+    let (_tmp, _store, relay) = setup();
+    let mut s = spec();
+    s.connection = "stranded".into();
+    s.execution_mode = ExecutionMode::Resident {
+        cadence_ms: Some(10),
+        // Large backoff so the post-run requeue is not yet due when the fleet re-checks.
+        restart_backoff_ms: 5_000,
+    };
+    let id = relay.plan(&s).unwrap();
+
+    // A runner claims it, then dies without ever heartbeating; the lease expires.
+    relay
+        .claim("ghost", "default", Duration::from_millis(20))
+        .unwrap()
+        .expect("ghost claims the resident unit");
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert_eq!(
+        relay.state(id).unwrap().as_deref(),
+        Some("leased"),
+        "stranded: expired lease held by a ghost, nothing else due"
+    );
+
+    // The per-poll fleet drive (what `serve` runs every tick) sweeps + re-runs it.
+    #[derive(Clone)]
+    struct Rec {
+        seen: Arc<std::sync::Mutex<Vec<i64>>>,
+    }
+    #[async_trait::async_trait]
+    impl weir_orchestrator::WorkExecutor for Rec {
+        fn name(&self) -> &str {
+            "rec"
+        }
+        async fn execute(
+            &self,
+            e: weir_orchestrator::WorkReadyEvent,
+        ) -> Result<weir_orchestrator::ExecutionResult, weir_orchestrator::ExecutorError> {
+            self.seen.lock().unwrap().push(e.work_unit_id);
+            // Returning = the resident exited; the worker requeues it with backoff.
+            Ok(weir_orchestrator::ExecutionResult::Completed {
+                rows_written: 0,
+                dead_lettered: 0,
+            })
+        }
+    }
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let rec = Rec { seen: seen.clone() };
+    let fleet = Fleet::new(relay.clone(), move || rec.clone(), WorkerConfig::default());
+    fleet.run_until_idle().await.unwrap();
+
+    assert_eq!(
+        seen.lock().unwrap().as_slice(),
+        &[id],
+        "the stranded resident was reclaimed and re-run by the fleet sweep"
+    );
+}

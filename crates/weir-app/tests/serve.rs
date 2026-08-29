@@ -135,3 +135,96 @@ async fn sync_picks_up_live_connection_at_subsecond_interval() {
     // Idempotent reconcile: no spurious changes when nothing changed.
     assert_eq!(app.sync_schedules(&scheduler).unwrap(), 0);
 }
+
+fn echo_conn(name: &str, cfg: &str) -> Connection {
+    Connection {
+        name: name.to_string(),
+        source: connector_ref("Echo"),
+        dest: connector_ref("ArrowSink"),
+        stream: "echo".to_string(),
+        source_config: cfg.to_string(),
+        dest_config: "{}".to_string(),
+        every_secs: Some(1.0),
+        cron: None,
+        sync_mode: "full_refresh".into(),
+        write_mode: "append".into(),
+        business_keys: vec![],
+        cursor_field: None,
+        execution_mode: "run_once".into(),
+    }
+}
+
+#[tokio::test]
+async fn sync_reregisters_on_config_change_same_cadence() {
+    // [[WEIR-T-0171]]: editing a connection's CONFIG without touching cadence must refresh
+    // the registered spec — a fixed credential takes effect by the next fire. Previously
+    // the reconciler compared only (every_ms, cron), so the schedule fired the OLD config
+    // forever ("fixed the credential, still failing").
+    use_wasm_connectors();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let app = App::open(tmp.path().join("weir.db").to_str().unwrap()).unwrap();
+
+    let clock = ManualClock::new(0);
+    let scheduler = Scheduler::new(app.relay().clone(), clock.clone()).unwrap();
+
+    app.add_connection(DEFAULT_TENANT, &echo_conn("cfg-edit", r#"{"tag":"old"}"#))
+        .unwrap();
+    assert_eq!(app.sync_schedules(&scheduler).unwrap(), 1);
+    assert_eq!(
+        app.sync_schedules(&scheduler).unwrap(),
+        0,
+        "unchanged connection → no re-register (next_due_at preserved)"
+    );
+
+    // Same cadence, new config → exactly one change: the spec refresh.
+    app.add_connection(DEFAULT_TENANT, &echo_conn("cfg-edit", r#"{"tag":"new"}"#))
+        .unwrap();
+    assert_eq!(
+        app.sync_schedules(&scheduler).unwrap(),
+        1,
+        "a config-only edit re-registers the schedule"
+    );
+    let (_, _, _, spec) = scheduler
+        .schedules()
+        .unwrap()
+        .into_iter()
+        .find(|(k, ..)| k == "default/cfg-edit")
+        .expect("tenant-scoped schedule key registered");
+    assert!(
+        spec.contains("new") && !spec.contains("\"tag\":\"old\""),
+        "the stored spec carries the edited config: {spec}"
+    );
+    assert_eq!(app.sync_schedules(&scheduler).unwrap(), 0, "stable again");
+}
+
+#[tokio::test]
+async fn non_default_tenant_schedule_fires() {
+    // [[WEIR-T-0171]]: sync_schedules reconciles EVERY tenant — previously it hardcoded
+    // the default tenant, so other tenants' cadences never fired under `serve`.
+    use_wasm_connectors();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let app = App::open(tmp.path().join("weir.db").to_str().unwrap()).unwrap();
+    app.create_tenant("acme", "Acme").unwrap();
+    app.add_connection("acme", &echo_conn("t2-sched", "{}"))
+        .unwrap();
+
+    let clock = ManualClock::new(0);
+    let scheduler = Scheduler::new(app.relay().clone(), clock.clone()).unwrap();
+    assert_eq!(app.sync_schedules(&scheduler).unwrap(), 1);
+    assert_eq!(scheduler.tick().unwrap(), 1, "acme's cadence fires");
+
+    let worker = Worker::new(
+        app.relay().clone(),
+        InProcessExecutor::new(app.store().clone(), app.relay().clone()),
+        WorkerConfig {
+            tenant: "acme".to_string(),
+            ..WorkerConfig::default()
+        },
+    );
+    worker.run_until_idle().await.unwrap();
+    assert_eq!(
+        app.store().outbox_count("t2-sched").unwrap(),
+        1,
+        "the non-default tenant's scheduled connection ran end-to-end"
+    );
+}

@@ -1,5 +1,5 @@
 site_name: weir
-site_description: An early-stage Rust project.
+site_description: An open-source, no-code data ingestion & reverse-ETL platform.
 site_url: https://colliery-io.github.io/weir
 repo_url: https://github.com/colliery-io/weir
 repo_name: colliery-io/weir
@@ -77,6 +77,7 @@ nav:
     - Author a connector: guides/connector-authoring.md
     - Soak testing: guides/soak-testing.md
     - Demo pipelines: guides/demo-pipelines.md
+    - First-hour triage: guides/first-hour-triage.md
   - Reference:
     - Installation: reference/installation.md
     - CLI: reference/cli.md

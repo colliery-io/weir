@@ -1054,3 +1054,74 @@ async fn schema_endpoint_returns_captured_schema() {
         .expect("field n captured");
     assert_eq!(n["type"], "integer", "Slow's n inferred as integer");
 }
+
+#[tokio::test]
+async fn create_rejects_unknown_connector_and_missing_required_config() {
+    // [[WEIR-T-0166]]: creation-time validation — a typo'd connector 404s with a catalog
+    // pointer, and config missing the connector's declared requireds 400s naming the fields.
+    use_wasm_connectors();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let app = Arc::new(App::open(tmp.path().join("weir.db").to_str().unwrap()).unwrap());
+    let router = weir_api::router(Arc::clone(&app));
+    let token = format!("Bearer {}", app.bootstrap_admin_key().unwrap().unwrap());
+
+    // Unknown source connector → 404 naming it, never 201-then-fail-at-run.
+    let body = serde_json::json!({
+        "name": "typo", "source": "Ecoh", "dest": "ArrowSink", "stream": "s", "config": {}
+    })
+    .to_string();
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::post("/connections")
+                .header("authorization", token.as_str())
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let err = json(resp).await["error"].as_str().unwrap().to_string();
+    assert!(
+        err.to_lowercase().contains("ecoh"),
+        "names the connector: {err}"
+    );
+    assert!(err.contains("/catalog"), "points at the catalog: {err}");
+
+    // `rest` declares required base_url + path → an empty config 400s listing them.
+    let body = serde_json::json!({
+        "name": "restless", "source": "rest", "dest": "ArrowSink", "stream": "s", "config": {}
+    })
+    .to_string();
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::post("/connections")
+                .header("authorization", token.as_str())
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let err = json(resp).await["error"].as_str().unwrap().to_string();
+    assert!(
+        err.contains("base_url") && err.contains("path"),
+        "lists the missing required fields: {err}"
+    );
+
+    // Neither rejected create persisted anything.
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::get("/connections")
+                .header("authorization", token.as_str())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(json(resp).await.as_array().unwrap().len(), 0);
+}

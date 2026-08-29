@@ -40,6 +40,15 @@ lcov.info
 # Documentation build output
 /site/
 
+# plissken-generated API docs (rebuilt by docs.yml CI)
+docs/api/_nav.yml
+docs/api/weir.md
+docs/api/rust/
+
+# Staged-connector output written by weir-app tests (compile-isolation staging
+# defaults connectors_dir() to this path) — test side effects, never inputs.
+crates/weir-app/connectors/
+
 # Environment
 .env
 .env.local
