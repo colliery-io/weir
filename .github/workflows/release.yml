@@ -44,12 +44,10 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             asset: weir-linux-x86_64.tar.gz
+          # arm64 = Graviton and friends; Linux-only artifacts by design.
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
             asset: weir-linux-aarch64.tar.gz
-          - target: aarch64-apple-darwin
-            runner: macos-latest
-            asset: weir-darwin-aarch64.tar.gz
     steps:
       - uses: actions/checkout@v4
 
@@ -65,14 +63,6 @@ jobs:
 
       - name: Install trunk (embedded-UI build)
         run: cargo install trunk --locked
-
-      # diesel's pq-sys links libpq dynamically; the Linux runner images ship it
-      # but macOS runners keep brew's libpq keg-only and off the linker path.
-      - name: Install libpq (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          brew list libpq >/dev/null 2>&1 || brew install libpq
-          echo "PQ_LIB_DIR=$(brew --prefix libpq)/lib" >> "$GITHUB_ENV"
 
       - name: Build the web UI
         run: trunk build --release
@@ -101,7 +91,6 @@ jobs:
 
           Runtime libraries (dynamically linked): libpq, sqlite3, bzip2.
             Debian/Ubuntu: apt install libpq5 libsqlite3-0 libbz2-1.0
-            macOS:         brew install libpq
 
           Docs: https://github.com/colliery-io/weir/tree/main/docs
           EOF
