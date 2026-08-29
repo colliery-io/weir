@@ -39,6 +39,6 @@ weir-wasm-testkit = { path = "../weir-wasm-testkit" }
 # A connector to load in tests (linked in-process via rlib).
 tempfile = "3"
 # Signing helpers for the signature-gating test (package_digest + ed25519 sign).
-fidius-core = "0.5.4"
+fidius-core = "0.5.8"
 # Drive the async streaming `read` in tests (current-thread runtime, like the engine).
 tokio = { version = "1", features = ["rt", "macros"] }

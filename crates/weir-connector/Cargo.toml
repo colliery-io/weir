@@ -9,7 +9,7 @@ repository.workspace = true
 description = "The weir connector contract: the fidius Connector interface and its boundary types (WEIR-A-0014 / WEIR-S-0006)."
 
 [dependencies]
-fidius = "0.5.4"
+fidius = "0.5.8"
 weir-connector-types = { path = "../weir-connector-types" }
 
 [features]

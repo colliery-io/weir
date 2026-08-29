@@ -21,8 +21,8 @@ use ed25519_dalek::VerifyingKey;
 // All host-side fidius surface is reached white-label via the facade (fidius 0.5.2
 // completed it): loader/handle types, plus the WASM egress contract under `wasm`.
 use weir_connector::fidius::{
-    CallError, EgressDenied, EgressPolicy, LoadError, PluginHandle, PluginHost, ValueError,
-    from_value,
+    CallError, EgressDenied, EgressPolicy, LoadError, PluginHandle, PluginHost, TcpTarget,
+    ValueError, from_value,
 };
 use weir_connector::{
     CheckResult, CodecError, Config, ConnectorRole, ConnectorSpec, DiscoverOutcome, ReadContext,
@@ -256,6 +256,38 @@ impl EgressPolicy for HostAllowList {
                 "tcp egress to `{addr}` not allowed"
             )))
         }
+    }
+
+    /// Name-aware TCP egress ([[WEIR-A-0041]] review trigger / fidius FIDIUS-I-0034):
+    /// allow-list entries may be **hostnames** — `db.example.com` or
+    /// `db.example.com:5432` — matched against the name the guest actually dialed
+    /// (fidius resolves-and-pins the guest's lookup and hands it here, lowercased).
+    /// IP-literal dials arrive with `host: None` and can only match IP/`ip:port`
+    /// entries via the resolved-addr fallback — a hostname entry never authorizes an
+    /// IP dial. IP allow-lists stay supported but are operationally broken for
+    /// managed endpoints (RDS/Cloud SQL/Azure) that rotate IPs; list names instead.
+    fn authorize_tcp_target(&self, target: &TcpTarget<'_>) -> Result<(), EgressDenied> {
+        if let Some(host) = target.host {
+            let hostport = format!("{host}:{}", target.addr.port());
+            if self
+                .allowed_hosts
+                .iter()
+                .any(|h| h.eq_ignore_ascii_case(host) || h.eq_ignore_ascii_case(&hostport))
+            {
+                return Ok(());
+            }
+        }
+        self.authorize_tcp(&target.addr).map_err(|_| {
+            EgressDenied::new(match target.host {
+                Some(host) => {
+                    format!("tcp egress to `{host}` ({}) not allowed", target.addr)
+                }
+                None => format!(
+                    "tcp egress to IP-literal `{}` not allowed (dial by hostname, or list the IP)",
+                    target.addr
+                ),
+            })
+        })
     }
 }
 
@@ -1150,6 +1182,134 @@ impl SessionProvider {
         })?;
         *cache = Some(token.clone());
         Ok(token)
+    }
+}
+
+#[cfg(test)]
+mod tcp_egress_policy_tests {
+    use super::*;
+
+    fn addr(s: &str) -> std::net::SocketAddr {
+        s.parse().unwrap()
+    }
+
+    fn named<'a>(host: &'a str, a: &str) -> TcpTarget<'a> {
+        TcpTarget {
+            host: Some(host),
+            addr: addr(a),
+        }
+    }
+
+    fn ip_literal(a: &str) -> TcpTarget<'static> {
+        TcpTarget {
+            host: None,
+            addr: addr(a),
+        }
+    }
+
+    fn list(hosts: &[&str]) -> HostAllowList {
+        HostAllowList {
+            allowed_hosts: hosts.iter().map(|s| s.to_string()).collect(),
+            inject_headers: Vec::new(),
+            credential: None,
+        }
+    }
+
+    #[test]
+    fn allow_all_permits_any_target() {
+        let p = HostAllowList::allow_all();
+        assert!(
+            p.authorize_tcp_target(&named("db.internal", "10.0.0.9:5432"))
+                .is_ok()
+        );
+        assert!(p.authorize_tcp_target(&ip_literal("10.0.0.9:5432")).is_ok());
+    }
+
+    #[test]
+    fn hostname_entry_matches_by_name_dial() {
+        // Bare-name entry: any port; fidius hands the dialed name lowercased.
+        let p = list(&["db.example.com"]);
+        assert!(
+            p.authorize_tcp_target(&named("db.example.com", "203.0.113.7:5432"))
+                .is_ok()
+        );
+        // Entries are matched case-insensitively (DNS is case-insensitive).
+        let p = list(&["DB.Example.COM"]);
+        assert!(
+            p.authorize_tcp_target(&named("db.example.com", "203.0.113.7:5432"))
+                .is_ok()
+        );
+        // host:port entry pins the port too.
+        let p = list(&["db.example.com:5432"]);
+        assert!(
+            p.authorize_tcp_target(&named("db.example.com", "203.0.113.7:5432"))
+                .is_ok()
+        );
+        let denied = p
+            .authorize_tcp_target(&named("db.example.com", "203.0.113.7:1433"))
+            .unwrap_err();
+        assert!(
+            denied.reason.contains("db.example.com"),
+            "{}",
+            denied.reason
+        );
+        assert!(
+            denied.reason.contains("203.0.113.7:1433"),
+            "{}",
+            denied.reason
+        );
+    }
+
+    #[test]
+    fn hostname_entry_never_authorizes_ip_literal_dial() {
+        // The guest dialed the resolved IP directly — no pinned name, so a
+        // name-keyed list must fail closed even though the addr "belongs" to it.
+        let p = list(&["db.example.com"]);
+        let denied = p
+            .authorize_tcp_target(&ip_literal("203.0.113.7:5432"))
+            .unwrap_err();
+        assert!(denied.reason.contains("IP-literal"), "{}", denied.reason);
+    }
+
+    #[test]
+    fn ip_entries_still_match_via_resolved_addr() {
+        // Existing IP/`ip:port` allow-lists keep working for both dial styles.
+        let p = list(&["203.0.113.7"]);
+        assert!(
+            p.authorize_tcp_target(&ip_literal("203.0.113.7:5432"))
+                .is_ok()
+        );
+        assert!(
+            p.authorize_tcp_target(&named("db.example.com", "203.0.113.7:5432"))
+                .is_ok()
+        );
+        let p = list(&["203.0.113.7:5432"]);
+        assert!(
+            p.authorize_tcp_target(&ip_literal("203.0.113.7:5432"))
+                .is_ok()
+        );
+        assert!(
+            p.authorize_tcp_target(&ip_literal("203.0.113.7:1433"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn unlisted_name_is_denied_with_both_name_and_addr() {
+        let p = list(&["db.example.com"]);
+        let denied = p
+            .authorize_tcp_target(&named("evil.example.net", "198.51.100.1:5432"))
+            .unwrap_err();
+        assert!(
+            denied.reason.contains("evil.example.net"),
+            "{}",
+            denied.reason
+        );
+        assert!(
+            denied.reason.contains("198.51.100.1:5432"),
+            "{}",
+            denied.reason
+        );
     }
 }
 
