@@ -4,14 +4,14 @@ level: initiative
 title: "Declarative connector integration testing (SOPS-encrypted secrets + live suite)"
 short_code: "WEIR-I-0014"
 created_at: 2026-06-30T15:59:30.734252+00:00
-updated_at: 2026-07-05T19:26:15.359471+00:00
+updated_at: 2026-08-30T11:43:11.699672+00:00
 parent: WEIR-V-0001
 blocked_by: []
 archived: false
 
 tags:
   - "#initiative"
-  - "#phase/active"
+  - "#phase/completed"
 
 
 exit_criteria_met: false
@@ -110,6 +110,15 @@ S1 (secrets + angreal) first — it's the prerequisite for any authed run, and s
 decrypt + run the existing keyed test). S2 (assertions + CI) builds the demonstrate-functionality /
 catch-breaking-changes layer on top. Each ends green (workspace + clippy); S2 ends with CI green + a
 proven red-on-break. Decomposed into tasks below.
+
+## Scope decision (2026-08-30)
+
+Dylan will not provision further connector accounts ([[WEIR-T-0067]] archived). The initiative's live
+surface is therefore: the **no-auth tier** (5 connectors, live-verified — see `manifests/verified.json`,
+[[WEIR-T-0183]]) plus the **three existing bundles** (`openweather`, `github`, `nasa` — together covering
+the header / bearer / query-param injection paths). The machinery (SOPS + angreal + suite +
+`connectors-live.yml`) is complete and user-consumable; the remaining optional step is CI enablement
+(`SOPS_AGE_KEY` repo secret) for the nightly run. Read the exit criteria below against that scope.
 
 ## Exit Criteria
 

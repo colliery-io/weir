@@ -360,6 +360,9 @@ impl Credential {
             "session_login_url".into(),
             "session_token_path".into(),
             "session_inject_header".into(),
+            "session_login_body".into(),
+            "session_login_method".into(),
+            "session_ttl_secs".into(),
             "basic_username_key".into(),
             "basic_password_key".into(),
             "google_sa_key_key".into(),
@@ -433,11 +436,39 @@ impl Credential {
                 };
                 let inject_header =
                     get(obj, "session_inject_header").unwrap_or_else(|| "Authorization".into());
-                Some(Credential::Session(SessionProvider::new(
-                    login_url,
-                    token_path,
-                    inject_header,
-                )))
+                // Credentialed login body ([[WEIR-T-0180]]): a JSON object template
+                // whose `{{key}}` string values are substituted from the config —
+                // and those keys are stripped as secrets (host-side only,
+                // [[WEIR-A-0033]]).
+                let login_body = obj
+                    .get("session_login_body")
+                    .and_then(|b| b.as_object())
+                    .map(|tmpl| {
+                        let mut out = serde_json::Map::new();
+                        for (k, v) in tmpl {
+                            let resolved = match v.as_str() {
+                                Some(s) if s.starts_with("{{") && s.ends_with("}}") => {
+                                    let key = s[2..s.len() - 2].trim().to_string();
+                                    let val = get(obj, &key).unwrap_or_default();
+                                    strip.push(key);
+                                    serde_json::Value::String(val)
+                                }
+                                _ => v.clone(),
+                            };
+                            out.insert(k.clone(), resolved);
+                        }
+                        serde_json::Value::Object(out).to_string()
+                    });
+                let method = get(obj, "session_login_method").unwrap_or_else(|| "POST".into());
+                let ttl = obj
+                    .get("session_ttl_secs")
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(0);
+                Some(Credential::Session(
+                    SessionProvider::new(login_url, token_path, inject_header)
+                        .with_login(method, login_body)
+                        .with_ttl(std::time::Duration::from_secs(ttl)),
+                ))
             }
             Some("basic") => {
                 let user_key = get(obj, "basic_username_key").unwrap_or_else(|| "username".into());
@@ -674,7 +705,12 @@ fn canonical_uri(path: &str) -> String {
     }
 }
 
-/// SigV4 canonical query: each `k=v` percent-encoded, then sorted by encoded key.
+/// SigV4 canonical query: each `k=v` DECODED then percent-encoded exactly once,
+/// sorted by encoded key. The wire query is already percent-encoded by the
+/// caller — encoding it again double-encodes (`%3D` → `%253D`) and the
+/// signature no longer matches what the server computes ([[WEIR-T-0181]]
+/// exposed this via ListObjectsV2 continuation tokens; any reserved character
+/// in `prefix`/`start-after` hit it too).
 fn canonical_query(query: &str) -> String {
     if query.is_empty() {
         return String::new();
@@ -683,7 +719,10 @@ fn canonical_query(query: &str) -> String {
         .split('&')
         .map(|p| {
             let (k, v) = p.split_once('=').unwrap_or((p, ""));
-            (uri_encode(k, false), uri_encode(v, false))
+            (
+                uri_encode(&uri_decode(k), false),
+                uri_encode(&uri_decode(v), false),
+            )
         })
         .collect();
     pairs.sort();
@@ -692,6 +731,29 @@ fn canonical_query(query: &str) -> String {
         .map(|(k, v)| format!("{k}={v}"))
         .collect::<Vec<_>>()
         .join("&")
+}
+
+/// Percent-decode (`%XX` only; a literal `+` stays a plus — S3 object keys with
+/// `+` arrive as `%2B`). Malformed escapes pass through untouched.
+fn uri_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && let (Some(h), Some(l)) = (
+                bytes.get(i + 1).and_then(|b| (*b as char).to_digit(16)),
+                bytes.get(i + 2).and_then(|b| (*b as char).to_digit(16)),
+            )
+        {
+            out.push((h * 16 + l) as u8);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Insert `name: value` into the request headers, failing closed on an invalid name/value.
@@ -1138,35 +1200,74 @@ fn run_blocking<T: Send + 'static>(
 /// bodies are a follow-up (the seam is the same).
 pub struct SessionProvider {
     login_url: String,
+    /// Login request method (default POST).
+    login_method: String,
+    /// JSON body for the login request, built HOST-side from the connection's
+    /// secret config ([[WEIR-T-0180]]) — the secret never enters the guest.
+    /// `None` = bare request (the pre-existing behavior).
+    login_body: Option<String>,
     /// Dot-path segments into the login response JSON holding the token.
     token_path: Vec<String>,
     /// Header the token is injected as on subsequent requests.
     inject_header: String,
-    cache: Mutex<Option<String>>,
+    /// Proactive re-login: a cached token older than this is re-minted BEFORE
+    /// use, so long syncs survive expiring session tokens. Zero = cache for the
+    /// provider's lifetime (one run). A mid-run 401 still fails the attempt —
+    /// the egress seam cannot see responses (fidius dispatches them straight
+    /// back to the guest), so in-run intercept-and-replay is inexpressible; the
+    /// worker retry re-resolves the credential (fresh login) and replays the
+    /// run from its checkpoint.
+    ttl: std::time::Duration,
+    cache: Mutex<Option<(String, std::time::Instant)>>,
 }
 
 impl SessionProvider {
     pub fn new(login_url: String, token_path: Vec<String>, inject_header: String) -> Self {
         Self {
             login_url,
+            login_method: "POST".to_string(),
+            login_body: None,
             token_path,
             inject_header,
+            ttl: std::time::Duration::ZERO,
             cache: Mutex::new(None),
         }
     }
 
+    /// Credentialed login: request method + JSON body ([[WEIR-T-0180]]).
+    pub fn with_login(mut self, method: String, body: Option<String>) -> Self {
+        self.login_method = method;
+        self.login_body = body;
+        self
+    }
+
+    /// Proactive re-login interval (zero = cache for the provider's lifetime).
+    pub fn with_ttl(mut self, ttl: std::time::Duration) -> Self {
+        self.ttl = ttl;
+        self
+    }
+
     fn token(&self) -> Result<String, EgressDenied> {
         let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(t) = cache.as_ref() {
+        if let Some((t, minted)) = cache.as_ref()
+            && (self.ttl.is_zero() || minted.elapsed() < self.ttl)
+        {
             return Ok(t.clone());
         }
         let login_url = self.login_url.clone();
+        let login_method = self.login_method.clone();
+        let login_body = self.login_body.clone();
         let token_path = self.token_path.clone();
         // Offloaded to a clean thread for the same reason as the OAuth grant (see `mint`).
         let token = run_blocking(move || {
-            let resp = ureq::post(&login_url)
-                .call()
-                .map_err(|e| format!("session login failed: {e}"))?;
+            let req = ureq::request(&login_method, &login_url);
+            let resp = match &login_body {
+                Some(body) => req
+                    .set("content-type", "application/json")
+                    .send_string(body),
+                None => req.call(),
+            }
+            .map_err(|e| format!("session login failed: {e}"))?;
             let body: serde_json::Value = resp
                 .into_json()
                 .map_err(|e| format!("session login response not JSON: {e}"))?;
@@ -1180,7 +1281,7 @@ impl SessionProvider {
                 .map(str::to_string)
                 .ok_or_else(|| "session token is not a string".into())
         })?;
-        *cache = Some(token.clone());
+        *cache = Some((token.clone(), std::time::Instant::now()));
         Ok(token)
     }
 }
@@ -1325,6 +1426,20 @@ mod sigv4_credential_tests {
             ("20150830T123600Z".to_string(), "20150830".to_string())
         );
         assert_eq!(epoch_to_amz(0).0, "19700101T000000Z");
+    }
+
+    /// The wire query is already percent-encoded — canonicalization must decode
+    /// then encode exactly ONCE ([[WEIR-T-0181]]: double-encoding `%3D` in a
+    /// ListObjectsV2 continuation token broke the signature → 403).
+    #[test]
+    fn canonical_query_encodes_exactly_once() {
+        assert_eq!(
+            canonical_query("list-type=2&continuation-token=abc%3D%3D&max-keys=1"),
+            "continuation-token=abc%3D%3D&list-type=2&max-keys=1",
+            "sorted, and %3D stays single-encoded"
+        );
+        // Raw reserved characters still get encoded.
+        assert_eq!(canonical_query("a=x/y"), "a=x%2Fy");
     }
 
     #[test]
@@ -1637,6 +1752,86 @@ mod egress_tests {
         );
         assert_eq!(p.token().expect("login"), "sess-9");
         assert_eq!(p.token().expect("cached"), "sess-9");
+    }
+
+    /// Credentialed login ([[WEIR-T-0180]]): the JSON body reaches the login
+    /// endpoint, and a non-zero ttl re-logs-in proactively (token rotates).
+    #[test]
+    fn session_provider_sends_login_body_and_relogs_in_after_ttl() {
+        use std::sync::mpsc;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = mpsc::channel::<String>();
+        thread::spawn(move || {
+            for n in 0..2 {
+                let Ok((mut s, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buf = [0u8; 4096];
+                let mut req = Vec::new();
+                // Read until the JSON body's closing brace arrives (canned, tiny).
+                while !req.windows(1).next_back().is_some_and(|w| w == b"}")
+                    && let Ok(k) = s.read(&mut buf)
+                {
+                    if k == 0 {
+                        break;
+                    }
+                    req.extend_from_slice(&buf[..k]);
+                }
+                let _ = tx.send(String::from_utf8_lossy(&req).into_owned());
+                let body = format!(r#"{{"token":"sess-{n}"}}"#);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s.write_all(resp.as_bytes());
+                let _ = s.flush();
+            }
+        });
+        let p = SessionProvider::new(
+            format!("http://{addr}/login"),
+            vec!["token".into()],
+            "Authorization".into(),
+        )
+        .with_login(
+            "POST".into(),
+            Some(r#"{"password":"shh","username":"admin"}"#.into()),
+        )
+        .with_ttl(std::time::Duration::from_millis(30));
+
+        assert_eq!(p.token().expect("login 1"), "sess-0");
+        let req = rx.recv().expect("captured request");
+        assert!(req.contains("POST /login"), "{req}");
+        assert!(req.contains("content-type: application/json"), "{req}");
+        assert!(
+            req.contains(r#"{"password":"shh","username":"admin"}"#),
+            "{req}"
+        );
+
+        // Within the ttl: cached.
+        assert_eq!(p.token().expect("cached"), "sess-0");
+        // Past the ttl: proactive re-login mints a fresh token.
+        thread::sleep(std::time::Duration::from_millis(60));
+        assert_eq!(p.token().expect("re-login"), "sess-1");
+    }
+
+    /// The `{{key}}` body template pulls secret fields host-side and strips them
+    /// (plus the session metadata) from the guest config ([[WEIR-A-0033]]).
+    #[test]
+    fn session_login_body_template_strips_secret_fields() {
+        let (cred, sanitized) = Credential::from_auth_config(
+            r#"{"auth_scheme":"session","session_login_url":"http://x/login",
+                "session_token_path":"token","session_ttl_secs":300,
+                "session_login_body":{"username":"{{admin_user}}","password":"{{admin_pass}}","remember":true},
+                "admin_user":"root","admin_pass":"shh","table":"t"}"#,
+        );
+        assert!(matches!(cred, Some(Credential::Session(_))));
+        assert!(!sanitized.contains("shh"), "{sanitized}");
+        assert!(!sanitized.contains("root"), "{sanitized}");
+        assert!(!sanitized.contains("admin_pass"), "{sanitized}");
+        assert!(!sanitized.contains("session_login_body"), "{sanitized}");
+        assert!(sanitized.contains("\"table\":\"t\""), "{sanitized}");
     }
 
     #[test]

@@ -4,9 +4,8 @@ Stands up the test estate the `#[ignore]`d integration tests run against, from t
 unified `compose.yml` (auto-discovered). The test-only services (MSSQL + seed, Dex,
 MinIO + seed) sit behind the `integration` compose profile ([[WEIR-T-0173]]) so the
 demo path (`angreal docker up` / `--profile demo`) starts only weir + Postgres;
-these commands activate the profile explicitly. (CI instead provisions a
-Postgres-only GitHub Actions service container — its integration estate is
-narrower than this local one.)
+these commands activate the profile explicitly. CI (integration.yml) runs the
+same compose estate since [[WEIR-T-0178]], so the TLS wire gates run there too.
 """
 
 import os
@@ -28,9 +27,16 @@ def _run(cmd):
     return subprocess.run(cmd, cwd=cwd).returncode
 
 
+def _gen_tls():
+    """Ephemeral TLS material for postgres-tls / mssql-tls ([[WEIR-T-0178]])."""
+    return _run(["bash", "scripts/gen-test-tls.sh"])
+
+
 @integration()
-@angreal.command(name="up", about="start integration resources (Postgres, MSSQL, MinIO, Dex) and wait until healthy")
+@angreal.command(name="up", about="start integration resources (Postgres+TLS, MSSQL+TLS, MySQL, MinIO, Dex) and wait until healthy")
 def up():
+    if _gen_tls() != 0:
+        raise SystemExit(1)
     raise SystemExit(_run([*_COMPOSE, "up", "-d", "--wait"]))
 
 
@@ -52,7 +58,7 @@ def status():
     about="bring resources up, then run the (ignored) integration tests against them",
 )
 def test():
-    if _run([*_COMPOSE, "up", "-d", "--wait"]) != 0:
+    if _gen_tls() != 0 or _run([*_COMPOSE, "up", "-d", "--wait"]) != 0:
         raise SystemExit(1)
     # `--ignored` runs only the integration tests (gated behind real resources);
     # resources are left running afterwards for iteration — `down` to clean up.

@@ -109,6 +109,7 @@ impl App {
             location: package,
             kind: "wasm".to_string(),
             manifest: None,
+            verified_at: None,
         };
         self.register_connector(tenant, &entry)?;
         // Re-import = new wasm at the same package path → drop any stale cached
@@ -181,6 +182,7 @@ impl App {
             location: DECLARATIVE_RUNTIME_PKG.to_string(),
             kind: "manifest".to_string(),
             manifest: Some(canonical),
+            verified_at: None,
         };
         self.register_connector(tenant, &entry)?;
         Ok(entry)
@@ -225,6 +227,7 @@ impl App {
             location: DEST_RUNTIME_PKG.to_string(),
             kind: "dest-manifest".to_string(),
             manifest: Some(canonical),
+            verified_at: None,
         };
         self.register_connector(tenant, &entry)?;
         Ok(entry)

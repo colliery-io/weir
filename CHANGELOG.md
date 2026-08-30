@@ -6,6 +6,31 @@ between releases and are called out here.
 
 ## [Unreleased]
 
+### Changed
+- **Breaking (v0-unstable):** the `postgres` destination now lands **typed
+  relational columns** inferred from the records (bigint/double
+  precision/boolean/timestamptz/text, per-column jsonb fallback) instead of a
+  single `data JSONB` column; set `typed_columns: false` to restore the legacy
+  layout. Existing tables gain typed columns additively on the next write.
+- The `postgres` and `mssql` connectors default to **TLS**
+  (`sslmode=require` / `tls_mode=require`, guest-side rustls per WEIR-A-0041)
+  with real verification available (`verify-full` + inline-PEM roots); set
+  `disable` for plaintext-only dev servers. mssql TLS rides the vendored
+  `weir-tiberius` fork (TDS 7.x in-PRELOGIN handshake).
+
+### Fixed
+- Incremental cursors on typed (numeric/timestamp) columns compared
+  lexicographically and could re-deliver rows; the predicate now compares in
+  the column's native type.
+- SigV4 signing double-encoded already-encoded query values (S3 listing
+  continuation tokens, escaped prefixes) → 403s; canonicalization now encodes
+  exactly once.
+- The s3 source follows ListObjectsV2 continuation tokens — buckets over 1000
+  objects no longer truncate silently.
+- Postgres `discover()` introspects real tables (information_schema, with
+  primary keys) instead of returning a stub stream; connection failures
+  surface as discover errors.
+
 ## [0.0.1-alpha] - 2026-08-29
 
 The first published alpha.

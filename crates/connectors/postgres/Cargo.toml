@@ -29,6 +29,13 @@ serde_json = "1"
 postgres-protocol = "0.6"
 bytes = "1"
 fallible-iterator = "0.2"
+# Guest-side TLS ([[WEIR-A-0041]]): rustls with the pure-Rust RustCrypto provider —
+# ring/aws-lc-rs need a wasi-sdk clang and don't build for wasm32-wasip2. The
+# provider is alpha/unaudited (recorded trade-off; review triggers on the ADR).
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
+rustls-rustcrypto = "0.0.2-alpha"
+rustls-pki-types = "1.11"
+webpki-roots = "0.26"
 
 [build-dependencies]
 fidius-build = "0.5.4"

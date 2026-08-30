@@ -7,7 +7,7 @@ created_at: 2026-07-03T01:17:47.546721+00:00
 updated_at: 2026-07-03T01:17:47.546721+00:00
 parent: WEIR-I-0014
 blocked_by: []
-archived: false
+archived: true
 
 tags:
   - "#task"
@@ -45,6 +45,8 @@ angreal test connectors-live         # confirm it goes green (rows > 0)
 **The secret field name differs per connector** — using the wrong one silently fails. It's one of
 `api_key`, `api_token`, or `access_token`, listed below. Optional `"__stream": "<name>"` picks a stream
 (default = the manifest's first).
+
+## Acceptance Criteria
 
 ## Acceptance Criteria **[REQUIRED]**
 
@@ -104,3 +106,5 @@ angreal test connectors-live         # confirm it goes green (rows > 0)
 ## Status Updates **[REQUIRED]**
 
 *openweather done (2026-07-02). Remainder is operator work as accounts are provisioned.*
+
+**2026-08-30 — CANCELLED by decision (archived).** Dylan: "I won't be provisioning those accounts." No further account provisioning will happen. What exists stays: three encrypted bundles are in-tree and usable (`openweather`, `github`, `nasa` — covering header, bearer, and query-param injection paths), plus the five no-auth live connectors. The live-verification story is therefore: no-auth tier + the three existing bundles + wire-level integration gates (compose estate) — keyed cloud connectors (snowflake/hubspot/stripe/ga4/sheets) remain honestly unverified in the [[WEIR-T-0183]] ledger, which is exactly what the ledger is for. The SOPS machinery remains a shipped user-facing feature — anyone can bring their own accounts via `angreal secrets edit`.

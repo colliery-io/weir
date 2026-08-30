@@ -4,14 +4,14 @@ level: initiative
 title: "Alpha quick wins — front door, honest feedback, packaging hygiene"
 short_code: "WEIR-I-0042"
 created_at: 2026-08-16T15:22:27.476190+00:00
-updated_at: 2026-08-16T15:35:15.282328+00:00
+updated_at: 2026-08-30T11:43:10.018976+00:00
 parent: WEIR-V-0001
 blocked_by: []
 archived: false
 
 tags:
   - "#initiative"
-  - "#phase/decompose"
+  - "#phase/completed"
 
 
 exit_criteria_met: false

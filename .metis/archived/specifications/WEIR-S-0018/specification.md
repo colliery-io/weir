@@ -7,7 +7,7 @@ created_at: 2026-07-15T02:06:56.974022+00:00
 updated_at: 2026-07-15T02:06:56.974022+00:00
 parent: WEIR-V-0001
 blocked_by: []
-archived: false
+archived: true
 
 tags:
   - "#specification"
@@ -21,6 +21,11 @@ initiative_id: NULL
 # Demo account provisioning — accounts/infra for the live pipeline demo
 
 ## Overview **[REQUIRED]**
+
+**CANCELLED 2026-08-30 (archived):** Dylan will not be provisioning these accounts. The demo estate
+stands up provisioned-but-not-live (its designed degraded mode); the SOPS flow remains a shipped
+user-facing feature for anyone bringing their own accounts. Kept for reference — the checklist below is
+accurate if ever picked up.
 
 The human-side checklist for [[WEIR-I-0041]] (the pipeline demo). Each account below yields one SOPS-encrypted
 secret bundle (`angreal secrets edit <slug>` → `secrets/<slug>.enc.json`, [[WEIR-I-0014]] flow) that the live

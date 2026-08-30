@@ -4,14 +4,14 @@ level: task
 title: "Demo setup script + secret bundles + six-pipeline live validation"
 short_code: "WEIR-T-0162"
 created_at: 2026-07-15T02:09:18.276619+00:00
-updated_at: 2026-07-16T01:03:09.005609+00:00
+updated_at: 2026-08-30T03:09:27.516591+00:00
 parent: WEIR-I-0041
 blocked_by: [WEIR-T-0157, WEIR-T-0158, WEIR-T-0159, WEIR-T-0160, WEIR-T-0161]
 archived: false
 
 tags:
   - "#task"
-  - "#phase/active"
+  - "#phase/completed"
 
 
 exit_criteria_met: false
@@ -31,17 +31,19 @@ onboarding, six connections (HubSpot→Snowflake, Stripe→Snowflake, Sheets→S
 MSSQL→Snowflake, Snowflake→HubSpot rETL) with sync/write modes matching the demo spec — plus the
 live suite proving each end-to-end before anyone demos anything.
 
-## Acceptance Criteria
-
 ## Acceptance Criteria **[REQUIRED]**
 
-- [ ] An angreal task (e.g. `angreal demo pipelines`) provisions all six connections against a running weir
-      via the control-plane API, following the `angreal ui demo` seed pattern; idempotent re-run.
-- [ ] Secret bundles wired: SOPS slugs `google`, `snowflake`, `hubspot`, `stripe` ([[WEIR-S-0018]]) decrypt and
-      flow through host-side injection; MSSQL creds come from the compose service.
-- [ ] All six pipelines green in `angreal test connectors-live` (records land / rETL upserts verified by
-      read-back), and a scripted smoke asserts row counts in Snowflake after a full run.
-- [ ] A short runbook (docs how-to) covering: bring-up, teardown, what to click in the UI during the demo.
+*(Amended 2026-08-30 at close: the six-green LIVE data run is CANCELLED — Dylan will not provision the
+cloud accounts ([[WEIR-S-0018]] archived). AC3 closes on its verified mechanism; the estate's designed
+degraded mode — provisioned-but-not-live, per-pipeline "needs bundle" flags — is the shipped state.)*
+
+- [x] An angreal task (`angreal demo pipelines`) provisions all six connections against a running weir
+      via the control-plane API; idempotent re-run — verified live 2026-07-16.
+- [x] Secret bundles wired: SOPS decrypt → per-side config → host-side injection; MSSQL creds from the
+      compose service. (Bundles themselves cancelled; the plumbing is proven and user-consumable.)
+- [x] The `--validate` scripted smoke (runs each pipeline, polls `/runs`, reports rows landed) is built and
+      its path proven; the six-green data run is cancelled with the accounts.
+- [x] Runbook shipped (`docs/guides/demo-pipelines.md` + nav).
 
 ## Implementation Notes **[CONDITIONAL: Technical Task]**
 
@@ -123,3 +125,10 @@ decrypt → per-side config → host-side injection via orchestrator `from_auth_
 ✓ mechanism (`--validate` scripted smoke reports Snowflake rows landed; the six-green **data** run self-arms on
 the [[WEIR-S-0018]] bundles + GA4 window, GA4 sequenced last — like the sibling live tests). AC4 ✓ (runbook).
 The only thing gated on the human is the live data run once the cloud accounts exist. Awaiting review.
+
+### 2026-08-30 — closed; live data run cancelled by decision
+
+Dylan will not provision the cloud accounts ([[WEIR-T-0067]] and [[WEIR-S-0018]] archived). Everything
+buildable was built and verified live in July (provisioning, idempotency, `--validate` smoke path,
+runbook); the estate ships in its designed degraded mode — provisioned-but-not-live with per-pipeline
+"needs bundle" flags — and anyone with their own accounts can light it up via `angreal secrets edit`.

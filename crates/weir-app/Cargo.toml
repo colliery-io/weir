@@ -45,3 +45,5 @@ weir-runtime = { path = "../weir-runtime" }
 tempfile = "3"
 # Drive the streaming read in the live snowflake read-back ([[WEIR-T-0157]]).
 futures = "0.3"
+# Stamp the verification ledger ([[WEIR-T-0183]] live-pass dates).
+chrono = { workspace = true }

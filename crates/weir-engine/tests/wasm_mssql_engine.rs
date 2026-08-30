@@ -62,6 +62,9 @@ fn mssql(root: &Path, table: Option<&str>) -> ConnectorHandle {
         "database": "weir_demo",
         "user": "sa",
         "password": "weirStrong!Pass1",
+        // The plain compose service has Force Encryption off; the connector's
+        // default is `require` ([[WEIR-A-0041]]) — TLS gates live below.
+        "tls_mode": "disable",
     });
     if let Some(t) = table {
         cfg["table"] = t.into();
@@ -175,4 +178,140 @@ fn mssql_wasm_incremental_advances_and_resumes() {
         out2.rows_written, 0,
         "resume from the cursor reads nothing new"
     );
+}
+
+// ---- TLS wire gates ([[WEIR-T-0177]] / [[WEIR-A-0041]]) — against the
+// `mssql-tls` compose service (Force Encryption on, cert = the ephemeral
+// harness CA's localhost-SAN leaf; `scripts/gen-test-tls.sh`). The TDS 7.x
+// handshake runs INSIDE PRELOGIN via the weir-tiberius fork. ----
+
+/// The Force-Encryption SQL Server port (`WEIR_MSSQL_TLS_HOST_PORT`, default 11433).
+fn mssql_tls_port() -> u16 {
+    std::env::var("WEIR_MSSQL_TLS_HOST_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(11433)
+}
+
+/// The harness CA (inline PEM for `tls_ca_pem`).
+fn harness_ca() -> String {
+    let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/weir-tls-certs/ca.crt");
+    std::fs::read_to_string(&p).unwrap_or_else(|e| {
+        panic!(
+            "read {} ({e}) — run scripts/gen-test-tls.sh first",
+            p.display()
+        )
+    })
+}
+
+/// Load the mssql guest against the TLS service with explicit tls settings.
+fn mssql_tls(root: &Path, host: &str, tls: serde_json::Value) -> ConnectorHandle {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/connectors/mssql");
+    weir_wasm_testkit::stage(
+        &weir_wasm_testkit::WasmPackage {
+            fixture_dir: &fixture,
+            wasm_file: "weir_mssql_wasm.wasm",
+            pkg_name: "weir-mssql-pkg",
+            capabilities: &["tcp"],
+        },
+        root,
+    );
+    let mut cfg = serde_json::json!({
+        "host": host,
+        "port": mssql_tls_port(),
+        "database": "weir_demo",
+        "user": "sa",
+        "password": "weirStrong!Pass1",
+    });
+    for (k, v) in tls.as_object().unwrap() {
+        cfg[k] = v.clone();
+    }
+    ConnectorHandle::from_wasm_package(
+        root,
+        "weir-mssql-pkg",
+        &Config {
+            json: cfg.to_string(),
+        },
+        TcpOnly(mssql_tls_port()),
+        &[],
+    )
+    .expect("load mssql wasm")
+}
+
+/// `tls_mode=require` + the harness CA syncs against the Force-Encryption
+/// server — the in-PRELOGIN TDS handshake, chain + hostname verification, and
+/// the full read path through TLS.
+#[test]
+#[ignore = "needs the mssql-tls compose service (integration profile)"]
+fn mssql_tls_require_with_ca_reads_rows() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let src = mssql_tls(
+        tmp.path(),
+        "localhost",
+        serde_json::json!({"tls_mode": "require", "tls_ca_pem": harness_ca()}),
+    );
+    let out = Engine::new(&store(tmp.path(), "r"))
+        .sync("r", &stream(SyncMode::FullRefresh, None), &src, &arrow())
+        .expect("full refresh over TLS");
+    assert_eq!(
+        out.rows_written, 3,
+        "3 seeded contacts through Force-Encryption TLS"
+    );
+}
+
+/// Encrypt-only opt-out: `tls_insecure_skip_verify` connects without a CA.
+#[test]
+#[ignore = "needs the mssql-tls compose service (integration profile)"]
+fn mssql_tls_skip_verify_reads_rows() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let src = mssql_tls(
+        tmp.path(),
+        "localhost",
+        serde_json::json!({"tls_mode": "require", "tls_insecure_skip_verify": true}),
+    );
+    let out = Engine::new(&store(tmp.path(), "r"))
+        .sync("r", &stream(SyncMode::FullRefresh, None), &src, &arrow())
+        .expect("full refresh with skip-verify");
+    assert_eq!(out.rows_written, 3);
+}
+
+/// Negative verification gate: dialing the same server as `127.0.0.1` (the cert
+/// is valid ONLY for `localhost`) must fail — verification is real.
+#[test]
+#[ignore = "needs the mssql-tls compose service (integration profile)"]
+fn mssql_tls_wrong_name_fails_verification() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let src = mssql_tls(
+        tmp.path(),
+        "127.0.0.1",
+        serde_json::json!({"tls_mode": "require", "tls_ca_pem": harness_ca()}),
+    );
+    let err = Engine::new(&store(tmp.path(), "w"))
+        .sync("w", &stream(SyncMode::FullRefresh, None), &src, &arrow())
+        .expect_err("wrong-name dial must fail verification");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("not valid for name")
+            || msg.contains("invalid peer certificate")
+            || msg.contains("Tls"),
+        "failure is a certificate/TLS error: {msg}"
+    );
+}
+
+/// The engagement proof's other half: a plaintext-mode client cannot talk to a
+/// Force-Encryption server.
+#[test]
+#[ignore = "needs the mssql-tls compose service (integration profile)"]
+fn mssql_tls_plaintext_mode_is_rejected() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let src = mssql_tls(
+        tmp.path(),
+        "localhost",
+        serde_json::json!({"tls_mode": "disable"}),
+    );
+    let err = Engine::new(&store(tmp.path(), "w"))
+        .sync("w", &stream(SyncMode::FullRefresh, None), &src, &arrow())
+        .expect_err("plaintext must be rejected by Force Encryption");
+    let msg = format!("{err:?}");
+    assert!(!msg.is_empty(), "rejection surfaced: {msg}");
 }

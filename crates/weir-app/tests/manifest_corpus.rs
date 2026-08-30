@@ -199,6 +199,35 @@ async fn run_manifest_live(
     }
 }
 
+/// Record a live pass in the vendored verification ledger ([[WEIR-T-0183]],
+/// `manifests/verified.json` — surfaces as `verified_at` on catalog rows at
+/// registration). Opt-in via WEIR_WRITE_VERIFIED=1 (nightly/local); the updated
+/// file is committed like any vendored change.
+fn record_verified(slug: &str, reference: &str) {
+    if std::env::var("WEIR_WRITE_VERIFIED").as_deref() != Ok("1") {
+        return;
+    }
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../manifests/verified.json");
+    let ledger: serde_json::Map<String, serde_json::Value> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let mut sorted: std::collections::BTreeMap<String, serde_json::Value> =
+        ledger.into_iter().collect();
+    sorted.insert(
+        slug.to_string(),
+        serde_json::json!({"verified_at": today, "ref": reference}),
+    );
+    std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&sorted).expect("ledger json") + "\n",
+    )
+    .expect("write verified.json");
+}
+
 /// Live integration: every **no-auth** vendored connector actually functions against
 /// its real API on the shared rest runtime → arrow-sink. `#[ignore]` (network);
 /// run explicitly: `cargo test -p weir-app --test manifest_corpus -- --ignored`
@@ -248,7 +277,10 @@ async fn no_auth_manifests_run_live() {
         }
         let name = format!("f{i}-{slug}");
         match run_manifest_live(&app, &name, slug, stream, "{}").await {
-            Ok(rows) if rows > 0 => report.push_str(&format!("  ✓ {slug}/{stream}: {rows} rows\n")),
+            Ok(rows) if rows > 0 => {
+                record_verified(slug, &format!("live read {stream}: {rows} rows"));
+                report.push_str(&format!("  ✓ {slug}/{stream}: {rows} rows\n"))
+            }
             Ok(rows) => {
                 report.push_str(&format!(
                     "  ✗ {slug}/{stream}: {rows} rows (expected > 0)\n"
@@ -341,7 +373,10 @@ async fn keyed_manifests_run_live() {
 
         let name = format!("k-{slug}");
         match run_manifest_live(&app, &name, &slug, &stream, &raw).await {
-            Ok(rows) if rows > 0 => report.push_str(&format!("  ✓ {slug}/{stream}: {rows} rows\n")),
+            Ok(rows) if rows > 0 => {
+                record_verified(&slug, &format!("live read {stream}: {rows} rows"));
+                report.push_str(&format!("  ✓ {slug}/{stream}: {rows} rows\n"))
+            }
             Ok(rows) => {
                 report.push_str(&format!(
                     "  ✗ {slug}/{stream}: {rows} rows (expected > 0)\n"

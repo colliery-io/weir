@@ -213,8 +213,10 @@ pub fn stage(pkg: &WasmPackage, dest_root: &Path) -> PathBuf {
     dir
 }
 
-/// True if `art` exists and is newer than the crate's `Cargo.toml`, `build.rs`, and
-/// everything under `src/` + `wit/` — i.e. a rebuild would be a no-op.
+/// True if `art` exists and is newer than the crate's `Cargo.toml`, `build.rs`,
+/// everything under `src/` + `wit/`, AND the vendored path deps under
+/// `<workspace>/vendor` (weir-tiberius etc. — a fork edit must rebuild its
+/// guest) — i.e. a rebuild would be a no-op.
 fn is_fresh(art: &Path, fixture_dir: &Path) -> bool {
     let Ok(art_mtime) = modified(art) else {
         return false;
@@ -227,6 +229,18 @@ fn is_fresh(art: &Path, fixture_dir: &Path) -> bool {
     }
     newest = newest.max(newest_under(&fixture_dir.join("src")));
     newest = newest.max(newest_under(&fixture_dir.join("wit")));
+    for vendor in ["vendor"] {
+        let dir = workspace_root().join(vendor);
+        if dir.is_dir() {
+            for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                let crate_dir = entry.path();
+                newest = newest.max(newest_under(&crate_dir.join("src")));
+                if let Ok(m) = modified(&crate_dir.join("Cargo.toml")) {
+                    newest = newest.max(m);
+                }
+            }
+        }
+    }
     art_mtime >= newest
 }
 

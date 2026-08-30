@@ -61,7 +61,7 @@ weir --db weir.db connection add \
   --source slow \
   --dest postgres \
   --stream demo_rows \
-  --config '{"url":"postgres://weir:weir@localhost:5433/weir","rows":5,"batch":true}'
+  --config '{"url":"postgres://weir:weir@localhost:5433/weir?sslmode=disable","rows":5,"batch":true}'
 ```
 
 ```
@@ -70,6 +70,9 @@ added connection `first-sync`
 
 The `--config` is passed to the connectors: `rows`/`batch` tell `slow` how much to emit, and `url` tells the
 `postgres` destination where to write. The `--stream` (`demo_rows`) becomes the destination table.
+`sslmode=disable` is needed because the tutorial's Docker Postgres speaks plaintext — the connector
+**defaults to `sslmode=require`** (TLS), which is what a managed database (RDS, Cloud SQL, Azure) wants;
+`verify-full` adds certificate verification (optionally against an inline-PEM `sslrootcert`).
 
 ## 4. Run it
 

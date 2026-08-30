@@ -436,6 +436,12 @@ impl App {
         let roles_j = json(&e.roles)?;
         let modes_j = json(&e.supported_sync_modes)?;
         let origin_j = json(&e.origin)?;
+        // Verification record ([[WEIR-T-0183]]): an explicit value wins; else the
+        // vendored ledger by connector name (None = honest "unverified").
+        let verified = e
+            .verified_at
+            .clone()
+            .or_else(|| verified_ledger().get(&e.name).cloned());
         // Portable upsert (MultiBackend has no `on_conflict`): update keeps the
         // original created_at; insert stamps both timestamps. Keyed `(tenant, name, version)`.
         let updated = diesel::update(
@@ -456,6 +462,7 @@ impl App {
             connectors::location.eq(&e.location),
             connectors::kind.eq(&e.kind),
             connectors::manifest.eq(e.manifest.as_deref()),
+            connectors::verified_at.eq(verified.as_deref()),
             connectors::updated_at.eq(now),
         ))
         .execute(&mut conn)?;
@@ -474,6 +481,7 @@ impl App {
                     connectors::location.eq(&e.location),
                     connectors::kind.eq(&e.kind),
                     connectors::manifest.eq(e.manifest.as_deref()),
+                    connectors::verified_at.eq(verified.as_deref()),
                     connectors::created_at.eq(now),
                     connectors::updated_at.eq(now),
                 ))
@@ -504,6 +512,7 @@ impl App {
                 connectors::location,
                 connectors::kind,
                 connectors::manifest,
+                connectors::verified_at,
             ))
             .load(&mut conn)?;
         rows.into_iter().map(catalog_row_to_entry).collect()
@@ -540,6 +549,7 @@ impl App {
                 connectors::location,
                 connectors::kind,
                 connectors::manifest,
+                connectors::verified_at,
             ))
             .first(&mut conn)
             .optional()?;
@@ -1473,6 +1483,37 @@ pub struct CatalogEntry {
     /// The declarative `manifest.yaml` for `kind = "manifest"` (else `None`).
     #[serde(default)]
     pub manifest: Option<String>,
+    /// When this connector last passed the LIVE suite against its real API
+    /// ([[WEIR-T-0183]]; ISO 8601 date from `<manifests_dir>/verified.json`,
+    /// filled at registration). `None` = unverified — the honest default.
+    #[serde(default)]
+    pub verified_at: Option<String>,
+}
+
+/// The verification ledger ([[WEIR-T-0183]]): `<manifests_dir>/verified.json`,
+/// `{ "<connector>": { "verified_at": "YYYY-MM-DD", "ref": "<what ran>" } }` —
+/// written by the live suite (`angreal test connectors-live` with
+/// `WEIR_WRITE_VERIFIED=1`), vendored alongside the manifests so deployments
+/// carry it. Missing/invalid file = empty ledger.
+fn verified_ledger() -> std::collections::HashMap<String, String> {
+    let path = std::path::Path::new(&manifests_dir()).join("verified.json");
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return Default::default();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return Default::default();
+    };
+    v.as_object()
+        .map(|o| {
+            o.iter()
+                .filter_map(|(name, rec)| {
+                    rec.get("verified_at")
+                        .and_then(|d| d.as_str())
+                        .map(|d| (name.clone(), d.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn default_kind() -> String {
@@ -1493,6 +1534,7 @@ type CatalogTuple = (
     String,
     String,
     String,
+    Option<String>,
     Option<String>,
 );
 
@@ -1526,6 +1568,7 @@ fn catalog_row_to_entry(r: CatalogTuple) -> Result<CatalogEntry, AppError> {
         location,
         kind,
         manifest,
+        verified_at,
     ) = r;
     Ok(CatalogEntry {
         name,
@@ -1539,6 +1582,7 @@ fn catalog_row_to_entry(r: CatalogTuple) -> Result<CatalogEntry, AppError> {
         location,
         kind,
         manifest,
+        verified_at,
     })
 }
 
@@ -2413,6 +2457,7 @@ mod catalog_tests {
             location: format!("weir-{name}-pkg"),
             kind: "wasm".to_string(),
             manifest: None,
+            verified_at: None,
         }
     }
 
@@ -2648,6 +2693,40 @@ streams:
                 .unwrap()
                 .is_some()
         );
+    }
+
+    /// Registration fills `verified_at` from the vendored ledger
+    /// (`<manifests_dir>/verified.json`, [[WEIR-T-0183]]); unlisted connectors
+    /// stay honestly unverified.
+    #[test]
+    fn registration_fills_verified_at_from_ledger() {
+        let mdir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            mdir.path().join("verified.json"),
+            r#"{"exchangerate":{"verified_at":"2026-08-29","ref":"live read latest: 1 rows"}}"#,
+        )
+        .unwrap();
+        unsafe {
+            std::env::set_var("WEIR_MANIFESTS_DIR", mdir.path());
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        let app = App::open(tmp.path().join("weir.db").to_str().unwrap()).unwrap();
+
+        app.register_connector(DEFAULT_TENANT, &entry("exchangerate", "1.0.0", 1))
+            .unwrap();
+        let got = app
+            .get_connector(DEFAULT_TENANT, "exchangerate", "1.0.0")
+            .unwrap()
+            .expect("registered");
+        assert_eq!(got.verified_at.as_deref(), Some("2026-08-29"));
+
+        app.register_connector(DEFAULT_TENANT, &entry("slow", "1.0.0", 1))
+            .unwrap();
+        let got = app
+            .get_connector(DEFAULT_TENANT, "slow", "1.0.0")
+            .unwrap()
+            .expect("registered");
+        assert!(got.verified_at.is_none(), "unlisted = honestly unverified");
     }
 
     #[test]

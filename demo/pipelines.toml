@@ -109,7 +109,7 @@ business_keys = ["id"]
 cursor_field = "updated_at"
 dest_extra = { table = "mssql_contacts", auth_scheme = "snowflake_keypair_jwt" }
 # MSSQL creds come from the integration compose service, not a SOPS bundle.
-source_extra = { host = "localhost", port = 1433, database = "weir_demo", user = "sa", password = "weirStrong!Pass1", table = "dbo.contacts" }
+source_extra = { host = "localhost", port = 1433, database = "weir_demo", user = "sa", password = "weirStrong!Pass1", table = "dbo.contacts", tls_mode = "disable" }
 dest_secrets = { account = "snowflake.account", user = "snowflake.user", private_key = "snowflake.private_key", database = "snowflake.database", schema = "snowflake.schema", warehouse = "snowflake.warehouse" }
 
 [[connection]]
