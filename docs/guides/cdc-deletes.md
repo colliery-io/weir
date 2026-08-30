@@ -35,6 +35,9 @@ weir --db weir.db connection add \
   }'
 ```
 
+- The `postgres` source defaults to **TLS** (`sslmode=require`) — right for managed databases; append
+  `?sslmode=disable` to the URL for a plaintext local/dev server, or `?sslmode=verify-full` (+ inline-PEM
+  `sslrootcert`) for verified TLS.
 - `--sync-mode cdc` makes the source read the logical-replication stream as structured changes.
 - `--write-mode upsert --business-keys id` makes Insert/Update upsert by `id`, and gives Delete its key.
 - The `config` is shared by source and destination; each reads the keys it understands (here the `postgres`

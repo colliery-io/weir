@@ -104,3 +104,60 @@ fn s3_wasm_incremental_by_key_resumes() {
         .expect("read 2");
     assert_eq!(o2.rows_written, 0, "no new objects → no re-delivery");
 }
+
+/// Listing pagination ([[WEIR-T-0181]]): `max_keys=1` forces one object per
+/// ListObjectsV2 page, so reading ALL records proves the
+/// `IsTruncated`/`NextContinuationToken` loop — the pre-fix connector read only
+/// the first page and reported success.
+#[test]
+#[ignore = "needs the integration MinIO (angreal integration up)"]
+fn s3_wasm_paginated_listing_reads_all_objects() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/connectors/s3");
+    weir_wasm_testkit::stage(
+        &weir_wasm_testkit::WasmPackage {
+            fixture_dir: &fixture,
+            wasm_file: "weir_s3_wasm.wasm",
+            pkg_name: "weir-s3-pkg",
+            capabilities: &["http"],
+        },
+        tmp.path(),
+    );
+    let cfg = Config {
+        json: format!(
+            "{{\"endpoint\":\"{}\",\"bucket\":\"weir-test\",\"max_keys\":1}}",
+            s3_endpoint()
+        ),
+    };
+    let egress = HostAllowList::allow_all().with_credential(Credential::AwsSigV4 {
+        access_key: "minioadmin".to_string(),
+        secret_key: "minioadmin".to_string(),
+        region: "us-east-1".to_string(),
+        service: "s3".to_string(),
+    });
+    let s3 = ConnectorHandle::from_wasm_package(tmp.path(), "weir-s3-pkg", &cfg, egress, &[])
+        .expect("load s3 wasm");
+
+    // Full refresh across two one-object pages → all 5 records.
+    let st = cstream(SyncMode::FullRefresh, None);
+    let out = Engine::new(&store(tmp.path(), "r"))
+        .sync("r", &st, &s3, &arrow())
+        .expect("paginated full refresh");
+    assert_eq!(out.rows_written, 5, "all records across listing pages");
+
+    // Incremental cursor still lands on the LAST page's key and resumes clean.
+    let inc = cstream(SyncMode::Incremental, Some("_key"));
+    let rd = store(tmp.path(), "rd");
+    let o1 = Engine::new(&rd)
+        .sync("rd", &inc, &s3, &arrow())
+        .expect("read 1");
+    assert_eq!(o1.rows_written, 5);
+    assert_eq!(o1.final_state.cursor.as_deref(), Some("more.ndjson"));
+    let o2 = Engine::new(&rd)
+        .sync("rd", &inc, &s3, &arrow())
+        .expect("read 2");
+    assert_eq!(
+        o2.rows_written, 0,
+        "cursor from the last page resumes clean"
+    );
+}

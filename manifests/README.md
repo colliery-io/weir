@@ -36,8 +36,11 @@ are all handled.
 
 ## Verification honesty
 
-Importing cleanly is not the same as verified against the live API: the no-auth set
-(`coinpaprika`, `frankfurter`, `jsonplaceholder`, `rickandmorty`, `xkcd`) runs live in
-the test suite; keyed connectors run live only where a secret bundle exists
-(`angreal test connectors-live`). Treat un-live-tested manifests as
-well-founded-but-unverified until the live suite covers them.
+Importing cleanly is not the same as verified against the live API. The durable record
+is **[`verified.json`](verified.json)** — one entry per connector that last PASSED the
+live suite, with the date and what ran. It is written by
+`angreal test connectors-live` (or `angreal test manifests --live`) when
+`WEIR_WRITE_VERIFIED=1` is set, and committed like any vendored change; at connector
+registration the date lands on the catalog row as `verified_at` (API/UI-visible), so
+deployments carry the record. Keyed connectors join the ledger as their secret bundles
+land. **Absent from the ledger = well-founded-but-unverified** — treat it that way.

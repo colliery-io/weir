@@ -38,7 +38,13 @@ impl Connector for Postgres {
             config_schema: "{\"type\":\"object\",\"properties\":{\
                 \"url\":{\"type\":\"string\"},\"host\":{\"type\":\"string\"},\"port\":{\"type\":\"integer\"},\
                 \"user\":{\"type\":\"string\"},\"password\":{\"type\":\"string\",\"format\":\"password\"},\
-                \"dbname\":{\"type\":\"string\"},\"table\":{\"type\":\"string\"}}}".to_string(),
+                \"dbname\":{\"type\":\"string\"},\"table\":{\"type\":\"string\"},\
+                \"sslmode\":{\"type\":\"string\",\"enum\":[\"disable\",\"require\",\"verify-full\"],\"default\":\"require\",\
+                \"description\":\"TLS: require (encrypt, default) | verify-full (encrypt + verify chain/hostname) | disable\"},\
+                \"sslrootcert\":{\"type\":\"string\",\"description\":\"Inline PEM CA bundle for verify-full (defaults to public webpki roots)\"},\
+                \"schema\":{\"type\":\"string\",\"default\":\"public\",\"description\":\"Schema discover() introspects\"},\
+                \"typed_columns\":{\"type\":\"boolean\",\"default\":true,\
+                \"description\":\"Destination lands typed relational columns inferred from the records (false = legacy single data JSONB column)\"}}}".to_string(),
             roles: vec![ConnectorRole::Source, ConnectorRole::Destination],
             supported_sync_modes: vec![SyncMode::FullRefresh, SyncMode::Incremental, SyncMode::Cdc],
         }
@@ -54,19 +60,65 @@ impl Connector for Postgres {
         }
     }
 
+    /// Real table introspection ([[WEIR-T-0179]], porting the mssql pattern): one
+    /// stream per base table in the configured schema (config `schema`, default
+    /// `public`), with source-defined primary keys. Column TYPES are not carried
+    /// here — the platform's typed schemas ([[WEIR-I-0025]]) are captured at sync
+    /// via `StreamSchema::infer`, and nothing consumes discover's IPC seam.
+    /// A connection failure is an honest `DiscoverOutcome::Error`, not an empty
+    /// catalog; an empty schema is an empty catalog.
     fn discover(&self, _config: Config) -> DiscoverOutcome {
-        DiscoverOutcome::Catalog(Catalog {
-            streams: vec![StreamInfo {
-                name: "table".to_string(),
-                namespace: None,
-                schema: ArrowSchemaIpc { ipc: Vec::new() },
-                supported_sync_modes: vec![SyncMode::FullRefresh, SyncMode::Incremental, SyncMode::Cdc],
-                source_defined_cursor: false,
-                default_cursor_field: None,
-                source_defined_primary_key: None,
-                partitioning: PartitionScheme::Unpartitioned,
-            }],
-        })
+        let conn = Conn::from_json(&self.cfg.json);
+        let result = (|| -> Result<Vec<StreamInfo>, String> {
+            let mut c = PgConn::connect(&conn)?;
+            let sql = format!(
+                "SELECT t.table_name, coalesce(pk.cols, '') \
+                 FROM information_schema.tables t \
+                 LEFT JOIN (SELECT tc.table_schema, tc.table_name, \
+                            string_agg(kcu.column_name, ',' ORDER BY kcu.ordinal_position) AS cols \
+                            FROM information_schema.table_constraints tc \
+                            JOIN information_schema.key_column_usage kcu \
+                              ON kcu.constraint_name = tc.constraint_name \
+                             AND kcu.table_schema = tc.table_schema \
+                             AND kcu.table_name = tc.table_name \
+                            WHERE tc.constraint_type = 'PRIMARY KEY' \
+                            GROUP BY tc.table_schema, tc.table_name) pk \
+                   ON pk.table_schema = t.table_schema AND pk.table_name = t.table_name \
+                 WHERE t.table_type = 'BASE TABLE' AND t.table_schema = {} \
+                 ORDER BY t.table_name",
+                lit(&conn.schema)
+            );
+            let rows = c.query_rows(&sql)?;
+            Ok(rows
+                .into_iter()
+                .filter_map(|mut r| {
+                    let name = r.first().cloned().flatten()?;
+                    let pks: Vec<String> = r
+                        .get_mut(1)
+                        .and_then(|c| c.take())
+                        .map(|s| s.split(',').filter(|p| !p.is_empty()).map(str::to_string).collect())
+                        .unwrap_or_default();
+                    Some(StreamInfo {
+                        name,
+                        namespace: Some(conn.schema.clone()),
+                        schema: ArrowSchemaIpc { ipc: Vec::new() },
+                        supported_sync_modes: vec![
+                            SyncMode::FullRefresh,
+                            SyncMode::Incremental,
+                            SyncMode::Cdc,
+                        ],
+                        source_defined_cursor: false,
+                        default_cursor_field: None,
+                        source_defined_primary_key: if pks.is_empty() { None } else { Some(pks) },
+                        partitioning: PartitionScheme::Unpartitioned,
+                    })
+                })
+                .collect())
+        })();
+        match result {
+            Ok(streams) => DiscoverOutcome::Catalog(Catalog { streams }),
+            Err(e) => DiscoverOutcome::Error(ConnectorError::transient(e)),
+        }
     }
 
     fn read(&self, ctx: ReadContext) -> fidius_guest::Stream<ReadMessage> {
@@ -183,7 +235,12 @@ impl Postgres {
                 }
                 let cursor = ctx.state.cursor.clone();
                 if let Some(cur) = &cursor {
-                    conds.push(format!("t.{cq}::text > {}", lit(cur)));
+                    // UNTYPED literal on purpose: Postgres casts it to the
+                    // column's native type, so bigint/timestamp cursors compare
+                    // numerically/temporally — `::text` here compared '2' > '12'
+                    // lexicographically and re-delivered rows on typed columns
+                    // ([[WEIR-T-0182]] exposed it; text columns are unchanged).
+                    conds.push(format!("t.{cq} > {}", lit(cur)));
                 }
                 let where_clause = if conds.is_empty() {
                     String::new()
@@ -252,22 +309,43 @@ impl Postgres {
         let mut dead: Vec<DeadLetter> = Vec::new();
         let mut accepted = 0u64;
 
+        let typed = typed_enabled(&self.cfg.json);
         let txn = (|| -> Result<(), String> {
             c.query_rows("BEGIN")?;
-            let tomb_def = if tombstone {
-                format!(", {} TEXT", quote_ident(&tomb_col))
+            // Typed CDC ([[WEIR-T-0182]]): infer columns from the batch's
+            // Insert/Update rows; deletes only need the key columns.
+            let typed_cols = if typed {
+                let data_rows: Vec<String> = changes
+                    .iter()
+                    .filter(|ch| matches!(ch.op, ChangeOp::Insert | ChangeOp::Update))
+                    .map(|ch| ch.data.clone())
+                    .collect();
+                let fields = typed_fields(&data_rows, &business_keys);
+                ensure_typed_table(
+                    &mut c,
+                    &t,
+                    &fields,
+                    &business_keys,
+                    tombstone.then_some(tomb_col.as_str()),
+                )?;
+                Some(fields)
             } else {
-                String::new()
-            };
-            c.query_rows(&format!(
-                "CREATE TABLE IF NOT EXISTS {t} ({coldefs}, data JSONB{tomb_def}, PRIMARY KEY ({pk}))"
-            ))?;
-            if tombstone {
+                let tomb_def = if tombstone {
+                    format!(", {} TEXT", quote_ident(&tomb_col))
+                } else {
+                    String::new()
+                };
                 c.query_rows(&format!(
-                    "ALTER TABLE {t} ADD COLUMN IF NOT EXISTS {} TEXT",
-                    quote_ident(&tomb_col)
+                    "CREATE TABLE IF NOT EXISTS {t} ({coldefs}, data JSONB{tomb_def}, PRIMARY KEY ({pk}))"
                 ))?;
-            }
+                if tombstone {
+                    c.query_rows(&format!(
+                        "ALTER TABLE {t} ADD COLUMN IF NOT EXISTS {} TEXT",
+                        quote_ident(&tomb_col)
+                    ))?;
+                }
+                None
+            };
             for ch in changes {
                 let v: serde_json::Value = match serde_json::from_str(&ch.data) {
                     Ok(v) => v,
@@ -287,14 +365,23 @@ impl Postgres {
                     .map(|(kc, k)| format!("{kc} = {}", lit(&key_text(&v, k))))
                     .collect::<Vec<_>>()
                     .join(" AND ");
-                let sql = match ch.op {
-                    ChangeOp::Insert | ChangeOp::Update => {
+                let sql = match (&ch.op, &typed_cols) {
+                    (ChangeOp::Insert | ChangeOp::Update, Some(fields)) => {
+                        match typed_tuple(&ch.data, fields) {
+                            Ok(tup) => typed_insert_sql(&t, fields, &business_keys, &tup),
+                            Err(e) => {
+                                dead.push(DeadLetter { record: ch.data.clone(), reason: e });
+                                continue;
+                            }
+                        }
+                    }
+                    (ChangeOp::Insert | ChangeOp::Update, None) => {
                         weir_connector_types::pg_cdc::upsert(&t, &pk, &key_lits, &lit(&ch.data))
                     }
-                    ChangeOp::Delete if tombstone => {
+                    (ChangeOp::Delete, _) if tombstone => {
                         weir_connector_types::pg_cdc::tombstone(&t, &quote_ident(&tomb_col), &where_clause)
                     }
-                    ChangeOp::Delete => weir_connector_types::pg_cdc::delete(&t, &where_clause),
+                    (ChangeOp::Delete, _) => weir_connector_types::pg_cdc::delete(&t, &where_clause),
                 };
                 match c.query_rows(&sql) {
                     Ok(_) => accepted += 1,
@@ -324,9 +411,35 @@ impl Postgres {
         let t = quote_ident(&self.table(&stream.stream));
         let mut dead: Vec<DeadLetter> = Vec::new();
 
+        let typed = typed_enabled(&self.cfg.json);
         let txn = (|| -> Result<(), String> {
             c.query_rows("BEGIN")?;
             match &stream.write_mode {
+                WriteMode::Append | WriteMode::Overwrite if typed => {
+                    // Typed columns ([[WEIR-T-0182]]): infer once over the whole
+                    // write so every chunk shares one column set.
+                    let fields = typed_fields(rows, &[]);
+                    if !fields.is_empty() {
+                        ensure_typed_table(&mut c, &t, &fields, &[], None)?;
+                        if matches!(stream.write_mode, WriteMode::Overwrite) {
+                            c.query_rows(&format!("TRUNCATE {t}"))?;
+                        }
+                        let attempt =
+                            |c: &mut PgConn, sub: &[String]| -> Result<Result<(), String>, String> {
+                                let mut tuples = Vec::with_capacity(sub.len());
+                                for r in sub {
+                                    match typed_tuple(r, &fields) {
+                                        Ok(tup) => tuples.push(tup),
+                                        Err(e) => return Ok(Err(e)),
+                                    }
+                                }
+                                c.try_savepoint(&typed_insert_sql(&t, &fields, &[], &tuples.join(",")))
+                            };
+                        for chunk in rows.chunks(BATCH) {
+                            bisect(&mut c, chunk, &attempt, &mut dead)?;
+                        }
+                    }
+                }
                 WriteMode::Append | WriteMode::Overwrite => {
                     c.query_rows(&format!("CREATE TABLE IF NOT EXISTS {t} (data JSONB)"))?;
                     if matches!(stream.write_mode, WriteMode::Overwrite) {
@@ -340,6 +453,32 @@ impl Postgres {
                             .join(",");
                         c.try_savepoint(&format!("INSERT INTO {t} (data) VALUES {values}"))
                     };
+                    for chunk in rows.chunks(BATCH) {
+                        bisect(&mut c, chunk, &attempt, &mut dead)?;
+                    }
+                }
+                WriteMode::Upsert { business_keys } if typed => {
+                    if business_keys.is_empty() {
+                        return Err("upsert requires non-empty business_keys".to_string());
+                    }
+                    let fields = typed_fields(rows, business_keys);
+                    ensure_typed_table(&mut c, &t, &fields, business_keys, None)?;
+                    let attempt =
+                        |c: &mut PgConn, sub: &[String]| -> Result<Result<(), String>, String> {
+                            let mut tuples = Vec::with_capacity(sub.len());
+                            for r in sub {
+                                match typed_tuple(r, &fields) {
+                                    Ok(tup) => tuples.push(tup),
+                                    Err(e) => return Ok(Err(e)),
+                                }
+                            }
+                            c.try_savepoint(&typed_insert_sql(
+                                &t,
+                                &fields,
+                                business_keys,
+                                &tuples.join(","),
+                            ))
+                        };
                     for chunk in rows.chunks(BATCH) {
                         bisect(&mut c, chunk, &attempt, &mut dead)?;
                     }
@@ -389,6 +528,139 @@ impl Postgres {
         }
         let accepted = rows.len() as u64 - dead.len() as u64;
         Ok((accepted, dead))
+    }
+}
+
+// ---- typed relational columns ([[WEIR-T-0182]]) ----
+
+/// `typed_columns` config flag (default TRUE — the warehouse expectation: a
+/// synced `orders` stream lands as `id bigint, total double precision, …`, not
+/// one `data JSONB` blob; `false` restores the legacy JSONB layout).
+fn typed_enabled(cfg_json: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(cfg_json)
+        .ok()
+        .and_then(|v| v.get("typed_columns").and_then(|x| x.as_bool()))
+        .unwrap_or(true)
+}
+
+fn pg_type(ft: weir_connector_types::FieldType) -> &'static str {
+    use weir_connector_types::FieldType::*;
+    match ft {
+        Integer => "bigint",
+        Float => "double precision",
+        Boolean => "boolean",
+        Timestamp => "timestamptz",
+        Str => "text",
+        Json => "jsonb",
+    }
+}
+
+/// Fields inferred from the batch ([[WEIR-I-0025]] `StreamSchema::infer` — the
+/// same inference the host's schema capture uses), with the business keys
+/// guaranteed present (a key absent from every row lands as text).
+fn typed_fields(rows: &[String], keys: &[String]) -> Vec<weir_connector_types::Field> {
+    let mut fields = weir_connector_types::StreamSchema::infer(rows).fields;
+    for k in keys {
+        if !fields.iter().any(|f| &f.name == k) {
+            fields.push(weir_connector_types::Field {
+                name: k.clone(),
+                field_type: weir_connector_types::FieldType::Str,
+                nullable: false,
+            });
+        }
+    }
+    fields
+}
+
+/// CREATE the typed table if missing (+ PK when keyed), then additively ALTER
+/// in any new columns — the [[WEIR-I-0025]] additive path. A concrete type
+/// change on an existing column is deliberately NOT patched: the insert errors
+/// and those rows dead-letter (the host-side evolution policy is the breaking-
+/// change gate).
+fn ensure_typed_table(
+    c: &mut PgConn,
+    t: &str,
+    fields: &[weir_connector_types::Field],
+    keys: &[String],
+    tombstone_col: Option<&str>,
+) -> Result<(), String> {
+    let mut defs: Vec<String> = fields
+        .iter()
+        .map(|f| format!("{} {}", quote_ident(&f.name), pg_type(f.field_type)))
+        .collect();
+    if let Some(tc) = tombstone_col {
+        defs.push(format!("{} TEXT", quote_ident(tc)));
+    }
+    let pk_clause = if keys.is_empty() {
+        String::new()
+    } else {
+        format!(
+            ", PRIMARY KEY ({})",
+            keys.iter().map(|k| quote_ident(k)).collect::<Vec<_>>().join(", ")
+        )
+    };
+    c.query_rows(&format!(
+        "CREATE TABLE IF NOT EXISTS {t} ({}{pk_clause})",
+        defs.join(", ")
+    ))?;
+    for f in fields {
+        c.query_rows(&format!(
+            "ALTER TABLE {t} ADD COLUMN IF NOT EXISTS {} {}",
+            quote_ident(&f.name),
+            pg_type(f.field_type)
+        ))?;
+    }
+    if let Some(tc) = tombstone_col {
+        c.query_rows(&format!(
+            "ALTER TABLE {t} ADD COLUMN IF NOT EXISTS {} TEXT",
+            quote_ident(tc)
+        ))?;
+    }
+    Ok(())
+}
+
+/// SQL literal for a JSON value landing in a typed column. Kind mismatches are
+/// left to Postgres — the offending row dead-letters via the bisection
+/// machinery instead of being silently mangled.
+fn typed_value(v: Option<&serde_json::Value>) -> String {
+    match v {
+        None | Some(serde_json::Value::Null) => "NULL".to_string(),
+        Some(serde_json::Value::Bool(b)) => if *b { "TRUE" } else { "FALSE" }.to_string(),
+        Some(serde_json::Value::Number(n)) => n.to_string(),
+        Some(serde_json::Value::String(s)) => lit(s),
+        Some(other) => format!("{}::jsonb", lit(&other.to_string())),
+    }
+}
+
+/// One `(v1, v2, …)` tuple for `row` over `fields`; Err = unparseable row.
+fn typed_tuple(row: &str, fields: &[weir_connector_types::Field]) -> Result<String, String> {
+    let v: serde_json::Value = serde_json::from_str(row).map_err(|e| format!("row json: {e}"))?;
+    let vals: Vec<String> = fields.iter().map(|f| typed_value(v.get(&f.name))).collect();
+    Ok(format!("({})", vals.join(", ")))
+}
+
+/// `INSERT INTO t (cols) VALUES <tuples>`, with the keyed upsert clause.
+fn typed_insert_sql(
+    t: &str,
+    fields: &[weir_connector_types::Field],
+    keys: &[String],
+    tuples: &str,
+) -> String {
+    let cols: Vec<String> = fields.iter().map(|f| quote_ident(&f.name)).collect();
+    let base = format!("INSERT INTO {t} ({}) VALUES {tuples}", cols.join(", "));
+    if keys.is_empty() {
+        return base;
+    }
+    let pk = keys.iter().map(|k| quote_ident(k)).collect::<Vec<_>>().join(", ");
+    let sets: Vec<String> = fields
+        .iter()
+        .filter(|f| !keys.contains(&f.name))
+        .map(|f| format!("{c} = EXCLUDED.{c}", c = quote_ident(&f.name)))
+        .collect();
+    if sets.is_empty() {
+        format!("{base} ON CONFLICT ({pk}) DO NOTHING")
+    } else {
+        format!("{base} ON CONFLICT ({pk}) DO UPDATE SET {}", sets.join(", "))
     }
 }
 
@@ -493,26 +765,47 @@ struct Conn {
     user: String,
     password: String,
     dbname: String,
+    /// `disable | require | verify-full` ([[WEIR-A-0041]]; default **require** — no
+    /// `prefer`, a silent plaintext fallback is dishonest). Validated at connect.
+    sslmode: String,
+    /// Inline PEM CA bundle for `verify-full` ([[WEIR-A-0037]]: consumed per
+    /// connect, never cached). Absent → compiled-in webpki roots.
+    sslrootcert: Option<String>,
+    /// The schema `discover()` introspects (default `public`).
+    schema: String,
 }
 
 impl Conn {
     fn from_json(s: &str) -> Self {
         let v: serde_json::Value = serde_json::from_str(s).unwrap_or(serde_json::Value::Null);
-        // `url` (postgres://user:pw@host:port/db) wins; else discrete fields.
-        if let Some(url) = v.get("url").and_then(|x| x.as_str()) {
-            if let Some(c) = parse_url(url) {
-                return c;
-            }
-        }
         let get = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
-        let user = get("user").unwrap_or_else(|| "postgres".to_string());
-        Conn {
-            host: get("host").unwrap_or_else(|| "127.0.0.1".to_string()),
-            port: v.get("port").and_then(|x| x.as_u64()).unwrap_or(5432) as u16,
-            dbname: get("dbname").unwrap_or_else(|| user.clone()),
-            user,
-            password: get("password").unwrap_or_default(),
+        // `url` (postgres://user:pw@host:port/db?sslmode=…) wins; else discrete fields.
+        let mut conn = if let Some(c) = v.get("url").and_then(|x| x.as_str()).and_then(parse_url) {
+            c
+        } else {
+            let user = get("user").unwrap_or_else(|| "postgres".to_string());
+            Conn {
+                host: get("host").unwrap_or_else(|| "127.0.0.1".to_string()),
+                port: v.get("port").and_then(|x| x.as_u64()).unwrap_or(5432) as u16,
+                dbname: get("dbname").unwrap_or_else(|| user.clone()),
+                user,
+                password: get("password").unwrap_or_default(),
+                sslmode: "require".to_string(),
+                sslrootcert: None,
+                schema: "public".to_string(),
+            }
+        };
+        // Explicit JSON fields override the URL's query (and the default).
+        if let Some(m) = get("sslmode") {
+            conn.sslmode = m;
         }
+        if let Some(pem) = get("sslrootcert") {
+            conn.sslrootcert = Some(pem);
+        }
+        if let Some(s) = get("schema").filter(|s| !s.is_empty()) {
+            conn.schema = s;
+        }
+        conn
     }
 }
 
@@ -520,26 +813,176 @@ fn parse_url(url: &str) -> Option<Conn> {
     let rest = url.strip_prefix("postgres://").or_else(|| url.strip_prefix("postgresql://"))?;
     let (creds, hostpart) = rest.split_once('@')?;
     let (user, password) = creds.split_once(':').unwrap_or((creds, ""));
-    let (hostport, dbname) = hostpart.split_once('/').unwrap_or((hostpart, ""));
+    let (hostport, path) = hostpart.split_once('/').unwrap_or((hostpart, ""));
     let (host, port) = hostport.split_once(':').unwrap_or((hostport, "5432"));
+    // `?sslmode=…` query on the db path (libpq-style).
+    let (dbname, query) = path.split_once('?').unwrap_or((path, ""));
+    let sslmode = query
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("sslmode="))
+        .unwrap_or("require");
     Some(Conn {
         host: host.to_string(),
         port: port.parse().unwrap_or(5432),
         user: user.to_string(),
         password: password.to_string(),
         dbname: if dbname.is_empty() { user.to_string() } else { dbname.to_string() },
+        sslmode: sslmode.to_string(),
+        sslrootcert: None,
+        schema: "public".to_string(),
     })
 }
 
+/// The wire under the protocol: plaintext, or rustls layered over the same
+/// brokered TCP stream ([[WEIR-A-0041]] guest-side TLS).
+enum PgStream {
+    Plain(fidius_guest::sockets::tcp::TcpStream),
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, fidius_guest::sockets::tcp::TcpStream>>),
+}
+
+impl Read for PgStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            PgStream::Plain(s) => s.read(buf),
+            PgStream::Tls(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for PgStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            PgStream::Plain(s) => s.write(buf),
+            PgStream::Tls(s) => s.write(buf),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            PgStream::Plain(s) => s.flush(),
+            PgStream::Tls(s) => s.flush(),
+        }
+    }
+}
+
+/// `require`-mode verifier: encrypt without certificate verification (libpq
+/// semantics). Deliberate and explicit — `verify-full` is the verified mode.
+#[derive(Debug)]
+struct AcceptAnyCert(std::sync::Arc<rustls::crypto::CryptoProvider>);
+
+impl rustls::client::danger::ServerCertVerifier for AcceptAnyCert {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls_pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls_pki_types::CertificateDer<'_>],
+        _server_name: &rustls_pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls_pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls_pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls_pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+/// Build the rustls client for `require` (encrypt, no verification) or
+/// `verify-full` (hostname + chain against `sslrootcert` inline PEM, else the
+/// compiled-in webpki roots). Roots are parsed per connect — never cached
+/// ([[WEIR-A-0037]]).
+fn tls_connection(c: &Conn, verify: bool) -> Result<rustls::ClientConnection, String> {
+    let provider = std::sync::Arc::new(rustls_rustcrypto::provider());
+    let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+        .map_err(|e| format!("tls versions: {e}"))?;
+    let config = if verify {
+        let mut roots = rustls::RootCertStore::empty();
+        match &c.sslrootcert {
+            Some(pem) => {
+                use rustls_pki_types::pem::PemObject;
+                let mut added = 0usize;
+                for cert in rustls_pki_types::CertificateDer::pem_slice_iter(pem.as_bytes()) {
+                    let cert = cert.map_err(|e| format!("sslrootcert pem: {e:?}"))?;
+                    roots.add(cert).map_err(|e| format!("sslrootcert: {e}"))?;
+                    added += 1;
+                }
+                if added == 0 {
+                    return Err("sslrootcert contains no certificates".to_string());
+                }
+            }
+            None => {
+                roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            }
+        }
+        builder.with_root_certificates(roots).with_no_client_auth()
+    } else {
+        builder
+            .dangerous()
+            .with_custom_certificate_verifier(std::sync::Arc::new(AcceptAnyCert(provider)))
+            .with_no_client_auth()
+    };
+    let server_name = rustls_pki_types::ServerName::try_from(c.host.clone())
+        .map_err(|e| format!("tls server name `{}`: {e}", c.host))?;
+    rustls::ClientConnection::new(std::sync::Arc::new(config), server_name)
+        .map_err(|e| format!("tls client: {e}"))
+}
+
 struct PgConn {
-    stream: fidius_guest::sockets::tcp::TcpStream,
+    stream: PgStream,
     buf: bytes::BytesMut,
 }
 
 impl PgConn {
     fn connect(c: &Conn) -> Result<Self, String> {
-        let stream = fidius_guest::sockets::tcp::connect(&c.host, c.port)
+        let verify = match c.sslmode.as_str() {
+            "disable" => None,
+            "require" => Some(false),
+            "verify-full" => Some(true),
+            other => {
+                return Err(format!(
+                    "unknown sslmode `{other}` (expected disable | require | verify-full)"
+                ));
+            }
+        };
+        let mut tcp = fidius_guest::sockets::tcp::connect(&c.host, c.port)
             .map_err(|e| format!("connect {}:{}: {e}", c.host, c.port))?;
+        let stream = match verify {
+            None => PgStream::Plain(tcp),
+            Some(verify) => {
+                // SSLRequest (len=8, code 80877103); the server answers ONE byte:
+                // 'S' = proceed with TLS, 'N' = refused. No silent fallback.
+                tcp.write_all(&[0, 0, 0, 8, 0x04, 0xd2, 0x16, 0x2f])
+                    .and_then(|_| tcp.flush())
+                    .map_err(|e| format!("sslrequest: {e}"))?;
+                let mut answer = [0u8; 1];
+                tcp.read_exact(&mut answer)
+                    .map_err(|e| format!("sslrequest answer: {e}"))?;
+                if answer[0] != b'S' {
+                    return Err(format!(
+                        "server refused TLS (sslmode={}); set sslmode=disable for a \
+                         plaintext-only server",
+                        c.sslmode
+                    ));
+                }
+                let tls = tls_connection(c, verify)?;
+                PgStream::Tls(Box::new(rustls::StreamOwned::new(tls, tcp)))
+            }
+        };
         let mut conn = PgConn { stream, buf: bytes::BytesMut::new() };
         let mut out = bytes::BytesMut::new();
         frontend::startup_message(
@@ -602,7 +1045,11 @@ impl PgConn {
                     if !chose {
                         return Err("server offered no SCRAM-SHA-256 mechanism".to_string());
                     }
-                    let mut s = ScramSha256::new(c.password.as_bytes(), ChannelBinding::unrequested());
+                    // GS2 flag "n" (client does no channel binding) — honest in both
+                    // modes. The former `unrequested()` sent "y", which a server
+                    // advertising SCRAM-SHA-256-PLUS (i.e. any TLS server) MUST
+                    // reject as downgrade protection ([[WEIR-A-0041]]).
+                    let s = ScramSha256::new(c.password.as_bytes(), ChannelBinding::unsupported());
                     let mut out = bytes::BytesMut::new();
                     frontend::sasl_initial_response("SCRAM-SHA-256", s.message(), &mut out)
                         .map_err(|e| format!("sasl init encode: {e}"))?;

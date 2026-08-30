@@ -33,9 +33,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # TDS (SQL Server) protocol codec + row/column typing. Runtime-agnostic: driven over a
 # sync blocking wasi socket via a poll-Ready transport adapter + futures::block_on (no
-# tokio). `tds73` = the modern token stream; TLS features off (plaintext against the
-# demo compose service).
-tiberius = { version = "0.12", default-features = false, features = ["tds73"] }
+# tokio). `tds73` = the modern token stream. THE FORK ([[WEIR-A-0041]] / [[WEIR-T-0177]]):
+# vendor/weir-tiberius rebuilds the `rustls` feature on futures-rustls +
+# rustls-rustcrypto (wasm32-wasip2-capable TLS; TlsPreloginWrapper handles the
+# TDS 7.x in-PRELOGIN handshake) and adds the inline-PEM trust API.
+# Lib target is still named `tiberius`, so imports are unchanged.
+weir-tiberius = { path = "../../../vendor/weir-tiberius", default-features = false, features = ["tds73", "rustls"] }
 futures = { version = "0.3", default-features = false, features = ["executor"] }
 
 [build-dependencies]

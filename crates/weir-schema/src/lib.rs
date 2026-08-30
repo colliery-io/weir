@@ -37,6 +37,11 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
         include_str!("../schema/generated/migrations-postgres/0003_resident_runtime/up.sql"),
         include_str!("../schema/generated/migrations-sqlite/0003_resident_runtime/up.sql"),
     ),
+    (
+        "0004_verification",
+        include_str!("../schema/generated/migrations-postgres/0004_verification/up.sql"),
+        include_str!("../schema/generated/migrations-sqlite/0004_verification/up.sql"),
+    ),
 ];
 
 /// Apply every not-yet-applied generated migration for the **active backend**, in order.

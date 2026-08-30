@@ -99,7 +99,12 @@ impl Connector for Mssql {
                 \"database\":{\"type\":\"string\",\"title\":\"Database\"},\
                 \"user\":{\"type\":\"string\",\"title\":\"Login\"},\
                 \"password\":{\"type\":\"string\",\"title\":\"Password\"},\
-                \"table\":{\"type\":\"string\",\"title\":\"Table (blank = stream name)\"}}}".to_string(),
+                \"table\":{\"type\":\"string\",\"title\":\"Table (blank = stream name)\"},\
+                \"tls_mode\":{\"type\":\"string\",\"enum\":[\"disable\",\"prefer\",\"require\"],\"default\":\"require\",\
+                \"title\":\"TLS: require (default) | prefer | disable\"},\
+                \"tls_ca_pem\":{\"type\":\"string\",\"title\":\"Inline PEM CA bundle (default: public webpki roots)\"},\
+                \"tls_insecure_skip_verify\":{\"type\":\"boolean\",\"default\":false,\
+                \"title\":\"Encrypt WITHOUT certificate verification (dangerous)\"}}}".to_string(),
             roles: vec![ConnectorRole::Source],
             supported_sync_modes: vec![SyncMode::FullRefresh, SyncMode::Incremental],
         }
@@ -169,6 +174,14 @@ struct Conn {
     database: String,
     user: String,
     password: String,
+    /// `disable | prefer | require` ([[WEIR-A-0041]]; default **require** — managed
+    /// SQL Server wants TLS; set `disable` for a plaintext-only dev server).
+    tls_mode: String,
+    /// Inline PEM CA bundle; absent → compiled-in webpki roots.
+    tls_ca_pem: Option<String>,
+    /// Explicit opt-out of certificate verification (encrypt only). Dangerous;
+    /// logged loudly by the driver.
+    tls_insecure_skip_verify: bool,
 }
 
 impl Conn {
@@ -183,6 +196,12 @@ impl Conn {
             database: req("database")?,
             user: req("user")?,
             password: req("password")?,
+            tls_mode: s("tls_mode").unwrap_or_else(|| "require".to_string()),
+            tls_ca_pem: s("tls_ca_pem").filter(|p| !p.is_empty()),
+            tls_insecure_skip_verify: v
+                .get("tls_insecure_skip_verify")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(false),
         })
     }
 }
@@ -236,10 +255,33 @@ impl TdsConn {
         cfg.port(c.port);
         cfg.database(&c.database);
         cfg.authentication(tiberius::AuthMethod::sql_server(&c.user, &c.password));
-        // Plaintext against the demo/compose service ([[WEIR-T-0161]] risk note); TLS
-        // features are off in the build.
-        cfg.encryption(tiberius::EncryptionLevel::NotSupported);
-        cfg.trust_cert();
+        // TLS per [[WEIR-A-0041]] via the weir-tiberius fork: the TDS 7.x handshake
+        // runs INSIDE PRELOGIN (TlsPreloginWrapper) over the same SyncSock. Default
+        // `require`; verification defaults to webpki roots, `tls_ca_pem` supplies an
+        // inline-PEM CA, `tls_insecure_skip_verify` is the explicit encrypt-only opt-out.
+        match c.tls_mode.as_str() {
+            "disable" => {
+                cfg.encryption(tiberius::EncryptionLevel::NotSupported);
+                cfg.trust_cert(); // moot without TLS; keeps upstream's shape
+            }
+            mode @ ("require" | "prefer") => {
+                cfg.encryption(if mode == "require" {
+                    tiberius::EncryptionLevel::Required
+                } else {
+                    tiberius::EncryptionLevel::On
+                });
+                if c.tls_insecure_skip_verify {
+                    cfg.trust_cert();
+                } else if let Some(pem) = &c.tls_ca_pem {
+                    cfg.trust_cert_pem(pem);
+                } // else: default trust → compiled-in webpki roots
+            }
+            other => {
+                return Err(format!(
+                    "unknown tls_mode `{other}` (expected disable | prefer | require)"
+                ));
+            }
+        }
         let client = block_on(tiberius::Client::connect(cfg, SyncSock(sock)))
             .map_err(|e| format!("tds connect: {e}"))?;
         Ok(TdsConn { client })

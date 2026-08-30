@@ -108,6 +108,7 @@ diesel::table! {
         manifest -> Nullable<Text>,
         created_at -> BigInt,
         updated_at -> BigInt,
+        verified_at -> Nullable<Text>,
     }
 }
 

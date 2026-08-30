@@ -67,3 +67,6 @@ weir-ui/target/
 /secrets/*.json
 !/secrets/*.enc.json
 !/secrets/*.example.json
+
+# Vendored fork build artifacts (weir-tiberius builds standalone)
+vendor/**/target/

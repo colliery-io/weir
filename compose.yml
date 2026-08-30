@@ -13,7 +13,8 @@
 #
 # Host ports are overridable to coexist with local services (weir's is the only
 # non-loopback publish): WEIR_HTTP_HOST_PORT (8080), WEIR_PG_HOST_PORT (5432),
-# WEIR_MSSQL_HOST_PORT (1433), WEIR_MINIO_HOST_PORT (9000), WEIR_MYSQL_HOST_PORT (3306).
+# WEIR_MSSQL_HOST_PORT (1433), WEIR_MINIO_HOST_PORT (9000), WEIR_MYSQL_HOST_PORT (3306),
+# WEIR_PG_TLS_HOST_PORT (5434), WEIR_MSSQL_TLS_HOST_PORT (11433).
 # Postgres is NOT exposed to the network; the weir service reaches it over the
 # compose network at `postgres:5432` (never localhost).
 name: weir
@@ -37,6 +38,88 @@ services:
       interval: 2s
       timeout: 3s
       retries: 15
+
+  # TLS-ONLY Postgres — the [[WEIR-A-0041]] wire-proof gate ([[WEIR-T-0178]]):
+  # ssl=on with a hostssl-only pg_hba, so a PLAINTEXT connection is REJECTED and a
+  # passing sync proves TLS engaged. Certs are ephemeral — run
+  # `scripts/gen-test-tls.sh` first (angreal integration up does). The entrypoint
+  # wrapper copies the mounted material so the key gets postgres-owned 0600 perms
+  # regardless of host uid (bind mounts arrive with arbitrary ownership).
+  postgres-tls:
+    profiles: ["integration"]
+    image: postgres:16
+    environment:
+      POSTGRES_USER: weir
+      POSTGRES_PASSWORD: weir
+      POSTGRES_DB: weir
+    volumes:
+      - ./target/weir-tls-certs:/certs-src:ro
+    entrypoint:
+      - /bin/bash
+      - -c
+      - >
+        mkdir -p /certs && cp /certs-src/server.crt /certs-src/server.key /certs-src/pg_hba.conf /certs/ &&
+        chown -R postgres:postgres /certs && chmod 600 /certs/server.key &&
+        exec docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/certs/server.crt
+        -c ssl_key_file=/certs/server.key -c hba_file=/certs/pg_hba.conf -c wal_level=logical
+    ports:
+      - "127.0.0.1:${WEIR_PG_TLS_HOST_PORT:-5434}:5432"
+    healthcheck:
+      # Unix-socket check (`local … trust` in the hba) — TCP is hostssl-only.
+      test: ["CMD-SHELL", "pg_isready -U weir -d weir"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  # Force-Encryption SQL Server — [[WEIR-T-0177]]'s wire gate. Same ephemeral cert
+  # material; mssql.conf sets forceencryption=1. The healthcheck connects with
+  # -N (encrypt) -C (trust the test cert).
+  mssql-tls:
+    profiles: ["integration"]
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "weirStrong!Pass1"
+      MSSQL_PID: "Developer"
+    volumes:
+      - ./target/weir-tls-certs:/certs-src:ro
+    # Root ONLY for the cert staging (bind mounts arrive with arbitrary host
+    # ownership); permissions_check.sh is the image's own drop-to-mssql wrapper.
+    user: root
+    entrypoint:
+      - /bin/bash
+      - -c
+      - >
+        mkdir -p /var/opt/mssql/certs &&
+        cp /certs-src/server.crt /certs-src/server.key /var/opt/mssql/certs/ &&
+        sed 's#/certs/#/var/opt/mssql/certs/#' /certs-src/mssql.conf > /var/opt/mssql/mssql.conf &&
+        chown -R mssql /var/opt/mssql && chmod 600 /var/opt/mssql/certs/server.key &&
+        exec /opt/mssql/bin/sqlservr
+    ports:
+      - "127.0.0.1:${WEIR_MSSQL_TLS_HOST_PORT:-11433}:1433"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$$MSSQL_SA_PASSWORD" -N -C -Q "SELECT 1" || exit 1
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  # Seed the Force-Encryption server with the same demo database (encrypted client).
+  mssql-tls-seed:
+    profiles: ["integration"]
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    depends_on:
+      mssql-tls:
+        condition: service_healthy
+    volumes:
+      - ./test-fixtures/mssql:/fixtures:ro
+    entrypoint:
+      - /bin/bash
+      - -c
+      - >
+        /opt/mssql-tools18/bin/sqlcmd -S mssql-tls -U sa -P "weirStrong!Pass1" -N -C -b -i /fixtures/seed.sql &&
+        echo "seeded weir_demo (tls)"
 
   # SQL Server — the source for the `mssql` connector's integration test
   # ([[WEIR-T-0161]]). Loopback-only; host port overridable to coexist. Test-only;

@@ -4,14 +4,14 @@ level: initiative
 title: "Real-source reach — TLS to managed databases, real discover, OAuth, verified catalog"
 short_code: "WEIR-I-0043"
 created_at: 2026-08-18T01:57:39.186020+00:00
-updated_at: 2026-08-18T02:04:31.607479+00:00
+updated_at: 2026-08-30T11:43:11.381887+00:00
 parent: WEIR-V-0001
 blocked_by: []
 archived: false
 
 tags:
   - "#initiative"
-  - "#phase/design"
+  - "#phase/completed"
 
 
 exit_criteria_met: false
@@ -45,11 +45,12 @@ The TLS design was investigated and decided 2026-08-17: **[[WEIR-A-0041]] — TL
 
 ## Detailed Design **[REQUIRED]**
 
-TLS design is settled by [[WEIR-A-0041]] (guest-side rustls; postgres `Plain|Tls` stream enum + SSLRequest exchange + SCRAM channel-binding fix; mssql via the minimal `weir-tiberius` fork; wire-proof integration gates; experiment artifacts in the 2026-08-17 session scratchpad). Remaining **open design questions** for this initiative:
+TLS design is settled by [[WEIR-A-0041]] (guest-side rustls; postgres `Plain|Tls` stream enum + SSLRequest exchange + SCRAM channel-binding fix; mssql via the minimal `weir-tiberius` fork; wire-proof integration gates; experiment artifacts in the 2026-08-17 session scratchpad). **Design questions closed 2026-08-29 (Dylan):**
 
-1. **OAuth token storage & lifecycle** — where the authorization-code flow's refresh/access tokens live and how they rotate. Owner of the storage form: [[WEIR-I-0047]] (secret-field semantics); this initiative owns the flow (authorize-redirect + callback route — the PKCE *pattern* already exists in `crates/weir-api/src/oidc.rs` for login, reuse the pattern not the code) and the manifest construct declaring a provider's endpoints/scopes.
-2. **First OAuth providers** — recommend HubSpot + Salesforce (dest manifests + mocked-refresh tests already exist), which also upgrades the reverse-ETL story from hand-obtained refresh tokens to real connect-your-account.
-3. **Verification-badge record** — where "this keyed manifest last passed live on DATE" lives (catalog row column vs docs table) so corpus quality regressions are visible; coordinate with [[WEIR-I-0014]]'s nightly live suite.
+1. **OAuth — DEFERRED.** Dylan: "glad to wait on these for now." No OAuth task is created at decompose; the alpha fallback posture (hand-obtained refresh tokens + client_credentials, documented) stands. When picked up: storage form belongs to [[WEIR-I-0047]]; this initiative owns the flow (authorize-redirect + callback — reuse the PKCE *pattern* from `crates/weir-api/src/oidc.rs`, not the code) and the manifest construct; recommended first providers were HubSpot + Salesforce.
+2. **Verification-badge record — catalog row column.** A verified-at record on the connector catalog row, written by the live suite — queryable, surfaces in API/UI, survives doc rewrites; coordinate with [[WEIR-I-0014]]'s nightly live suite.
+
+Additional prior work this initiative inherits: the fidius hostname-egress wiring landed 2026-08-29 as [[WEIR-T-0175]] (name-keyed TCP allow-lists + wire proof), so TLS tasks can assume hostname-carrying egress.
 
 ### Candidate decomposition (tasks created at decompose, after design questions close)
 
@@ -73,7 +74,9 @@ TLS design is settled by [[WEIR-A-0041]] (guest-side rustls; postgres `Plain|Tls
 
 ## Implementation Plan **[REQUIRED]**
 
-Order: tasks 1→3 (TLS core + gates) first — they unblock the flagship "managed database" claim; 4, 6, 7 are independent fillers; 8 after 1 (same connector); 5 after [[WEIR-I-0047]]'s storage decision; 9 whenever the human provisioning ([[WEIR-S-0018]]) lands. Alpha cut: tasks 1, 3, 4 are must; 2 strongly-should; 5, 8, 9 may trail with documented posture.
+**Decomposed 2026-08-29** (OAuth task 5 NOT created — deferred per Dylan): 1 → [[WEIR-T-0176]], 2 → [[WEIR-T-0177]], 3 → [[WEIR-T-0178]], 4 → [[WEIR-T-0179]], 6 → [[WEIR-T-0180]], 7 → [[WEIR-T-0181]], 8 → [[WEIR-T-0182]], 9 → [[WEIR-T-0183]]. (The hostname-egress dependency landed early as [[WEIR-T-0175]].)
+
+Order: [[WEIR-T-0176]] + [[WEIR-T-0178]] (TLS core + gates) first — they unblock the flagship "managed database" claim; [[WEIR-T-0179]], [[WEIR-T-0180]], [[WEIR-T-0181]] are independent fillers; [[WEIR-T-0182]] after [[WEIR-T-0176]] (same connector); [[WEIR-T-0183]] whenever the human provisioning ([[WEIR-S-0018]]/[[WEIR-T-0067]]) lands. Alpha cut: [[WEIR-T-0176]], [[WEIR-T-0178]], [[WEIR-T-0179]] are must; [[WEIR-T-0177]] strongly-should; [[WEIR-T-0182]]/[[WEIR-T-0183]] may trail with documented posture.
 
 Dependencies: [[WEIR-A-0041]] (decided), [[WEIR-I-0047]] (OAuth token storage form), [[WEIR-T-0067]]/[[WEIR-S-0018]] (human: accounts + bundles), fidius hostname-egress FR (orthogonal; wire into `HostAllowList` when it lands).
 

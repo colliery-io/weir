@@ -35,7 +35,8 @@ impl Connector for S3 {
             config_schema: "{\"type\":\"object\",\"required\":[\"endpoint\",\"bucket\"],\"properties\":{\
                 \"endpoint\":{\"type\":\"string\",\"title\":\"S3 endpoint (e.g. https://s3.amazonaws.com or http://minio:9000)\"},\
                 \"bucket\":{\"type\":\"string\",\"title\":\"Bucket\"},\
-                \"prefix\":{\"type\":\"string\",\"title\":\"Key prefix (blank = whole bucket)\"}}}".to_string(),
+                \"prefix\":{\"type\":\"string\",\"title\":\"Key prefix (blank = whole bucket)\"},\
+                \"max_keys\":{\"type\":\"integer\",\"title\":\"Listing page size (default: S3's 1000; listing follows continuation tokens either way)\"}}}".to_string(),
             // Auth (aws_sigv4) is resolved + signed host-side ([[WEIR-A-0033]]); the guest
             // declares no credential and never sees the secret.
             roles: vec![ConnectorRole::Source],
@@ -95,6 +96,9 @@ struct S3Cfg {
     endpoint: String,
     bucket: String,
     prefix: String,
+    /// Listing page size (`max-keys`; None = S3's default 1000). Mostly a test
+    /// lever to force multi-page listings cheaply.
+    max_keys: Option<u64>,
 }
 
 fn parse_cfg(config: &weir_connector_types::Config) -> S3Cfg {
@@ -104,6 +108,7 @@ fn parse_cfg(config: &weir_connector_types::Config) -> S3Cfg {
         endpoint: s("endpoint").trim_end_matches('/').to_string(),
         bucket: s("bucket"),
         prefix: s("prefix"),
+        max_keys: v.get("max_keys").and_then(|x| x.as_u64()),
     }
 }
 
@@ -125,14 +130,33 @@ fn read_objects(
     if !cfg.prefix.is_empty() {
         list_url.push_str(&format!("&prefix={}", uri_escape(&cfg.prefix)));
     }
+    if let Some(n) = cfg.max_keys {
+        list_url.push_str(&format!("&max-keys={n}"));
+    }
     if incremental {
         if let Some(a) = &after {
             list_url.push_str(&format!("&start-after={}", uri_escape(a)));
         }
     }
 
-    let listing = http_get(&list_url)?;
-    let mut keys = parse_list_keys(&listing);
+    // Follow `IsTruncated`/`NextContinuationToken` to the end of the listing
+    // ([[WEIR-T-0181]]) — a single unpaged ListObjectsV2 silently caps at 1000
+    // objects and REPORTS SUCCESS, the worst failure mode for an ingestion tool.
+    let mut keys = Vec::new();
+    let mut token: Option<String> = None;
+    loop {
+        let url = match &token {
+            Some(t) => format!("{list_url}&continuation-token={}", uri_escape(t)),
+            None => list_url.clone(),
+        };
+        let listing = http_get(&url)?;
+        keys.extend(parse_list_keys(&listing));
+        let truncated = xml_tag(&listing, "IsTruncated").as_deref() == Some("true");
+        token = xml_tag(&listing, "NextContinuationToken");
+        if !truncated || token.is_none() {
+            break;
+        }
+    }
     keys.sort();
 
     let mut rows = Vec::new();
@@ -177,6 +201,16 @@ fn parse_list_keys(xml: &str) -> Vec<String> {
         }
     }
     keys
+}
+
+/// The unescaped text of the FIRST `<tag>…</tag>` in `xml` (minimal,
+/// dependency-free — S3's listing schema is stable and unnested for these).
+fn xml_tag(xml: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = xml.find(&open)? + open.len();
+    let end = xml[start..].find(&close)? + start;
+    Some(xml_unescape(&xml[start..end]))
 }
 
 fn xml_unescape(s: &str) -> String {

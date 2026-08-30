@@ -26,11 +26,36 @@ The source and destination resolve with **independent** config ([[WEIR-I-0029]])
 one table and write another. weir strips its own reserved keys (e.g. an embedded `__mapping`) before the config
 reaches the guest.
 
+## Host-side auth (`auth_scheme`)
+
+Credentials are resolved and attached **on the host** — secret fields are stripped before the config reaches
+the sandboxed connector. `auth_scheme` selects the scheme: `bearer` / `header` / `query` (an `api_key`),
+`basic`, `oauth2` (client-credentials or refresh-token grants), `aws_sigv4`, `google_service_account`,
+`snowflake_keypair_jwt`, and `session`. The **session** scheme performs a login request and injects the
+extracted token per request:
+
+| Key | Meaning |
+| --- | --- |
+| `session_login_url` | The login endpoint. |
+| `session_login_method` | Login request method (default `POST`). |
+| `session_login_body` | JSON object template for the login body. String values of the form `"{{key}}"` are substituted from the config — and those keys are stripped as secrets (e.g. `{"username": "{{admin_user}}", "password": "{{admin_pass}}"}`). |
+| `session_token_path` | Dot-path (or array) into the login response holding the token. |
+| `session_inject_header` | Header the token is injected as (default `Authorization`). |
+| `session_ttl_secs` | Proactive re-login interval: a cached token older than this is re-minted **before** use, so long syncs survive expiring tokens. `0`/absent = cache for the run. A mid-run `401` fails the attempt; the automatic retry re-logs-in and resumes from the checkpoint. |
+
 ## In-flight mapping
 
 An optional ordered `MappingSpec` reshapes each record **between** read and write — `select` / `drop` / `rename`
 / `cast` / `filter` / `compute`. It is bounded per-record shaping, not a transform engine. The operator table and
 edge-case semantics are in [Map fields](../guides/field-mapping.md).
+
+## Typed columns (postgres destination)
+
+The `postgres` destination lands **typed relational columns** inferred from the records — `{"n": 1, "tag":
+"a"}` becomes `n bigint, tag text`, with upsert keys as a typed primary key and new fields ALTERed in
+additively. Unmapped shapes (objects/arrays, mixed types) land as `jsonb` **per column**. Set
+`typed_columns: false` in the destination config to restore the legacy single-`data JSONB` layout (tables
+created before this default keep working — new typed columns are added alongside).
 
 ## Write modes
 
