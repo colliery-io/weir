@@ -512,6 +512,9 @@ streams:
     /// select" (kind=manifest) and each entry validates + onboards.
     #[test]
     fn vendored_manifests_list_and_onboard() {
+        let _env = crate::MANIFESTS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let repo_manifests = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../manifests");
         unsafe { std::env::set_var("WEIR_MANIFESTS_DIR", &repo_manifests) };
         let tmp = tempfile::TempDir::new().unwrap();

@@ -8,11 +8,13 @@
 //! The `wit` feature enables `#[derive(WitType)]` on the typed-method types so a
 //! WASM guest can project them to WIT (WEIR-T-0002/0003).
 
+pub mod cursor;
 pub mod error;
 pub mod mssql;
 pub mod snowflake;
 pub mod types;
 
+pub use cursor::cursor_cmp;
 pub use error::{ConnectorError, ErrorKind};
 pub use types::*;
 

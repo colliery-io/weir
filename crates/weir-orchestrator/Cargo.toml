@@ -41,3 +41,5 @@ kubernetes = ["dep:kube", "dep:k8s-openapi"]
 [dev-dependencies]
 weir-wasm-testkit = { path = "../weir-wasm-testkit" }
 tempfile = "3"
+uuid = { version = "1", features = ["v4"] }
+async-trait = "0.1"

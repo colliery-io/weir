@@ -107,6 +107,31 @@ fn mock_http_once(body: &'static str) -> String {
     url
 }
 
+/// Serves one `body` per request, in order (then `[]`), capturing each request
+/// line — for multi-run tests where each engine run gets the next response.
+fn mock_http_sequence(
+    bodies: &'static [&'static str],
+    requests: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        let mut i = 0usize;
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let req = read_full_request(&mut stream);
+            requests
+                .lock()
+                .unwrap()
+                .push(req.lines().next().unwrap_or_default().to_string());
+            let body = bodies.get(i).copied().unwrap_or("[]");
+            i += 1;
+            respond_ok(&mut stream, body);
+        }
+    });
+    format!("http://{addr}")
+}
+
 /// Like `mock_http_once` but also hands back the raw request bytes, so a test can
 /// assert on the **outgoing** headers (e.g. that the connector sent `Authorization`).
 fn mock_http_capture(body: &'static str) -> (String, std::sync::mpsc::Receiver<String>) {
@@ -234,6 +259,56 @@ fn mock_http_stripe() -> String {
             if !after.is_empty() && after != "ch_2" {
                 break; // has_more:false page served → the guest must stop here
             }
+        }
+    });
+    format!("http://{addr}")
+}
+
+/// Serves `/items?page=N&limit=2`: pages 1..=3 of 2 records + a short page 4
+/// (ids 1..=7), then `[]`. While `healthy` is false, page 3 answers HTTP
+/// `sick_status` — letting a test kill a run mid-pagination ([[WEIR-T-0184]] /
+/// [[WEIR-T-0186]]). Every served page number is pushed to `requests`; serves
+/// until the process exits.
+fn mock_http_paged(
+    healthy: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    requests: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
+    sick_status: u16,
+) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]);
+            let page: u64 = req
+                .split("page=")
+                .nth(1)
+                .and_then(|s| s.split(['&', ' ']).next())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1);
+            requests.lock().unwrap().push(page);
+            let resp = if page == 3 && !healthy.load(std::sync::atomic::Ordering::SeqCst) {
+                format!(
+                    "HTTP/1.1 {sick_status} Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                )
+            } else {
+                let body = match page {
+                    1 => r#"[{"id":1},{"id":2}]"#,
+                    2 => r#"[{"id":3},{"id":4}]"#,
+                    3 => r#"[{"id":5},{"id":6}]"#,
+                    4 => r#"[{"id":7}]"#,
+                    _ => "[]",
+                };
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+            };
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
         }
     });
     format!("http://{addr}")
@@ -603,6 +678,281 @@ fn wasm_http_source_walks_offset_pagination() {
         .sync("offset-conn", &items_stream(), &source, &dest)
         .expect("engine sync over offset-paginated wasm http source");
     assert_eq!(out.rows_written, 5, "all 3 offset pages collected (2+2+1)");
+}
+
+/// Kill-at-page-N resume proof ([[WEIR-T-0184]]): the rest runtime checkpoints per
+/// page, so a run that dies at page 3 keeps pages 1-2 committed and the NEXT run
+/// resumes at page 3 from `StreamState.opaque` — no re-read, no gap. A third run
+/// (after the clean finish cleared `opaque`) starts back at page 1.
+#[test]
+fn wasm_http_source_resumes_pagination_after_mid_run_failure() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let healthy = std::sync::Arc::new(AtomicBool::new(false));
+    let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let base = mock_http_paged(healthy.clone(), requests.clone(), 500);
+
+    let pkg_root = tempfile::TempDir::new().unwrap();
+    build_and_stage(pkg_root.path());
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let store = Store::open(db_dir.path().join("weir.db").to_str().unwrap()).unwrap();
+    let engine = Engine::new(&store);
+
+    let src_cfg = Config {
+        json: serde_json::json!({
+            "base_url": base,
+            "path": "/items",
+            "page_param": "page",
+            "page_size_param": "limit",
+            "page_size": 2,
+            "max_retries": 0, // the 500 fails immediately instead of retrying
+        })
+        .to_string(),
+    };
+    let policy = HostAllowList {
+        allowed_hosts: vec!["127.0.0.1".to_string()],
+        inject_headers: vec![],
+        credential: None,
+    };
+    let source =
+        ConnectorHandle::from_wasm_package(pkg_root.path(), "weir-rest-pkg", &src_cfg, policy, &[])
+            .expect("load wasm rest http source");
+    let dest = weir_wasm_testkit::load(
+        "ArrowSink",
+        &Config {
+            json: "{}".to_string(),
+        },
+    )
+    .unwrap();
+
+    // Run 1 dies at page 3 (the mock answers 500) — pages 1-2 are already committed.
+    let err = engine.sync("resume-conn", &items_stream(), &source, &dest);
+    assert!(err.is_err(), "run 1 must fail at the 500 page");
+    assert_eq!(
+        store.outbox_count("resume-conn").unwrap(),
+        2,
+        "two per-page checkpoints committed before the failure"
+    );
+
+    // Run 2 resumes at page 3 and finishes the read.
+    healthy.store(true, Ordering::SeqCst);
+    let out = engine
+        .sync("resume-conn", &items_stream(), &source, &dest)
+        .expect("resumed run completes");
+    assert_eq!(
+        out.rows_written, 3,
+        "resume delivers pages 3-4 only (ids 5,6,7)"
+    );
+    {
+        let reqs = requests.lock().unwrap();
+        assert_eq!(
+            &*reqs,
+            &[1, 2, 3, 3, 4],
+            "run 1 = pages 1,2,3(500); run 2 resumes at 3 — pages 1-2 never re-fetched"
+        );
+    }
+
+    // Run 3: the clean finish cleared the resume state — a fresh read starts at page 1.
+    let out = engine
+        .sync("resume-conn", &items_stream(), &source, &dest)
+        .expect("fresh run after clean finish");
+    assert_eq!(
+        out.rows_written, 7,
+        "a fresh full-refresh re-reads everything"
+    );
+    assert_eq!(
+        requests.lock().unwrap()[5],
+        1,
+        "run 3 starts back at page 1 (opaque was cleared by the clean finish)"
+    );
+}
+
+/// max_pages ([[WEIR-T-0184]]): hitting the per-run page cap is LOUD (a Warn in
+/// run_logs) and resumable (checkpoint committed) — never a silent truncation. The
+/// next run continues exactly where the capped run stopped.
+#[test]
+fn wasm_http_source_max_pages_warns_and_resumes() {
+    let healthy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let base = mock_http_paged(healthy, requests.clone(), 500);
+
+    let pkg_root = tempfile::TempDir::new().unwrap();
+    build_and_stage(pkg_root.path());
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let store = Store::open(db_dir.path().join("weir.db").to_str().unwrap()).unwrap();
+    let engine = Engine::new(&store);
+
+    let src_cfg = Config {
+        json: serde_json::json!({
+            "base_url": base,
+            "path": "/items",
+            "page_param": "page",
+            "page_size_param": "limit",
+            "page_size": 2,
+            "max_pages": 2,
+        })
+        .to_string(),
+    };
+    let policy = HostAllowList {
+        allowed_hosts: vec!["127.0.0.1".to_string()],
+        inject_headers: vec![],
+        credential: None,
+    };
+    let source =
+        ConnectorHandle::from_wasm_package(pkg_root.path(), "weir-rest-pkg", &src_cfg, policy, &[])
+            .expect("load wasm rest http source");
+    let dest = weir_wasm_testkit::load(
+        "ArrowSink",
+        &Config {
+            json: "{}".to_string(),
+        },
+    )
+    .unwrap();
+
+    // Run 1 hits the cap after 2 pages: SUCCEEDS, warns, checkpoints resumably.
+    let out = engine
+        .sync("cap-conn", &items_stream(), &source, &dest)
+        .expect("capped run succeeds");
+    assert_eq!(out.rows_written, 4, "pages 1-2 delivered under the cap");
+    let logs = store.logs("cap-conn", 50).unwrap();
+    assert!(
+        logs.iter()
+            .any(|l| l.level == "warn" && l.message.contains("max_pages")),
+        "hitting the cap must leave a Warn naming max_pages in run_logs; got {logs:?}"
+    );
+
+    // Run 2 resumes past the cap and finishes.
+    let out = engine
+        .sync("cap-conn", &items_stream(), &source, &dest)
+        .expect("run 2 resumes past the cap");
+    assert_eq!(
+        out.rows_written, 3,
+        "pages 3-4 delivered by the resumed run"
+    );
+    assert_eq!(
+        &*requests.lock().unwrap(),
+        &[1, 2, 3, 4],
+        "no page fetched twice across the capped runs"
+    );
+}
+
+/// Status-aware end-of-data ([[WEIR-T-0186]]): a 401 mid-pagination FAILS the run —
+/// never a silent partial "success" — with the status + page in the error; the
+/// checkpoint through the last good page is already committed ([[WEIR-T-0184]]) so
+/// the healed re-run resumes past it, and a 2xx page with an empty record array is
+/// still the legitimate clean end (no `page_size` here, so the read ends by probing
+/// the empty page 5).
+#[test]
+fn wasm_http_source_fails_run_on_mid_pagination_error_page() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let healthy = std::sync::Arc::new(AtomicBool::new(false));
+    let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let base = mock_http_paged(healthy.clone(), requests.clone(), 401);
+
+    let pkg_root = tempfile::TempDir::new().unwrap();
+    build_and_stage(pkg_root.path());
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let store = Store::open(db_dir.path().join("weir.db").to_str().unwrap()).unwrap();
+    let engine = Engine::new(&store);
+
+    let src_cfg = Config {
+        json: serde_json::json!({
+            "base_url": base,
+            "path": "/items",
+            "page_param": "page",
+        })
+        .to_string(),
+    };
+    let policy = HostAllowList {
+        allowed_hosts: vec!["127.0.0.1".to_string()],
+        inject_headers: vec![],
+        credential: None,
+    };
+    let source =
+        ConnectorHandle::from_wasm_package(pkg_root.path(), "weir-rest-pkg", &src_cfg, policy, &[])
+            .expect("load wasm rest http source");
+    let dest = weir_wasm_testkit::load(
+        "ArrowSink",
+        &Config {
+            json: "{}".to_string(),
+        },
+    )
+    .unwrap();
+
+    // Run 1: the 401 at page 3 FAILS the run, naming status + page.
+    let err = engine
+        .sync("err-page-conn", &items_stream(), &source, &dest)
+        .expect_err("a mid-pagination 401 must fail the run, not end it cleanly");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("401") && msg.contains("page 3"),
+        "the error must carry the status and page position; got: {msg}"
+    );
+    assert_eq!(
+        store.outbox_count("err-page-conn").unwrap(),
+        2,
+        "pages 1-2 were committed before the failure"
+    );
+
+    // Run 2 (credential "healed"): resumes at page 3, ends cleanly on the
+    // 2xx-empty page 5.
+    healthy.store(true, Ordering::SeqCst);
+    let out = engine
+        .sync("err-page-conn", &items_stream(), &source, &dest)
+        .expect("healed run completes");
+    assert_eq!(out.rows_written, 3, "pages 3-4 delivered (ids 5,6,7)");
+    assert_eq!(
+        &*requests.lock().unwrap(),
+        &[1, 2, 3, 3, 4, 5],
+        "run 2 resumed at page 3 and stopped after the empty page 5"
+    );
+}
+
+/// The sanctioned non-2xx stop ([[WEIR-T-0186]]): a 404 PAST page 1 is how
+/// page-probing APIs signal one-past-the-end — still a clean end, since the same
+/// URL shape already succeeded so it cannot be a config error.
+#[test]
+fn wasm_http_source_treats_404_past_last_page_as_end() {
+    let healthy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let base = mock_http_paged(healthy, requests.clone(), 404); // page 3 404s forever
+
+    let pkg_root = tempfile::TempDir::new().unwrap();
+    build_and_stage(pkg_root.path());
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let store = Store::open(db_dir.path().join("weir.db").to_str().unwrap()).unwrap();
+    let engine = Engine::new(&store);
+
+    let src_cfg = Config {
+        json: serde_json::json!({
+            "base_url": base,
+            "path": "/items",
+            "page_param": "page",
+        })
+        .to_string(),
+    };
+    let policy = HostAllowList {
+        allowed_hosts: vec!["127.0.0.1".to_string()],
+        inject_headers: vec![],
+        credential: None,
+    };
+    let source =
+        ConnectorHandle::from_wasm_package(pkg_root.path(), "weir-rest-pkg", &src_cfg, policy, &[])
+            .expect("load wasm rest http source");
+    let dest = weir_wasm_testkit::load(
+        "ArrowSink",
+        &Config {
+            json: "{}".to_string(),
+        },
+    )
+    .unwrap();
+
+    let out = engine
+        .sync("probe-404-conn", &items_stream(), &source, &dest)
+        .expect("the 404 one page past the end is a clean stop");
+    assert_eq!(
+        out.rows_written, 4,
+        "pages 1-2 delivered; the 404 page ended the read"
+    );
 }
 
 /// Opaque cursor/token pagination ([[WEIR-I-0008]]): the guest reads the next-page token
@@ -1011,9 +1361,134 @@ fn wasm_http_source_sends_datetime_start_end_bounds() {
         .recv_timeout(std::time::Duration::from_secs(5))
         .expect("captured outbound request");
     let line = req.lines().next().unwrap_or_default();
+    // Query values are percent-encoded exactly once at build time ([[WEIR-T-0185]]).
     assert!(
-        line.contains("since=2020-01-01T00:00:00Z") && line.contains("until=2026-12-31T00:00:00Z"),
-        "request must carry the start + end datetime bounds; got: {line}"
+        line.contains("since=2020-01-01T00%3A00%3A00Z")
+            && line.contains("until=2026-12-31T00%3A00%3A00Z"),
+        "request must carry the start + end datetime bounds, percent-encoded; got: {line}"
+    );
+}
+
+/// Query values are percent-encoded exactly once at build time ([[WEIR-T-0185]]):
+/// an ISO cursor with a `+02:00` offset must reach the wire as `%2B` (a raw `+`
+/// decodes as a space server-side), and a host-injected query credential with
+/// reserved characters must not corrupt the query string.
+#[test]
+fn wasm_http_source_percent_encodes_query_values() {
+    let (base, req_rx) =
+        mock_http_capture(r#"[{"id":1,"title":"hi","updated_at":"2026-01-01T00:00:00+02:00"}]"#);
+
+    let pkg_root = tempfile::TempDir::new().unwrap();
+    build_and_stage(pkg_root.path());
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let store = Store::open(db_dir.path().join("weir.db").to_str().unwrap()).unwrap();
+    let engine = Engine::new(&store);
+
+    // Host-side query credential ([[WEIR-A-0033]]) with every reserved char that
+    // corrupts a query, plus a `+`-bearing datetime lower bound from the guest.
+    let cfg_json = serde_json::json!({
+        "base_url": base, "path": "/posts",
+        "auth_scheme": "query", "auth_name": "apikey", "api_key": "k+&=#z",
+        "cursor_field": "updated_at", "cursor_param": "since",
+        "cursor_start": "2020-01-01T00:00:00+02:00",
+    })
+    .to_string();
+    let source = host_auth_source(pkg_root.path(), &cfg_json);
+    let dest = weir_wasm_testkit::load(
+        "ArrowSink",
+        &Config {
+            json: "{}".to_string(),
+        },
+    )
+    .unwrap();
+
+    let out = engine
+        .sync("enc-conn", &posts_stream(), &source, &dest)
+        .expect("engine sync over percent-encoded query values");
+    assert_eq!(out.rows_written, 1);
+
+    let req = req_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("captured outbound request");
+    let line = req.lines().next().unwrap_or_default();
+    assert!(
+        line.contains("since=2020-01-01T00%3A00%3A00%2B02%3A00"),
+        "the datetime cursor must reach the wire with `+` as %2B, encoded once; got: {line}"
+    );
+    assert!(
+        line.contains("apikey=k%2B%26%3D%23z"),
+        "the query credential must be percent-encoded once host-side; got: {line}"
+    );
+    assert!(
+        !line.contains("%25"),
+        "nothing may be double-encoded (no %25 anywhere); got: {line}"
+    );
+}
+
+/// Numeric-aware cursor advance ([[WEIR-T-0187]]): once a numeric cursor crosses a
+/// digit boundary, a lexicographic max sticks at the old value (`"9" > "12"`) and
+/// re-delivers those rows on every later run. Two incremental runs across the
+/// 9 → 12 rollover must commit `12`.
+#[test]
+fn wasm_http_source_numeric_cursor_survives_digit_rollover() {
+    let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    static BODIES: &[&str] = &[
+        r#"[{"id":8},{"id":9}]"#,
+        r#"[{"id":10},{"id":11},{"id":12}]"#,
+    ];
+    let base = mock_http_sequence(BODIES, requests.clone());
+
+    let pkg_root = tempfile::TempDir::new().unwrap();
+    build_and_stage(pkg_root.path());
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let store = Store::open(db_dir.path().join("weir.db").to_str().unwrap()).unwrap();
+    let engine = Engine::new(&store);
+
+    let src_cfg = Config {
+        json: serde_json::json!({
+            "base_url": base, "path": "/items",
+            "cursor_field": "id", "cursor_param": "since",
+        })
+        .to_string(),
+    };
+    let policy = HostAllowList {
+        allowed_hosts: vec!["127.0.0.1".to_string()],
+        inject_headers: vec![],
+        credential: None,
+    };
+    let source =
+        ConnectorHandle::from_wasm_package(pkg_root.path(), "weir-rest-pkg", &src_cfg, policy, &[])
+            .expect("load wasm rest http source");
+    let dest = weir_wasm_testkit::load(
+        "ArrowSink",
+        &Config {
+            json: "{}".to_string(),
+        },
+    )
+    .unwrap();
+
+    // Run 1: ids 8,9 → cursor "9".
+    engine
+        .sync("num-cursor-conn", &items_stream(), &source, &dest)
+        .expect("run 1");
+    assert_eq!(
+        store.cursor("num-cursor-conn", "items").unwrap().as_deref(),
+        Some("9")
+    );
+
+    // Run 2: ids 10,11,12 — the numeric max advances past the digit rollover
+    // (a lexicographic compare would keep "9" and re-deliver 10-12 forever).
+    engine
+        .sync("num-cursor-conn", &items_stream(), &source, &dest)
+        .expect("run 2");
+    assert_eq!(
+        store.cursor("num-cursor-conn", "items").unwrap().as_deref(),
+        Some("12"),
+        "the committed cursor must advance numerically past the rollover"
+    );
+    assert!(
+        requests.lock().unwrap()[1].contains("since=9"),
+        "run 2 asked the API for rows past the committed cursor"
     );
 }
 

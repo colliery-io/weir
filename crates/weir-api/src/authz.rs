@@ -145,6 +145,7 @@ fn build_authz_table() -> AuthzTable {
         Access::any(Write),
     );
     add(Method::GET, "/runs", Access::any(Read));
+    add(Method::GET, "/runs/{id}", Access::any(Read));
     // Holistic ops health ([[WEIR-T-0110]]): own-tenant is `Any` (handler-scoped); the explicit
     // cross-tenant + the platform rollup are platform-admin.
     add(Method::GET, "/overview", Access::any(Read));
@@ -220,6 +221,11 @@ fn build_authz_table() -> AuthzTable {
         Access::platform(Admin),
     );
     add(Method::GET, "/tenants/{id}/runs", Access::platform(Admin));
+    add(
+        Method::GET,
+        "/tenants/{id}/runs/{run_id}",
+        Access::platform(Admin),
+    );
     t
 }
 

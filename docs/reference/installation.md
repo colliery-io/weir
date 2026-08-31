@@ -61,6 +61,12 @@ The daemons (`weir serve` / `weir api` / `weir runner`) retry **transient** run 
 `WEIR_MAX_ATTEMPTS` (min 1) and `WEIR_RETRY_BASE_MS` (default 1000). Fatal errors —
 bad config, connector-declared fatals — still fail immediately.
 
+**Retention**: `weir serve` prunes finished run history, run logs, and dead letters on the
+scheduler tick (leader-only) so the store never grows without bound — by age
+(`WEIR_RETENTION_DAYS`, default 30) and by a per-tenant row cap per table
+(`WEIR_RETENTION_MAX_ROWS`, default 10000, newest kept). Set either to `0` to disable that
+cap. In-flight runs are never pruned; dead letters are purged, not replayed.
+
 ## First run
 
 The API and UI are authenticated by default. On a **fresh store**, the first `weir api` (or

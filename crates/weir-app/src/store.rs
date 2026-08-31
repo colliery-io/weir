@@ -200,3 +200,55 @@ pub(crate) fn run_feed(
     out.sort_by_key(|b| std::cmp::Reverse(b.id));
     Ok(out)
 }
+
+/// One strict history page ([[WEIR-T-0189]]): units with `id < before`, newest
+/// first, capped. Ids are monotonic (timestamp-ordered), so walking `before =
+/// smallest id of the previous page` visits every unit exactly once — no dupes,
+/// no gaps. Unlike the first-page live feed, no active-union: this is history.
+pub(crate) fn run_feed_before(
+    conn: &mut DualConnection,
+    tenant: &str,
+    limit: i64,
+    before: i64,
+) -> Result<Vec<RunFeedRow>, AppError> {
+    Ok(work_units::table
+        .filter(
+            work_units::tenant_id
+                .eq(tenant)
+                .and(work_units::id.lt(before)),
+        )
+        .order(work_units::id.desc())
+        .limit(limit)
+        .select(RunFeedRow::as_select())
+        .load(conn)?)
+}
+
+/// One unit by `(tenant, id)` — the single-run fetch ([[WEIR-T-0189]]). A row
+/// belonging to another tenant is simply not found (no cross-tenant leak).
+pub(crate) fn run_by_id(
+    conn: &mut DualConnection,
+    tenant: &str,
+    id: i64,
+) -> Result<Option<RunDetailRow>, AppError> {
+    Ok(work_units::table
+        .filter(work_units::tenant_id.eq(tenant).and(work_units::id.eq(id)))
+        .select(RunDetailRow::as_select())
+        .first(conn)
+        .optional()?)
+}
+
+/// The single-run row ([[WEIR-T-0189]]) — the feed columns plus `stream`.
+#[derive(Queryable, Selectable)]
+#[diesel(table_name = work_units)]
+pub(crate) struct RunDetailRow {
+    pub id: i64,
+    pub connection: String,
+    pub stream: String,
+    pub state: String,
+    pub attempt: i64,
+    pub rows_written: i64,
+    pub dead_lettered: i64,
+    pub started_at: Option<i64>,
+    pub finished_at: Option<i64>,
+    pub error: Option<String>,
+}

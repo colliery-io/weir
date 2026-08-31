@@ -21,7 +21,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use diesel::prelude::*;
 use serde::{Deserialize, Serialize};
-use weir_schema::{leader_leases, schedules, work_units};
+use weir_schema::{dead_letters, leader_leases, run_logs, schedules, work_units};
 
 use weir_connector::{
     Config, ConfiguredStream, DiscoverOutcome, ErrorKind, Partition, PartitionScheme,
@@ -146,7 +146,8 @@ impl ConnectorRef {
                 // same package with different credentials never share a handle/token.
                 let key = format!("{search_path}\u{0}{package}\u{0}{}", config.json);
                 let cache = HANDLE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-                if let Some(h) = cache.lock().unwrap().get(&key) {
+                if let Some((h, last_used)) = cache.lock().unwrap().get_mut(&key) {
+                    *last_used = std::time::Instant::now();
                     return Ok(Arc::clone(h));
                 }
                 // Resolve the host-side credential ([[WEIR-A-0033]]): the secret is
@@ -184,17 +185,47 @@ impl ConnectorRef {
                     )
                     .map_err(|e| ExecutorError::Resolve(e.to_string()))?,
                 );
-                Ok(Arc::clone(
-                    cache.lock().unwrap().entry(key).or_insert(handle),
-                ))
+                let mut cache = cache.lock().unwrap();
+                // Bound the cache ([[WEIR-T-0190]]): each entry holds a JIT-compiled
+                // component, and distinct configs/versions accumulate forever
+                // otherwise — evict the least-recently-used entry at the cap.
+                // (Live runs keep their handle via the returned `Arc`.)
+                if !cache.contains_key(&key) {
+                    lru_evict(&mut cache, HANDLE_CACHE_CAP);
+                }
+                let (h, _) = cache
+                    .entry(key)
+                    .or_insert((handle, std::time::Instant::now()));
+                Ok(Arc::clone(h))
             }
         }
     }
 }
 
+/// Max cached connector handles ([[WEIR-T-0190]]) — LRU-evicted past this.
+const HANDLE_CACHE_CAP: usize = 32;
+
+/// Make room for one insert: while `map` is at/over `cap`, evict the entry with
+/// the oldest last-use stamp ([[WEIR-T-0190]]).
+fn lru_evict<T>(map: &mut HashMap<String, (T, std::time::Instant)>, cap: usize) {
+    while map.len() >= cap {
+        let Some(lru) = map
+            .iter()
+            .min_by_key(|(_, (_, at))| *at)
+            .map(|(k, _)| k.clone())
+        else {
+            return;
+        };
+        map.remove(&lru);
+    }
+}
+
 /// Process-wide cache of loaded connector handles, keyed by
-/// `(search_path, package, config)` — see [`ConnectorRef::resolve`].
-static HANDLE_CACHE: OnceLock<Mutex<HashMap<String, Arc<ConnectorHandle>>>> = OnceLock::new();
+/// `(search_path, package, config)`, valued with a last-use stamp for LRU
+/// eviction — see [`ConnectorRef::resolve`].
+#[allow(clippy::type_complexity)]
+static HANDLE_CACHE: OnceLock<Mutex<HashMap<String, (Arc<ConnectorHandle>, std::time::Instant)>>> =
+    OnceLock::new();
 
 /// How a connection's source is executed ([[WEIR-I-0035]] F1). **Host-side only** —
 /// it never crosses the connector (wasm) boundary; the guest `read` stream is
@@ -335,6 +366,39 @@ pub enum ExecutorError {
     Store(String),
     #[error("db: {0}")]
     Db(#[from] diesel::result::Error),
+    /// A drain pass processed this many units without reaching idle
+    /// ([[WEIR-T-0190]]) — something is perpetually requeuing itself.
+    #[error("drain did not reach idle after {0} units — a unit may be perpetually requeuing")]
+    DrainStuck(u64),
+}
+
+/// Retention knobs ([[WEIR-T-0188]]) for [`Relay::prune_retention`]. `None`
+/// disables that cap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetentionConfig {
+    /// Delete terminal rows older than this (epoch-ms age).
+    pub max_age_ms: Option<i64>,
+    /// Keep at most this many rows per table **per tenant** (newest win).
+    pub max_rows: Option<i64>,
+}
+
+impl RetentionConfig {
+    /// Read the operator knobs: `WEIR_RETENTION_DAYS` (default 30, `0`
+    /// disables) and `WEIR_RETENTION_MAX_ROWS` (default 10_000, `0` disables).
+    pub fn from_env() -> Self {
+        let days = std::env::var("WEIR_RETENTION_DAYS")
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(30);
+        let rows = std::env::var("WEIR_RETENTION_MAX_ROWS")
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(10_000);
+        Self {
+            max_age_ms: (days > 0).then(|| days.saturating_mul(86_400_000)),
+            max_rows: (rows > 0).then_some(rows),
+        }
+    }
 }
 
 /// Retry/backoff policy for the relay (transients requeue; fatal/config fail).
@@ -354,6 +418,10 @@ pub struct WorkerConfig {
     /// in-flight executions, independent of how many workers/nodes drain the queue
     /// (the atomic claim keeps concurrent claimants from double-running a unit).
     pub concurrency: usize,
+    /// Max units one `run_until_idle` pass may process before failing loudly
+    /// with [`ExecutorError::DrainStuck`] ([[WEIR-T-0190]]) — a unit that
+    /// perpetually requeues itself due-now must surface, not hang the drain.
+    pub max_drain_units: u64,
 }
 
 impl Default for WorkerConfig {
@@ -366,6 +434,7 @@ impl Default for WorkerConfig {
             lease: Duration::from_secs(30),
             heartbeat: Duration::from_secs(10),
             concurrency: 16,
+            max_drain_units: 10_000,
         }
     }
 }
@@ -502,11 +571,45 @@ pub trait WorkExecutor: Send + Sync {
 /// A client-generated, monotonic work-unit / schedule id: `now_ms() << 20 | counter`
 /// (the generator has no autoincrement; this keeps ids unique + roughly ordered, so
 /// the FIFO `ORDER BY id` claim and the run feed are preserved). [[WEIR-T-0061]]
+///
+/// The 20-bit counter is SEEDED with a per-process nonce ([[WEIR-T-0190]]):
+/// a zero-start counter meant a restarted process — or a second worker — minting
+/// an id in the same millisecond re-minted the exact same id.
 fn next_id() -> i64 {
     use std::sync::atomic::{AtomicI64, Ordering};
-    static COUNTER: AtomicI64 = AtomicI64::new(0);
-    let c = COUNTER.fetch_add(1, Ordering::Relaxed) & 0xF_FFFF; // 20-bit per-process counter
+    static COUNTER: OnceLock<AtomicI64> = OnceLock::new();
+    let counter = COUNTER.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as i64)
+            .unwrap_or(0);
+        AtomicI64::new((std::process::id() as i64) ^ nanos)
+    });
+    let c = counter.fetch_add(1, Ordering::Relaxed) & 0xF_FFFF; // 20-bit per-process counter
     (now_ms() << 20) | c
+}
+
+/// Absolute cap on the resident restart delay ([[WEIR-T-0190]]): 5 minutes.
+const RESIDENT_BACKOFF_CAP_MS: u64 = 300_000;
+/// A resident run alive at least this long counts as healthy uptime — its exit
+/// restarts on the BASE backoff (decay), not the accumulated attempt shift.
+const RESIDENT_HEALTHY_UPTIME_MS: u64 = 60_000;
+
+/// Restart delay for a resident exit ([[WEIR-T-0190]]): exponential in the
+/// unit's attempt count, but (a) a run that stayed healthy ≥
+/// [`RESIDENT_HEALTHY_UPTIME_MS`] resets to the base delay — `attempt` only ever
+/// grows over the unit's lifetime, so without decay one bad night would leave
+/// the connector permanently slow to restart — and (b) absolutely capped at
+/// [`RESIDENT_BACKOFF_CAP_MS`] so backoff can never grow into hours.
+fn resident_restart_delay(base_ms: u64, attempt: i64, run_ms: u64) -> i64 {
+    let shift = if run_ms >= RESIDENT_HEALTHY_UPTIME_MS {
+        0
+    } else {
+        (attempt - 1).clamp(0, 16) as u32
+    };
+    base_ms
+        .saturating_mul(1u64 << shift)
+        .min(RESIDENT_BACKOFF_CAP_MS) as i64
 }
 
 /// A work unit's status (for run history).
@@ -790,9 +893,15 @@ impl Relay {
         Ok(())
     }
 
+    /// Owner-guarded terminal transition ([[WEIR-T-0190]]): only the worker that
+    /// still HOLDS the unit (matching `lease_owner`, state in-flight) may finish
+    /// it. A lease-expired worker finishing late — after the unit was reclaimed,
+    /// re-claimed elsewhere, or cancelled — matches nothing: its result is void
+    /// (warn, `Ok`), never a clobber of the new holder's state.
     pub fn mark_done(
         &self,
         id: i64,
+        owner: &str,
         rows_written: u64,
         dead_lettered: u64,
     ) -> Result<(), ExecutorError> {
@@ -801,48 +910,81 @@ impl Relay {
             .pool()
             .get()
             .map_err(|e| ExecutorError::Store(e.to_string()))?;
-        diesel::update(work_units::table.filter(work_units::id.eq(id)))
-            .set((
-                work_units::state.eq("done"),
-                work_units::rows_written.eq(rows_written as i64),
-                work_units::dead_lettered.eq(dead_lettered as i64),
-                work_units::finished_at.eq(now_ms()),
-            ))
-            .execute(&mut conn)?;
+        let n = diesel::update(
+            work_units::table.filter(
+                work_units::id
+                    .eq(id)
+                    .and(work_units::lease_owner.eq(owner))
+                    .and(work_units::state.eq_any(["leased", "running"])),
+            ),
+        )
+        .set((
+            work_units::state.eq("done"),
+            work_units::rows_written.eq(rows_written as i64),
+            work_units::dead_lettered.eq(dead_lettered as i64),
+            work_units::finished_at.eq(now_ms()),
+        ))
+        .execute(&mut conn)?;
+        if n == 0 {
+            tracing::warn!(target: "weir_orchestrator", unit = id, owner, "stale mark_done ignored (unit no longer held by this owner)");
+        }
         Ok(())
     }
 
-    pub fn mark_failed(&self, id: i64, error: &str) -> Result<(), ExecutorError> {
+    /// Owner-guarded — see [`Relay::mark_done`].
+    pub fn mark_failed(&self, id: i64, owner: &str, error: &str) -> Result<(), ExecutorError> {
         let mut conn = self
             .store
             .pool()
             .get()
             .map_err(|e| ExecutorError::Store(e.to_string()))?;
-        diesel::update(work_units::table.filter(work_units::id.eq(id)))
-            .set((
-                work_units::state.eq("failed"),
-                work_units::error.eq(error),
-                work_units::finished_at.eq(now_ms()),
-            ))
-            .execute(&mut conn)?;
+        let n = diesel::update(
+            work_units::table.filter(
+                work_units::id
+                    .eq(id)
+                    .and(work_units::lease_owner.eq(owner))
+                    .and(work_units::state.eq_any(["leased", "running"])),
+            ),
+        )
+        .set((
+            work_units::state.eq("failed"),
+            work_units::error.eq(error),
+            work_units::finished_at.eq(now_ms()),
+        ))
+        .execute(&mut conn)?;
+        if n == 0 {
+            tracing::warn!(target: "weir_orchestrator", unit = id, owner, "stale mark_failed ignored (unit no longer held by this owner)");
+        }
         Ok(())
     }
 
     /// Return a unit to `Pending`, claimable at `next_attempt_at` (epoch ms).
-    pub fn requeue(&self, id: i64, next_attempt_at: i64) -> Result<(), ExecutorError> {
+    /// Owner-guarded like [`Relay::mark_done`] — a stale requeue must not
+    /// resurrect a unit that was cancelled or re-claimed elsewhere.
+    pub fn requeue(&self, id: i64, owner: &str, next_attempt_at: i64) -> Result<(), ExecutorError> {
         let mut conn = self
             .store
             .pool()
             .get()
             .map_err(|e| ExecutorError::Store(e.to_string()))?;
-        diesel::update(work_units::table.filter(work_units::id.eq(id)))
-            .set((
-                work_units::state.eq("pending"),
-                work_units::lease_owner.eq(None::<String>),
-                work_units::lease_expires_at.eq(None::<i64>),
-                work_units::next_attempt_at.eq(next_attempt_at),
-            ))
-            .execute(&mut conn)?;
+        let n = diesel::update(
+            work_units::table.filter(
+                work_units::id
+                    .eq(id)
+                    .and(work_units::lease_owner.eq(owner))
+                    .and(work_units::state.eq_any(["leased", "running"])),
+            ),
+        )
+        .set((
+            work_units::state.eq("pending"),
+            work_units::lease_owner.eq(None::<String>),
+            work_units::lease_expires_at.eq(None::<i64>),
+            work_units::next_attempt_at.eq(next_attempt_at),
+        ))
+        .execute(&mut conn)?;
+        if n == 0 {
+            tracing::warn!(target: "weir_orchestrator", unit = id, owner, "stale requeue ignored (unit no longer held by this owner)");
+        }
         Ok(())
     }
 
@@ -946,6 +1088,126 @@ impl Relay {
             h.stop();
         }
         n
+    }
+
+    /// Retention pass ([[WEIR-T-0188]]): prune **terminal** (`done`/`failed`)
+    /// `work_units`, plus `run_logs` and `dead_letters`, so a long-lived
+    /// deployment never eats its store. Two caps per table, both per tenant:
+    /// an age cap (rows older than the cutoff go) then a count cap (newest N
+    /// kept, oldest deleted). In-flight units (`pending`/`leased`/`running`)
+    /// are NEVER touched — terminal units are recognized by state and always
+    /// carry `finished_at`. Dead letters are purged, not replayed. Returns the
+    /// total rows deleted.
+    pub fn prune_retention(&self, cfg: &RetentionConfig) -> Result<u64, ExecutorError> {
+        const TERMINAL: [&str; 2] = ["done", "failed"];
+        let mut conn = self
+            .store
+            .pool()
+            .get()
+            .map_err(|e| ExecutorError::Store(e.to_string()))?;
+        let mut deleted: u64 = 0;
+
+        if let Some(age_ms) = cfg.max_age_ms {
+            let cutoff = now_ms() - age_ms;
+            deleted += diesel::delete(
+                work_units::table.filter(
+                    work_units::state
+                        .eq_any(TERMINAL)
+                        .and(work_units::finished_at.lt(cutoff)),
+                ),
+            )
+            .execute(&mut conn)? as u64;
+            deleted += diesel::delete(run_logs::table.filter(run_logs::ts.lt(cutoff)))
+                .execute(&mut conn)? as u64;
+            deleted += diesel::delete(dead_letters::table.filter(dead_letters::ts.lt(cutoff)))
+                .execute(&mut conn)? as u64;
+        }
+
+        if let Some(max_rows) = cfg.max_rows {
+            // Per-tenant caps: one noisy tenant must not evict another's history.
+            let tenants: Vec<String> = work_units::table
+                .select(work_units::tenant_id)
+                .distinct()
+                .load(&mut conn)?;
+            for t in &tenants {
+                // The (max_rows+1)-th newest terminal unit marks the eviction
+                // threshold; everything at or below it goes. Ids are monotonic
+                // (timestamp-ordered), so `ORDER BY id DESC` is newest-first.
+                let threshold: Option<i64> = work_units::table
+                    .filter(
+                        work_units::tenant_id
+                            .eq(t)
+                            .and(work_units::state.eq_any(TERMINAL)),
+                    )
+                    .select(work_units::id)
+                    .order(work_units::id.desc())
+                    .offset(max_rows)
+                    .limit(1)
+                    .first(&mut conn)
+                    .optional()?;
+                if let Some(th) = threshold {
+                    deleted += diesel::delete(
+                        work_units::table.filter(
+                            work_units::tenant_id
+                                .eq(t)
+                                .and(work_units::state.eq_any(TERMINAL))
+                                .and(work_units::id.le(th)),
+                        ),
+                    )
+                    .execute(&mut conn)? as u64;
+                }
+            }
+            // run_logs / dead_letters cap on the `ts` recency order. The
+            // (max_rows+1)-th newest ts marks the threshold; it and everything
+            // older goes. With ts ties at the boundary this may evict a tying
+            // row too — the caps are bounds, not exact counts.
+            let log_tenants: Vec<String> = run_logs::table
+                .select(run_logs::tenant_id)
+                .distinct()
+                .load(&mut conn)?;
+            for t in &log_tenants {
+                let threshold: Option<i64> = run_logs::table
+                    .filter(run_logs::tenant_id.eq(t))
+                    .select(run_logs::ts)
+                    .order(run_logs::ts.desc())
+                    .offset(max_rows)
+                    .limit(1)
+                    .first(&mut conn)
+                    .optional()?;
+                if let Some(th) = threshold {
+                    deleted += diesel::delete(
+                        run_logs::table.filter(run_logs::tenant_id.eq(t).and(run_logs::ts.le(th))),
+                    )
+                    .execute(&mut conn)? as u64;
+                }
+            }
+            let dl_tenants: Vec<String> = dead_letters::table
+                .select(dead_letters::tenant_id)
+                .distinct()
+                .load(&mut conn)?;
+            for t in &dl_tenants {
+                let threshold: Option<i64> = dead_letters::table
+                    .filter(dead_letters::tenant_id.eq(t))
+                    .select(dead_letters::ts)
+                    .order(dead_letters::ts.desc())
+                    .offset(max_rows)
+                    .limit(1)
+                    .first(&mut conn)
+                    .optional()?;
+                if let Some(th) = threshold {
+                    deleted += diesel::delete(
+                        dead_letters::table
+                            .filter(dead_letters::tenant_id.eq(t).and(dead_letters::ts.le(th))),
+                    )
+                    .execute(&mut conn)? as u64;
+                }
+            }
+        }
+
+        if deleted > 0 {
+            tracing::info!(target: "weir_orchestrator", deleted, "retention pruned rows");
+        }
+        Ok(deleted)
     }
 
     /// Return expired leases (dead workers) to `Pending`. Returns the count.
@@ -1495,7 +1757,15 @@ impl<E: WorkExecutor + 'static> Worker<E> {
         if let Some(hb) = heartbeat {
             hb.abort();
         }
-        let result = result?;
+        // Per-run isolation ([[WEIR-T-0190]], the [[WEIR-T-0066]] wedge): an executor
+        // error — including a JoinError from a panicking run — must fail only THIS
+        // run. Propagating it aborted the whole drain pass and stranded the unit
+        // leased-to-a-ghost until lease expiry. It becomes a transient failure and
+        // flows through the normal terminal transition below.
+        let result = result.unwrap_or_else(|e| ExecutionResult::Failed {
+            kind: ErrorKind::Transient,
+            message: format!("executor error: {e}"),
+        });
 
         // Metrics ([[WEIR-T-0099]]) + OpenLineage COMPLETE/FAIL ([[WEIR-T-0100]]).
         emit_run_metrics(
@@ -1514,7 +1784,7 @@ impl<E: WorkExecutor + 'static> Worker<E> {
 
         let max_attempts = config.max_attempts;
         let base_delay = config.base_delay.as_millis() as i64;
-        // Resident sources ([[WEIR-I-0035]] F1.3) restart on their own backoff, unbounded —
+        // Resident sources ([[WEIR-I-0035]] F1.3) restart on their own backoff —
         // `Some(base_ms)` iff this unit is resident. A clean stop reports `Completed` (→ done);
         // any exit/error requeues so it resumes from the last checkpoint (never silently dies).
         let resident_backoff_ms = run_spec
@@ -1522,6 +1792,8 @@ impl<E: WorkExecutor + 'static> Worker<E> {
             .and_then(|s| s.execution_mode.restart_backoff_ms());
         let id = event.work_unit_id;
         let attempt = event.attempt;
+        let owner = config.owner.clone();
+        let run_ms = run_started.elapsed().as_millis() as u64;
         tokio::task::spawn_blocking(move || {
             retry_locked(|| -> Result<(), ExecutorError> {
                 match &result {
@@ -1530,26 +1802,26 @@ impl<E: WorkExecutor + 'static> Worker<E> {
                         dead_lettered,
                     } => {
                         tracing::debug!(target: "weir_orchestrator", unit = id, rows = *rows_written, dead = *dead_lettered, "run done");
-                        relay.mark_done(id, *rows_written, *dead_lettered)
+                        relay.mark_done(id, &owner, *rows_written, *dead_lettered)
                     }
-                    ExecutionResult::Skipped => relay.requeue(id, now_ms()),
+                    ExecutionResult::Skipped => relay.requeue(id, &owner, now_ms()),
                     ExecutionResult::Failed { kind, message } => {
-                        let shift = (attempt - 1).clamp(0, 16) as u32;
                         if let Some(base_ms) = resident_backoff_ms {
-                            // Supervised restart: always requeue with exponential backoff
-                            // (capped shift, so no hot-loop), regardless of `max_attempts`.
-                            let delay = (base_ms as i64) * (1i64 << shift);
+                            // Supervised restart: requeue with capped, decaying
+                            // backoff ([[WEIR-T-0190]]) regardless of `max_attempts`.
+                            let delay = resident_restart_delay(base_ms, attempt, run_ms);
                             tracing::info!(target: "weir_orchestrator", unit = id, attempt, delay_ms = delay, error = %message, "resident run exited → requeue with backoff");
-                            relay.requeue(id, now_ms() + delay)
+                            relay.requeue(id, &owner, now_ms() + delay)
                         } else if matches!(kind, ErrorKind::Transient)
                             && (attempt as u32) < max_attempts
                         {
+                            let shift = (attempt - 1).clamp(0, 16) as u32;
                             let delay = base_delay * (1i64 << shift);
                             tracing::warn!(target: "weir_orchestrator", unit = id, attempt, delay_ms = delay, error = %message, "transient failure → requeue with backoff");
-                            relay.requeue(id, now_ms() + delay)
+                            relay.requeue(id, &owner, now_ms() + delay)
                         } else {
                             tracing::error!(target: "weir_orchestrator", unit = id, attempt, error = %message, "run failed (terminal)");
-                            relay.mark_failed(id, message)
+                            relay.mark_failed(id, &owner, message)
                         }
                     }
                 }
@@ -1586,6 +1858,11 @@ impl<E: WorkExecutor + 'static> Worker<E> {
         while let Some(processed) = inflight.next().await {
             if processed? {
                 processed_count += 1;
+                // Containment ([[WEIR-T-0190]]): a unit perpetually requeuing
+                // itself due-now would spin this loop forever — fail loudly.
+                if processed_count >= self.config.max_drain_units {
+                    return Err(ExecutorError::DrainStuck(processed_count));
+                }
                 inflight.push(self.tick());
             } else if inflight.is_empty() {
                 break;
@@ -1637,7 +1914,9 @@ impl<E: WorkExecutor + 'static, F: Fn() -> E> Fleet<E, F> {
         // reclaimed — workers only ran (and only they swept) when a tenant had due
         // pending work, so the stranded unit stayed leased-to-a-ghost forever.
         self.relay.reclaim_expired()?;
-        loop {
+        // Containment ([[WEIR-T-0190]]): bounded rounds, mirroring the per-worker
+        // `max_drain_units` cap — a stuck tenant surfaces instead of spinning.
+        for _round in 0..1_000 {
             let tenants = self.relay.active_tenants()?;
             if tenants.is_empty() {
                 return Ok(());
@@ -1654,6 +1933,7 @@ impl<E: WorkExecutor + 'static, F: Fn() -> E> Fleet<E, F> {
                 worker.run_until_idle().await?;
             }
         }
+        Err(ExecutorError::DrainStuck(1_000))
     }
 }
 
@@ -1786,32 +2066,44 @@ impl<C: Clock> Scheduler<C> {
         };
 
         let mut fired = 0;
-        for (id, _key, spec_json, every_ms, cron) in due {
-            let spec: WorkSpec = from_json(&spec_json)?;
-            // Resident sources ([[WEIR-I-0035]] F1.3) are NOT interval/cron-fired: they are
-            // enqueued once as a standing registration (via `Relay::plan`) and kept alive by the
-            // perpetual lease. Firing here would resurrect a deliberately-stopped source.
-            // The guard uses the SPEC's (tenant, connection) — not the registry key, which
-            // may be tenant-scoped (`{tenant}/{name}`, [[WEIR-T-0171]]).
-            if !spec.execution_mode.is_resident()
-                && !self.relay.has_active_in(&spec.tenant, &spec.connection)?
-            {
-                self.relay.plan(&spec)?;
-                fired += 1;
-            }
-            let mut conn = self
-                .relay
-                .store
-                .pool()
-                .get()
-                .map_err(|e| ExecutorError::Store(e.to_string()))?;
-            let next_due = match cron.as_deref() {
-                Some(expr) => next_cron(expr, now)?,
-                None => now + every_ms,
+        for (id, key, spec_json, every_ms, cron) in due {
+            // Per-schedule isolation ([[WEIR-T-0190]]): one poisoned schedule
+            // (unparseable spec, bad cron, a failing plan) must not abort the
+            // tick for every remaining schedule — log it and keep going.
+            let one = || -> Result<bool, ExecutorError> {
+                let spec: WorkSpec = from_json(&spec_json)?;
+                // Resident sources ([[WEIR-I-0035]] F1.3) are NOT interval/cron-fired: they are
+                // enqueued once as a standing registration (via `Relay::plan`) and kept alive by the
+                // perpetual lease. Firing here would resurrect a deliberately-stopped source.
+                // The guard uses the SPEC's (tenant, connection) — not the registry key, which
+                // may be tenant-scoped (`{tenant}/{name}`, [[WEIR-T-0171]]).
+                let fire = !spec.execution_mode.is_resident()
+                    && !self.relay.has_active_in(&spec.tenant, &spec.connection)?;
+                if fire {
+                    self.relay.plan(&spec)?;
+                }
+                let mut conn = self
+                    .relay
+                    .store
+                    .pool()
+                    .get()
+                    .map_err(|e| ExecutorError::Store(e.to_string()))?;
+                let next_due = match cron.as_deref() {
+                    Some(expr) => next_cron(expr, now)?,
+                    None => now + every_ms,
+                };
+                diesel::update(schedules::table.filter(schedules::id.eq(id)))
+                    .set(schedules::next_due_at.eq(next_due))
+                    .execute(&mut conn)?;
+                Ok(fire)
             };
-            diesel::update(schedules::table.filter(schedules::id.eq(id)))
-                .set(schedules::next_due_at.eq(next_due))
-                .execute(&mut conn)?;
+            match one() {
+                Ok(true) => fired += 1,
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::error!(target: "weir_orchestrator", schedule = id, connection = %key, error = %e, "schedule tick failed; continuing with the rest");
+                }
+            }
         }
         if fired > 0 {
             tracing::debug!(target: "weir_orchestrator", schedules_fired = fired, "scheduler tick: planned due connections");
@@ -1853,5 +2145,69 @@ impl<C: Clock> Scheduler<C> {
         diesel::delete(schedules::table.filter(schedules::connection.eq(connection)))
             .execute(&mut conn)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod sharp_edges_tests {
+    use super::*;
+
+    /// [[WEIR-T-0190]] item 5: the resident restart delay is exponential in the
+    /// attempt while crash-looping, DECAYS to the base after healthy uptime, and
+    /// is absolutely capped.
+    #[test]
+    fn resident_restart_delay_caps_and_decays() {
+        // Crash loop (short runs): exponential in attempt.
+        assert_eq!(resident_restart_delay(1_000, 1, 0), 1_000);
+        assert_eq!(resident_restart_delay(1_000, 3, 0), 4_000);
+        // Absolute cap: attempt 16+ on a 1s base would be 9+ hours uncapped.
+        assert_eq!(
+            resident_restart_delay(1_000, 17, 0),
+            RESIDENT_BACKOFF_CAP_MS as i64
+        );
+        assert_eq!(
+            resident_restart_delay(60_000, 30, 0),
+            RESIDENT_BACKOFF_CAP_MS as i64
+        );
+        // Decay: a run healthy past the uptime threshold restarts on the BASE
+        // delay again, no matter how big `attempt` has grown.
+        assert_eq!(
+            resident_restart_delay(1_000, 30, RESIDENT_HEALTHY_UPTIME_MS),
+            1_000
+        );
+    }
+
+    /// [[WEIR-T-0190]] item 6: the LRU eviction keeps the cache at the cap and
+    /// drops the least-recently-used entry.
+    #[test]
+    fn lru_evict_drops_oldest_at_cap() {
+        let mut m: HashMap<String, (u32, std::time::Instant)> = HashMap::new();
+        let base = std::time::Instant::now();
+        for (i, k) in ["a", "b", "c"].iter().enumerate() {
+            m.insert(
+                k.to_string(),
+                (i as u32, base + std::time::Duration::from_millis(i as u64)),
+            );
+        }
+        // Touch "a" so "b" becomes the LRU.
+        m.get_mut("a").unwrap().1 = base + std::time::Duration::from_millis(10);
+        lru_evict(&mut m, 3);
+        assert_eq!(m.len(), 2);
+        assert!(!m.contains_key("b"), "the least-recently-used entry goes");
+        assert!(m.contains_key("a") && m.contains_key("c"));
+        // Under the cap: nothing evicted.
+        lru_evict(&mut m, 3);
+        assert_eq!(m.len(), 2);
+    }
+
+    /// [[WEIR-T-0190]] item 3: a burst of ids is unique (the 20-bit counter is
+    /// nonce-seeded per process; cross-process collisions need the same seed AND
+    /// the same millisecond).
+    #[test]
+    fn next_id_burst_is_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..50_000 {
+            assert!(seen.insert(next_id()), "id collision in a rapid burst");
+        }
     }
 }

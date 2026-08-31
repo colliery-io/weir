@@ -41,7 +41,8 @@ impl Connector for Rest {
                 \"page_size_param\":{\"type\":\"string\",\"title\":\"Page-size query param\"},\
                 \"page_size\":{\"type\":\"integer\",\"title\":\"Page size\"},\
                 \"cursor_field\":{\"type\":\"string\",\"title\":\"Cursor field (blank = full refresh)\"},\
-                \"cursor_param\":{\"type\":\"string\",\"title\":\"Cursor query param\"}}}".to_string(),
+                \"cursor_param\":{\"type\":\"string\",\"title\":\"Cursor query param\"},\
+                \"max_pages\":{\"type\":\"integer\",\"title\":\"Max pages per run (checkpointed; next run resumes)\"}}}".to_string(),
                 // Auth is resolved + injected host-side by the egress policy
                 // ([[WEIR-A-0033]]); the guest declares no auth config and never sees a
                 // credential.
@@ -63,14 +64,36 @@ impl Connector for Rest {
     }
 
     fn read(&self, ctx: ReadContext) -> fidius_guest::Stream<ReadMessage> {
-        let msgs: Vec<ReadMessage> = match fetch_records(&self.cfg, &ctx) {
-            Ok((rows, cursor)) => vec![
-                ReadMessage::Records(RecordBatch::Rows(rows)),
-                ReadMessage::Checkpoint(StreamState { cursor, opaque: Vec::new() }),
-            ],
-            Err(e) => vec![ReadMessage::Fatal(e)],
+        // Streaming read ([[WEIR-T-0184]]): pages are fetched lazily, one per pull,
+        // each followed by a Checkpoint carrying the paginator's resume position in
+        // `StreamState.opaque` — the engine commits per Checkpoint, so a failure at
+        // page N loses only page N and memory is bounded by page size.
+        let c = parse_cfg(&self.cfg);
+        let base_cursor = ctx.state.cursor.clone();
+        let mut pending = std::collections::VecDeque::new();
+        let rs = if ctx.state.opaque.is_empty() {
+            ResumeState::start(0, base_cursor.clone().or_else(|| c.cursor_start.clone()))
+        } else {
+            match serde_json::from_slice::<ResumeState>(&ctx.state.opaque) {
+                Ok(rs) => rs,
+                Err(_) => {
+                    pending.push_back(ReadMessage::Log(LogEntry {
+                        level: LogLevel::Warn,
+                        message: "unrecognized resume state in stream opaque; restarting the read from the committed cursor".to_string(),
+                    }));
+                    ResumeState::start(0, base_cursor.clone().or_else(|| c.cursor_start.clone()))
+                }
+            }
         };
-        fidius_guest::Stream::from_iter(msgs)
+        fidius_guest::Stream::from_iter(ReadIter {
+            c,
+            base_cursor,
+            slices: None,
+            rs,
+            pages_read: 0,
+            pending,
+            finished: false,
+        })
     }
 
     fn write(&self, _ctx: WriteContext, mut batches: fidius_guest::Stream<RecordBatch>) -> WriteOutcome {
@@ -134,6 +157,9 @@ struct RestCfg {
     /// Max retries on a transient failure (429 / 5xx / transport) with exponential backoff
     /// ([[WEIR-T-0069]]); honors `Retry-After`. Default 4.
     max_retries: u32,
+    /// Max pages fetched **per run** ([[WEIR-T-0184]]). Hitting it commits a resumable
+    /// checkpoint + a Warn log; the next run continues from that position. Default 1000.
+    max_pages: u64,
     /// Request options ([[WEIR-T-0068]]): HTTP method (`GET` default | `POST`), a POST body
     /// (config-templated), and static request headers (e.g. `Notion-Version`). Auth headers
     /// are still host-injected ([[WEIR-A-0033]]).
@@ -197,6 +223,7 @@ fn parse_cfg(config: &weir_connector_types::Config) -> RestCfg {
         cursor_end_param: s("cursor_end_param"),
         cursor_end: s("cursor_end").map(|t| render_template(&t, &v)),
         max_retries: v.get("max_retries").and_then(|x| x.as_u64()).unwrap_or(4) as u32,
+        max_pages: v.get("max_pages").and_then(|x| x.as_u64()).unwrap_or(1000),
         http_method: s("http_method").unwrap_or_else(|| "GET".to_string()),
         request_body: s("request_body").map(|t| render_template(&t, &v)),
         page_inject_body: s("page_inject_into").as_deref() == Some("body"),
@@ -349,6 +376,26 @@ fn get_path<'a>(v: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::
     Some(cur)
 }
 
+/// Percent-encode a query VALUE per RFC 3986 (unreserved `A-Za-z0-9-._~` pass
+/// through) — exactly once, at build time ([[WEIR-T-0185]]). Values arrive RAW
+/// (response next-tokens, record cursor fields, config datetimes): an ISO
+/// `+02:00` offset would otherwise land as a space, and a base64 cursor's `+/=`
+/// (or any `&`/`#`) corrupts the query. Param NAMES are author-controlled config
+/// and go verbatim (e.g. `filter[updated]` stays literal). Numeric page/offset/
+/// size params need no encoding; Link-header next URLs are spliced verbatim
+/// (already server-encoded); body-injected params are JSON, not URL, values.
+fn url_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
 /// Exponential backoff for retry `attempt` (0-based): 200ms, 400, 800, … capped at 8s.
 fn backoff_ms(attempt: u32) -> u64 {
     (200u64 << attempt.min(5)).min(8000)
@@ -454,300 +501,487 @@ fn next_link_url(headers: &[(String, String)]) -> Option<String> {
     None
 }
 
-/// Route a read through the partition router (if any), then concatenate the records of
-/// every slice ([[WEIR-T-0064]]): `list` runs one fetch per static value; `substream`
-/// reads the parent stream and runs one fetch per parent `parent_key`; the slice value is
-/// templated into the child path as `{{ stream_partition.* }}`. No router → one flat fetch.
-fn fetch_records(
-    config: &weir_connector_types::Config,
-    ctx: &ReadContext,
-) -> Result<(Vec<String>, Option<String>), ConnectorError> {
-    let c = parse_cfg(config);
-    match c.partition_kind.as_deref() {
-        Some("list") => {
-            let mut rows = Vec::new();
-            let mut cursor = ctx.state.cursor.clone();
-            for val in &c.partition_values {
-                let path = render_partition(&c.path, val);
-                let (r, cur) = fetch_slice(&c, &path, &c.record_path, &cursor)?;
-                rows.extend(r);
-                cursor = cur; // the cursor only advances, so the last slice wins
-            }
-            Ok((rows, cursor))
+/// The paginator's resume position ([[WEIR-T-0184]]), serialized as JSON into
+/// `StreamState.opaque` at every per-page checkpoint. A run that dies mid-pagination
+/// resumes exactly here; the clean-end checkpoint clears it. `req_cursor` snapshots
+/// the incremental cursor this slice's requests are issued with (fixed at slice
+/// start, so every page — and a resumed run — issues the same query shape), while
+/// `cursor_seen` carries the advancing max, published as the committed cursor only
+/// when the read completes.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct ResumeState {
+    v: u32,
+    /// Partition slice index ([[WEIR-T-0064]]); 0 for an unrouted read.
+    slice: usize,
+    /// Next page number to fetch (1-based; also drives the past-page-1 heuristics).
+    page: u64,
+    /// Next row offset (offset pagination).
+    offset: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    page_cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    link_next: Option<String>,
+    /// Header-row data-row counter ([[WEIR-T-0160]]).
+    row_n: u64,
+    /// Header-row field names — carried so a resumed slice doesn't need page 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    header: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    req_cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cursor_seen: Option<String>,
+}
+
+impl ResumeState {
+    /// Fresh position at the start of `slice`, with the incremental cursor the
+    /// slice's requests will carry.
+    fn start(slice: usize, cursor: Option<String>) -> Self {
+        Self {
+            v: 1,
+            slice,
+            page: 1,
+            offset: 0,
+            page_cursor: None,
+            link_next: None,
+            row_n: 0,
+            header: None,
+            req_cursor: cursor.clone(),
+            cursor_seen: cursor,
         }
-        Some("substream") => {
-            let parent_path = c.parent_path.clone().unwrap_or_default();
-            let (parents, _) = fetch_slice(&c, &parent_path, &c.parent_record_path, &None)?;
-            let key = c.parent_key.clone().unwrap_or_else(|| "id".to_string());
-            let mut rows = Vec::new();
-            let mut cursor = ctx.state.cursor.clone();
-            for prow in &parents {
-                let pv: serde_json::Value = match serde_json::from_str(prow) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-                let id = match pv.get(&key) {
-                    Some(serde_json::Value::String(s)) => s.clone(),
-                    Some(other) => other.to_string(),
-                    None => continue,
-                };
-                let path = render_partition(&c.path, &id);
-                let (r, cur) = fetch_slice(&c, &path, &c.record_path, &cursor)?;
-                rows.extend(r);
-                cursor = cur;
-            }
-            Ok((rows, cursor))
-        }
-        _ => fetch_slice(&c, &c.path, &c.record_path, &ctx.state.cursor),
     }
 }
 
-/// Fetch one slice: GET `base_url+path` (with optional page/cursor query params), extract
-/// the records array at `record_path`, emit each record **whole** (the engine's mapping
-/// stage shapes them), paginating while a pagination param is set. Returns the rows + the
-/// advanced incremental cursor.
-fn fetch_slice(
+/// The streaming read driver ([[WEIR-T-0184]]): an iterator the host pulls one
+/// message at a time — each step fetches ONE page and yields `Records` +
+/// `Checkpoint`, so the engine commits progress per page. Hitting `max_pages`
+/// stops LOUDLY (Warn log) at a committed, resumable checkpoint.
+struct ReadIter {
+    c: RestCfg,
+    /// The committed cursor as of read start: mid-run checkpoints re-publish it
+    /// (with the resume position in `opaque`), so a lost/cleared `opaque` can only
+    /// re-read — never skip.
+    base_cursor: Option<String>,
+    /// Resolved slice paths (partition router, [[WEIR-T-0064]]); `None` until the
+    /// first step — resolving substream parents fetches the parent stream.
+    slices: Option<Vec<String>>,
+    rs: ResumeState,
+    /// Pages fetched by THIS run (`max_pages` is per run, so resumed chunked reads
+    /// make full progress across runs).
+    pages_read: u64,
+    pending: std::collections::VecDeque<ReadMessage>,
+    finished: bool,
+}
+
+impl Iterator for ReadIter {
+    type Item = ReadMessage;
+    fn next(&mut self) -> Option<ReadMessage> {
+        loop {
+            if let Some(m) = self.pending.pop_front() {
+                return Some(m);
+            }
+            if self.finished {
+                return None;
+            }
+            self.step();
+        }
+    }
+}
+
+impl ReadIter {
+    /// Mid-run checkpoint: the safe base cursor + the resume position in `opaque`.
+    fn checkpoint(&self) -> ReadMessage {
+        let opaque = serde_json::to_vec(&self.rs).unwrap_or_default();
+        ReadMessage::Checkpoint(StreamState { cursor: self.base_cursor.clone(), opaque })
+    }
+
+    /// Clean end: publish the advanced incremental cursor, clear the resume position.
+    fn finish_clean(&mut self) {
+        let cursor = self.rs.cursor_seen.clone().or_else(|| self.base_cursor.clone());
+        self.pending
+            .push_back(ReadMessage::Checkpoint(StreamState { cursor, opaque: Vec::new() }));
+        self.finished = true;
+    }
+
+    /// Resolve the partition router into child slice paths ([[WEIR-T-0064]]): `list`
+    /// = one per static value; `substream` = one per parent `parent_key` (parents
+    /// are (re-)fetched whole — parent lists are small, and a resumed run needs the
+    /// same slice indexing; parent-set drift between attempts is inherent). No
+    /// router → the one configured path.
+    fn resolve_slices(&self) -> Result<Vec<String>, ConnectorError> {
+        match self.c.partition_kind.as_deref() {
+            Some("list") => Ok(self
+                .c
+                .partition_values
+                .iter()
+                .map(|val| render_partition(&self.c.path, val))
+                .collect()),
+            Some("substream") => {
+                let parent_path = self.c.parent_path.clone().unwrap_or_default();
+                let parents = fetch_all(&self.c, &parent_path, &self.c.parent_record_path)?;
+                let key = self.c.parent_key.clone().unwrap_or_else(|| "id".to_string());
+                let mut paths = Vec::new();
+                for prow in &parents {
+                    let Ok(pv) = serde_json::from_str::<serde_json::Value>(prow) else {
+                        continue;
+                    };
+                    let id = match pv.get(&key) {
+                        Some(serde_json::Value::String(s)) => s.clone(),
+                        Some(other) => other.to_string(),
+                        None => continue,
+                    };
+                    paths.push(render_partition(&self.c.path, &id));
+                }
+                Ok(paths)
+            }
+            _ => Ok(vec![self.c.path.clone()]),
+        }
+    }
+
+    /// One driver step: fetch the next page of the current slice, queue its
+    /// `Records` + the follow-up `Checkpoint`, and advance slice/finish state.
+    fn step(&mut self) {
+        if self.slices.is_none() {
+            match self.resolve_slices() {
+                Ok(paths) => {
+                    if self.rs.slice >= paths.len() {
+                        // Nothing (left) to read — an empty partition list, or a
+                        // resumed slice index past a drifted parent set.
+                        self.finish_clean();
+                        return;
+                    }
+                    self.slices = Some(paths);
+                }
+                Err(e) => {
+                    self.pending.push_back(ReadMessage::Fatal(e));
+                    self.finished = true;
+                    return;
+                }
+            }
+        }
+        let path = self.slices.as_ref().expect("resolved above")[self.rs.slice].clone();
+        match fetch_page(&self.c, &path, &self.c.record_path, &mut self.rs) {
+            Ok((rows, more)) => {
+                self.pages_read += 1;
+                if !rows.is_empty() {
+                    self.pending.push_back(ReadMessage::Records(RecordBatch::Rows(rows)));
+                }
+                if more && self.pages_read >= self.c.max_pages {
+                    // Loud, resumable stop — never a silent cap: the checkpoint
+                    // commits this position and the next run continues from it.
+                    self.pending.push_back(self.checkpoint());
+                    self.pending.push_back(ReadMessage::Log(LogEntry {
+                        level: LogLevel::Warn,
+                        message: format!(
+                            "max_pages={} reached mid-read; progress is checkpointed — the next run resumes from page {}",
+                            self.c.max_pages, self.rs.page
+                        ),
+                    }));
+                    self.finished = true;
+                } else if more {
+                    self.pending.push_back(self.checkpoint());
+                } else {
+                    // Slice exhausted → next slice (the running cursor carries over,
+                    // matching the pre-streaming behavior) or clean end.
+                    let nslices = self.slices.as_ref().map(Vec::len).unwrap_or(0);
+                    self.rs = ResumeState::start(self.rs.slice + 1, self.rs.cursor_seen.clone());
+                    if self.rs.slice >= nslices {
+                        self.finish_clean();
+                    } else {
+                        self.pending.push_back(self.checkpoint());
+                    }
+                }
+            }
+            Err(e) => {
+                self.pending.push_back(ReadMessage::Fatal(e));
+                self.finished = true;
+            }
+        }
+    }
+}
+
+/// Buffered fetch of a whole (paginated) stream — used only for substream PARENT
+/// records, whose ids define the child slices. Bounded by `max_pages`.
+fn fetch_all(
     c: &RestCfg,
     path: &str,
     record_path: &[String],
-    cursor_in: &Option<String>,
-) -> Result<(Vec<String>, Option<String>), ConnectorError> {
-    let mut rows: Vec<String> = Vec::new();
-    // First run (no state) starts from the configured lower bound, if any.
-    let mut cursor = cursor_in.clone().or_else(|| c.cursor_start.clone());
-    let mut page: u64 = 1;
-    let mut offset: u64 = 0;
-    let mut page_cursor: Option<String> = None;
-    let mut link_next: Option<String> = None;
-    // Header-row shape ([[WEIR-T-0160]]): the first row of this slice is the header
-    // (held across pages); `_row` numbers the data rows.
-    let mut header: Option<Vec<String>> = None;
-    let mut row_n: u64 = 0;
-    const MAX_PAGES: u64 = 1000;
+) -> Result<Vec<String>, ConnectorError> {
+    let mut rs = ResumeState::start(0, c.cursor_start.clone());
+    let mut rows = Vec::new();
+    let mut pages: u64 = 0;
     loop {
-        // Params split between the query string and the JSON body ([[WEIR-T-0154]]):
-        // body-injected param names are dot-paths overlaid onto `request_body` per page.
-        let mut body_params: Vec<(String, serde_json::Value)> = Vec::new();
-        // A Link-header page carries an absolute next URL; otherwise build base_url+path+query.
-        let url = if let Some(u) = link_next.take() {
-            u
-        } else {
-            let mut url = format!("{}{}", c.base_url, path);
-            let mut q: Vec<String> = Vec::new();
-            if let Some(p) = &c.page_param {
-                if c.page_inject_body {
-                    body_params.push((p.clone(), page.into()));
-                } else {
-                    q.push(format!("{p}={page}"));
-                }
-            }
-            if let Some(p) = &c.offset_param {
-                if c.page_inject_body {
-                    body_params.push((p.clone(), offset.into()));
-                } else {
-                    q.push(format!("{p}={offset}"));
-                }
-            }
-            if let (Some(p), Some(tok)) = (&c.page_cursor_param, &page_cursor) {
-                if c.page_inject_body {
-                    body_params.push((p.clone(), tok.clone().into()));
-                } else {
-                    q.push(format!("{p}={tok}"));
-                }
-            }
-            if let (Some(p), Some(sz)) = (&c.page_size_param, c.page_size) {
-                if c.page_inject_body {
-                    body_params.push((p.clone(), sz.into()));
-                } else {
-                    q.push(format!("{p}={sz}"));
-                }
-            }
-            if let (Some(p), Some(cur)) = (&c.cursor_param, &cursor) {
-                if c.cursor_inject_body {
-                    body_params.push((p.clone(), cur.clone().into()));
-                } else {
-                    q.push(format!("{p}={cur}"));
-                }
-            }
-            if let (Some(p), Some(e)) = (&c.cursor_end_param, &c.cursor_end) {
-                if c.cursor_inject_body {
-                    body_params.push((p.clone(), e.clone().into()));
-                } else {
-                    q.push(format!("{p}={e}"));
-                }
-            }
-            if !q.is_empty() {
-                url.push('?');
-                url.push_str(&q.join("&"));
-            }
-            url
-        };
-
-        // POST body: the (config-templated) `request_body`, overlaid with body-injected
-        // params at their dot-paths ([[WEIR-T-0154]]) — rebuilt per page as they advance.
-        // Injected params imply POST even if `http_method` was left unset.
-        let body = if body_params.is_empty() {
-            c.http_method
-                .eq_ignore_ascii_case("POST")
-                .then(|| c.request_body.clone().unwrap_or_default())
-        } else {
-            let mut v: serde_json::Value = c
-                .request_body
-                .as_deref()
-                .and_then(|b| serde_json::from_str(b).ok())
-                .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
-            for (path, val) in body_params {
-                set_json_path(&mut v, &path, val);
-            }
-            Some(v.to_string())
-        };
-
-        // Auth is injected host-side by the egress policy ([[WEIR-A-0033]]); the guest
-        // sends a plain request. Transient failures (429 / 5xx / transport) retry with
-        // exponential backoff, honoring `Retry-After` ([[WEIR-T-0069]]).
-        let resp = send_with_retry(c, &url, body.as_deref())?;
-        let body = resp.text();
-        // Past page 1, a non-JSON body is end-of-data: paginated APIs often answer one
-        // page beyond the last with a 404 whose body is an HTML/empty error page.
-        let val: serde_json::Value = match serde_json::from_str(&body) {
-            Ok(v) => v,
-            Err(_) if page > 1 => break,
-            Err(e) => return Err(ConnectorError::fatal(format!("invalid JSON response: {e}"))),
-        };
-        // Past page 1, a missing record_path / non-array body is end-of-data: many
-        // paginated APIs return a 404 error object (e.g. `{"error": "..."}`) one page
-        // beyond the last instead of an empty array. On page 1 it's a real config error.
-        let node = match navigate(&val, record_path) {
-            Some(n) => n,
-            None if page > 1 => break,
-            None => {
-                return Err(ConnectorError::fatal(format!(
-                    "record_path {record_path:?} not found in response"
-                )))
-            }
-        };
-        let records: Vec<&serde_json::Value> = match node {
-            serde_json::Value::Array(a) => a.iter().collect(),
-            // A single-object resource (e.g. xkcd `/info.0.json`) — emit it as one record.
-            serde_json::Value::Object(_) if page == 1 => vec![node],
-            // Past page 1, a non-array body is end-of-data (a terminal error/empty page).
-            _ if page > 1 => break,
-            _ => {
-                return Err(ConnectorError::fatal(
-                    "record_path did not resolve to a JSON array or object",
-                ))
-            }
-        };
-        if records.is_empty() {
-            break;
-        }
-        let n = records.len() as u64;
-        // Stripe-style ([[WEIR-T-0168]]): the next-page token is a field of the LAST
-        // record on the page — capture it before the loop consumes `records`.
-        let last_record_cursor = c.page_cursor_record_field.as_ref().and_then(|f| {
-            records.last().and_then(|r| get_path(r, f)).map(|v| {
-                v.as_str()
-                    .map(str::to_string)
-                    .unwrap_or_else(|| v.to_string())
-            })
-        });
-        for rec in records {
-            // Header-row zip ([[WEIR-T-0160]]): first row-array = the field names;
-            // later row-arrays become objects (ragged rows pad with null) + `_row`.
-            if c.header_row {
-                let Some(cells) = rec.as_array() else { continue };
-                let Some(hdr) = &header else {
-                    header = Some(
-                        cells
-                            .iter()
-                            .enumerate()
-                            .map(|(i, cell)| header_name(cell, i))
-                            .collect(),
-                    );
-                    continue;
-                };
-                row_n += 1;
-                let mut obj = serde_json::Map::new();
-                obj.insert("_row".to_string(), row_n.into());
-                for (i, name) in hdr.iter().enumerate() {
-                    obj.insert(
-                        name.clone(),
-                        cells.get(i).cloned().unwrap_or(serde_json::Value::Null),
-                    );
-                }
-                rows.push(serde_json::Value::Object(obj).to_string());
-                continue;
-            }
-            if let Some(cf) = &c.cursor_field {
-                // Columnar responses carry the cursor nested ([[WEIR-T-0159]]) — read it
-                // at `cursor_value_path` when set, else at the flat `cursor_field`.
-                let cv = match &c.cursor_value_path {
-                    Some(path) => get_path(rec, path),
-                    None => rec.get(cf),
-                };
-                if let Some(cv) = cv {
-                    let cs = cv.as_str().map(str::to_string).unwrap_or_else(|| cv.to_string());
-                    if cursor.as_deref().map_or(true, |cur| cs.as_str() > cur) {
-                        cursor = Some(cs);
-                    }
-                }
-            }
-            rows.push(rec.to_string());
-        }
-        // Link-header pagination ([[WEIR-T-0070]]): follow `Link: <url>; rel="next"` from the
-        // response headers until it's absent (GitHub-style). The next URL is absolute.
-        if c.page_link_header {
-            match next_link_url(&resp.headers) {
-                Some(u) => {
-                    link_next = Some(u);
-                    page += 1;
-                    if page > MAX_PAGES {
-                        break;
-                    }
-                    continue;
-                }
-                None => break,
-            }
-        }
-        // has_more-style stop ([[WEIR-T-0168]]): a false at the configured response path
-        // is the last page — stop now instead of wasting an empty-page request.
-        if !c.page_stop_on_false_path.is_empty()
-            && navigate(&val, &c.page_stop_on_false_path).and_then(|x| x.as_bool()) == Some(false)
-        {
-            break;
-        }
-        // Advance: opaque cursor (`?cursor=<token>` from the response or the last record),
-        // page-increment (`?page=N`), or offset (`?offset=N`, by page_size).
-        let cursor_paginating =
-            !c.page_cursor_path.is_empty() || c.page_cursor_record_field.is_some();
-        if c.page_param.is_none() && c.offset_param.is_none() && !cursor_paginating {
-            break; // no pagination → single request
-        }
-        if cursor_paginating {
-            // Next-page token: the response path when configured, else the captured
-            // last-record field ([[WEIR-T-0168]]); absent/empty → last page.
-            let tok = if !c.page_cursor_path.is_empty() {
-                navigate(&val, &c.page_cursor_path)
-                    .and_then(|x| x.as_str())
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string)
-            } else {
-                last_record_cursor.clone().filter(|s| !s.is_empty())
-            };
-            match tok {
-                Some(tok) => page_cursor = Some(tok),
-                None => break,
-            }
-        } else if let Some(sz) = c.page_size {
-            if n < sz {
-                break; // short page → last page
-            }
-        }
-        page += 1;
-        offset += c.page_size.unwrap_or(n);
-        if page > MAX_PAGES {
-            break;
+        let (r, more) = fetch_page(c, path, record_path, &mut rs)?;
+        rows.extend(r);
+        pages += 1;
+        if !more || pages >= c.max_pages {
+            return Ok(rows);
         }
     }
-    Ok((rows, cursor))
+}
+
+/// Fetch ONE page of a slice ([[WEIR-T-0184]]): build the request from the resume
+/// position in `rs`, send it, extract the page's records **whole** (the engine's
+/// mapping stage shapes them), and advance `rs`. Returns the page's rows + whether
+/// the slice has more pages. The incremental cursor param is `rs.req_cursor` —
+/// snapshotted at slice start, so every page (and a resumed run) issues the same
+/// query shape; the advancing max lands in `rs.cursor_seen`.
+fn fetch_page(
+    c: &RestCfg,
+    path: &str,
+    record_path: &[String],
+    rs: &mut ResumeState,
+) -> Result<(Vec<String>, bool), ConnectorError> {
+    // Params split between the query string and the JSON body ([[WEIR-T-0154]]):
+    // body-injected param names are dot-paths overlaid onto `request_body` per page.
+    let mut body_params: Vec<(String, serde_json::Value)> = Vec::new();
+    // A Link-header page carries an absolute next URL; otherwise build base_url+path+query.
+    let url = if let Some(u) = rs.link_next.take() {
+        u
+    } else {
+        let mut url = format!("{}{}", c.base_url, path);
+        let mut q: Vec<String> = Vec::new();
+        if let Some(p) = &c.page_param {
+            if c.page_inject_body {
+                body_params.push((p.clone(), rs.page.into()));
+            } else {
+                q.push(format!("{p}={}", rs.page));
+            }
+        }
+        if let Some(p) = &c.offset_param {
+            if c.page_inject_body {
+                body_params.push((p.clone(), rs.offset.into()));
+            } else {
+                q.push(format!("{p}={}", rs.offset));
+            }
+        }
+        if let (Some(p), Some(tok)) = (&c.page_cursor_param, &rs.page_cursor) {
+            if c.page_inject_body {
+                body_params.push((p.clone(), tok.clone().into()));
+            } else {
+                q.push(format!("{p}={}", url_encode(tok)));
+            }
+        }
+        if let (Some(p), Some(sz)) = (&c.page_size_param, c.page_size) {
+            if c.page_inject_body {
+                body_params.push((p.clone(), sz.into()));
+            } else {
+                q.push(format!("{p}={sz}"));
+            }
+        }
+        if let (Some(p), Some(cur)) = (&c.cursor_param, &rs.req_cursor) {
+            if c.cursor_inject_body {
+                body_params.push((p.clone(), cur.clone().into()));
+            } else {
+                q.push(format!("{p}={}", url_encode(cur)));
+            }
+        }
+        if let (Some(p), Some(e)) = (&c.cursor_end_param, &c.cursor_end) {
+            if c.cursor_inject_body {
+                body_params.push((p.clone(), e.clone().into()));
+            } else {
+                q.push(format!("{p}={}", url_encode(e)));
+            }
+        }
+        if !q.is_empty() {
+            url.push('?');
+            url.push_str(&q.join("&"));
+        }
+        url
+    };
+
+    // POST body: the (config-templated) `request_body`, overlaid with body-injected
+    // params at their dot-paths ([[WEIR-T-0154]]) — rebuilt per page as they advance.
+    // Injected params imply POST even if `http_method` was left unset.
+    let body = if body_params.is_empty() {
+        c.http_method
+            .eq_ignore_ascii_case("POST")
+            .then(|| c.request_body.clone().unwrap_or_default())
+    } else {
+        let mut v: serde_json::Value = c
+            .request_body
+            .as_deref()
+            .and_then(|b| serde_json::from_str(b).ok())
+            .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+        for (path, val) in body_params {
+            set_json_path(&mut v, &path, val);
+        }
+        Some(v.to_string())
+    };
+
+    // Auth is injected host-side by the egress policy ([[WEIR-A-0033]]); the guest
+    // sends a plain request. Transient failures (429 / 5xx / transport) retry with
+    // exponential backoff, honoring `Retry-After` ([[WEIR-T-0069]]).
+    let resp = send_with_retry(c, &url, body.as_deref())?;
+    // Status-aware end-of-data ([[WEIR-T-0186]]): an error page must NEVER read as a
+    // clean end — a mid-pagination auth expiry would otherwise end the run
+    // "successfully" with partial data. Failing here is cheap: prior pages are
+    // committed per checkpoint ([[WEIR-T-0184]]) and the retry resumes from them.
+    // The one sanctioned non-2xx stop: a 404 PAST page 1 is how page-probing APIs
+    // signal one-past-the-end (the same URL shape already succeeded, so it cannot
+    // be a config error). 429/5xx never reach here — `send_with_retry` retries them
+    // and errors transient on exhaustion.
+    if !(200..=299).contains(&resp.status) {
+        if resp.status == 404 && rs.page > 1 {
+            return Ok((Vec::new(), false));
+        }
+        if resp.status == 401 {
+            // Likely an expired host-side credential — transient, so the worker's
+            // run-level retry re-resolves the credential and resumes from the last
+            // committed page.
+            return Err(ConnectorError::transient(format!(
+                "HTTP 401 at page {} of {url} (credential likely expired mid-run)",
+                rs.page
+            )));
+        }
+        return Err(ConnectorError::fatal(format!(
+            "HTTP {} at page {} of {url}",
+            resp.status, rs.page
+        )));
+    }
+    let body = resp.text();
+    // A 2xx with an EMPTY body past page 1 is end-of-data (some APIs answer the
+    // one-past-the-end probe with 200 and no body); any other unparseable 2xx body
+    // is a real error at ANY page ([[WEIR-T-0186]]).
+    let val: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(_) if body.trim().is_empty() && rs.page > 1 => return Ok((Vec::new(), false)),
+        Err(e) => return Err(ConnectorError::fatal(format!("invalid JSON response: {e}"))),
+    };
+    // Past page 1, a missing record_path / non-array body is end-of-data: some APIs
+    // answer the one-past-the-end probe with a **200** error object (e.g.
+    // `{"error": "..."}`) instead of an empty array — real error statuses are
+    // already handled by the gate above. On page 1 it's a real config error.
+    let node = match navigate(&val, record_path) {
+        Some(n) => n,
+        None if rs.page > 1 => return Ok((Vec::new(), false)),
+        None => {
+            return Err(ConnectorError::fatal(format!(
+                "record_path {record_path:?} not found in response"
+            )))
+        }
+    };
+    let records: Vec<&serde_json::Value> = match node {
+        serde_json::Value::Array(a) => a.iter().collect(),
+        // A single-object resource (e.g. xkcd `/info.0.json`) — emit it as one record.
+        serde_json::Value::Object(_) if rs.page == 1 => vec![node],
+        // Past page 1, a non-array body is end-of-data (a terminal error/empty page).
+        _ if rs.page > 1 => return Ok((Vec::new(), false)),
+        _ => {
+            return Err(ConnectorError::fatal(
+                "record_path did not resolve to a JSON array or object",
+            ))
+        }
+    };
+    if records.is_empty() {
+        return Ok((Vec::new(), false));
+    }
+    let n = records.len() as u64;
+    // Stripe-style ([[WEIR-T-0168]]): the next-page token is a field of the LAST
+    // record on the page — capture it before the loop consumes `records`.
+    let last_record_cursor = c.page_cursor_record_field.as_ref().and_then(|f| {
+        records.last().and_then(|r| get_path(r, f)).map(|v| {
+            v.as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| v.to_string())
+        })
+    });
+    let mut rows: Vec<String> = Vec::new();
+    for rec in records {
+        // Header-row zip ([[WEIR-T-0160]]): first row-array = the field names (held in
+        // `rs` across pages AND resumes); later row-arrays become objects (ragged rows
+        // pad with null) + `_row`.
+        if c.header_row {
+            let Some(cells) = rec.as_array() else { continue };
+            let Some(hdr) = &rs.header else {
+                rs.header = Some(
+                    cells
+                        .iter()
+                        .enumerate()
+                        .map(|(i, cell)| header_name(cell, i))
+                        .collect(),
+                );
+                continue;
+            };
+            rs.row_n += 1;
+            let mut obj = serde_json::Map::new();
+            obj.insert("_row".to_string(), rs.row_n.into());
+            for (i, name) in hdr.iter().enumerate() {
+                obj.insert(
+                    name.clone(),
+                    cells.get(i).cloned().unwrap_or(serde_json::Value::Null),
+                );
+            }
+            rows.push(serde_json::Value::Object(obj).to_string());
+            continue;
+        }
+        if let Some(cf) = &c.cursor_field {
+            // Columnar responses carry the cursor nested ([[WEIR-T-0159]]) — read it
+            // at `cursor_value_path` when set, else at the flat `cursor_field`.
+            let cv = match &c.cursor_value_path {
+                Some(path) => get_path(rec, path),
+                None => rec.get(cf),
+            };
+            if let Some(cv) = cv {
+                let cs = cv.as_str().map(str::to_string).unwrap_or_else(|| cv.to_string());
+                // Numeric-aware max ([[WEIR-T-0187]]): `"9" > "12"` lexicographically.
+                if rs
+                    .cursor_seen
+                    .as_deref()
+                    .map_or(true, |cur| weir_connector_types::cursor_cmp(&cs, cur).is_gt())
+                {
+                    rs.cursor_seen = Some(cs);
+                }
+            }
+        }
+        rows.push(rec.to_string());
+    }
+    // Link-header pagination ([[WEIR-T-0070]]): follow `Link: <url>; rel="next"` from the
+    // response headers until it's absent (GitHub-style). The next URL is absolute.
+    if c.page_link_header {
+        return match next_link_url(&resp.headers) {
+            Some(u) => {
+                rs.link_next = Some(u);
+                rs.page += 1;
+                Ok((rows, true))
+            }
+            None => Ok((rows, false)),
+        };
+    }
+    // has_more-style stop ([[WEIR-T-0168]]): a false at the configured response path
+    // is the last page — stop now instead of wasting an empty-page request.
+    if !c.page_stop_on_false_path.is_empty()
+        && navigate(&val, &c.page_stop_on_false_path).and_then(|x| x.as_bool()) == Some(false)
+    {
+        return Ok((rows, false));
+    }
+    // Advance: opaque cursor (`?cursor=<token>` from the response or the last record),
+    // page-increment (`?page=N`), or offset (`?offset=N`, by page_size).
+    let cursor_paginating =
+        !c.page_cursor_path.is_empty() || c.page_cursor_record_field.is_some();
+    if c.page_param.is_none() && c.offset_param.is_none() && !cursor_paginating {
+        return Ok((rows, false)); // no pagination → single request
+    }
+    if cursor_paginating {
+        // Next-page token: the response path when configured, else the captured
+        // last-record field ([[WEIR-T-0168]]); absent/empty → last page.
+        let tok = if !c.page_cursor_path.is_empty() {
+            navigate(&val, &c.page_cursor_path)
+                .and_then(|x| x.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        } else {
+            last_record_cursor.filter(|s| !s.is_empty())
+        };
+        match tok {
+            Some(tok) => rs.page_cursor = Some(tok),
+            None => return Ok((rows, false)),
+        }
+    } else if let Some(sz) = c.page_size {
+        if n < sz {
+            return Ok((rows, false)); // short page → last page
+        }
+    }
+    rs.page += 1;
+    rs.offset += c.page_size.unwrap_or(n);
+    Ok((rows, true))
 }

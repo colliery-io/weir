@@ -70,10 +70,14 @@ impl Mssql {
                 let mut next = cursor;
                 let mut rows = Vec::with_capacity(arr.len());
                 for v in &arr {
-                    // Rows arrive ordered by the cursor; advance to the max seen.
+                    // Rows arrive ordered by the cursor; advance to the max seen —
+                    // numeric-aware ([[WEIR-T-0187]]): `"9" > "12"` lexicographically.
                     if let Some(cv) = v.get(cf) {
                         let cs = cv.as_str().map(str::to_string).unwrap_or_else(|| cv.to_string());
-                        if next.as_deref().map_or(true, |cur| cs.as_str() > cur) {
+                        if next
+                            .as_deref()
+                            .map_or(true, |cur| weir_connector_types::cursor_cmp(&cs, cur).is_gt())
+                        {
                             next = Some(cs);
                         }
                     }

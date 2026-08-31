@@ -496,13 +496,16 @@ fn fetch_records(
     }
     let rows = sql::rows_to_objects(&names, &arrays);
 
-    // Advance the incremental cursor to the max seen (values arrive as strings).
+    // Advance the incremental cursor to the max seen (values arrive as strings) —
+    // numeric-aware ([[WEIR-T-0187]]): `"9" > "12"` lexicographically.
     if let Some(col) = &cursor_col {
         let key = col.to_lowercase();
         for row in &rows {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(row)
                 && let Some(cv) = v.get(&key).and_then(|x| x.as_str())
-                && cursor.as_deref().is_none_or(|cur| cv > cur)
+                && cursor
+                    .as_deref()
+                    .is_none_or(|cur| weir_connector_types::cursor_cmp(cv, cur).is_gt())
             {
                 cursor = Some(cv.to_string());
             }

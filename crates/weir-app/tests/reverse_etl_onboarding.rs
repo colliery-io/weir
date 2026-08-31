@@ -9,9 +9,12 @@ use weir_app::{App, Connection, DEFAULT_TENANT, Origin, connector_ref, plugin_na
 #[test]
 fn dest_manifest_discovers_registers_and_bakes_into_a_connection() {
     let dest_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../dest-manifests");
-    // SAFETY: set before the app reads the dir; scopes discovery to the repo's dest manifests.
+    // SAFETY: set before the app reads the dirs; scopes discovery to the repo's dest
+    // manifests, and stages the wasm fixtures so `connector_ref("slow")` passes the
+    // creation-time existence gate ([[WEIR-T-0166]]) regardless of ambient env.
     unsafe {
         std::env::set_var("WEIR_DEST_MANIFESTS_DIR", &dest_dir);
+        std::env::set_var("WEIR_CONNECTORS_DIR", weir_wasm_testkit::connectors_dir());
     }
 
     let tmp = tempfile::TempDir::new().unwrap();

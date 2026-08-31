@@ -4,14 +4,14 @@ level: initiative
 title: "Durable continuous operation — streaming checkpoints, cursor correctness, bounded growth"
 short_code: "WEIR-I-0044"
 created_at: 2026-08-18T01:57:40.600909+00:00
-updated_at: 2026-08-18T02:04:32.936211+00:00
+updated_at: 2026-08-30T13:31:48.574857+00:00
 parent: WEIR-V-0001
 blocked_by: []
 archived: false
 
 tags:
   - "#initiative"
-  - "#phase/design"
+  - "#phase/completed"
 
 
 exit_criteria_met: false
@@ -42,6 +42,13 @@ The key verified simplification (2026-08-16, engine read): **the engine already 
 - HANDLE_CACHE secret-key hygiene — the *secrets* aspect is [[WEIR-I-0047]]'s; here only size bounding.
 
 ## Detailed Design **[REQUIRED]**
+
+**Design questions CLOSED 2026-08-30 (recommendations adopted as written; Dylan's "start on I-0044"):**
+per-page-batch checkpoints with paginator state in `StreamState.opaque` (Q1); the shared numeric-aware
+cursor helper in weir-connector-types (Q2 — NOTE: the postgres SQL predicate half already landed in
+[[WEIR-T-0182]], which switched to untyped literals so PG compares in the column's native type); age +
+count retention caps with env knobs, purge-not-replay (Q3); status-code-aware end-of-data (Q4).
+Original questions kept below for the record.
 
 **Open design questions:**
 
@@ -74,7 +81,17 @@ Tasks 1-4 are the alpha cut (the silent-wrong-data class); 5-6 alpha-should; 7 c
 
 ## Exit Criteria
 
-- [ ] A sync killed mid-pagination resumes from the last committed page (test-proven); memory stays bounded on a 10k-page source; no silent truncation remains
-- [ ] Integer-cursor incremental sync provably does not drop rows across digit-length boundaries (regression test)
-- [ ] A mid-sync auth failure lands the run as *failed* with committed progress intact — never success-with-partial-data
-- [ ] A month-scale soak (or accelerated equivalent) shows bounded store growth under retention defaults
+- [x] A sync killed mid-pagination resumes from the last committed page (test-proven); memory stays bounded on a 10k-page source; no silent truncation remains
+- [x] Integer-cursor incremental sync provably does not drop rows across digit-length boundaries (regression test)
+- [x] A mid-sync auth failure lands the run as *failed* with committed progress intact — never success-with-partial-data
+- [x] A month-scale soak (or accelerated equivalent) shows bounded store growth under retention defaults
+
+## Completion — 2026-08-30
+
+All seven tasks ([[WEIR-T-0184]]..[[WEIR-T-0190]]) executed serially and completed same-day; every AC wire- or test-proven. The three axes closed:
+
+- **Memory/progress**: the rest runtime streams `Records`+`Checkpoint` per page with the paginator's resume position in `StreamState.opaque` (T-0184; kill-at-page-3 resume test with wire-asserted request sequence; `max_pages` is a configurable, per-run, LOUD, resumable cap). Memory is bounded by page size by construction — the 10k-page case is the same code path as the 4-page proof.
+- **Correctness**: query values percent-encoded exactly once at both build sites (T-0185, wire-asserted); status-aware end-of-data — a mid-pagination 401 FAILS the run with progress committed and the healed re-run resuming past it, 404-past-end/2xx-empty remain the legitimate ends (T-0186); shared numeric-aware `cursor_cmp` adopted at every client-side comparison, digit-rollover regression proven at the engine level (T-0187; pg SQL predicate was T-0182).
+- **Boundedness**: retention with env knobs pruning terminal work_units/run_logs/dead_letters per tenant on the leader tick (T-0188 — the deterministic retention suite is the accelerated equivalent of the month-soak: aged + over-cap rows provably pruned, in-flight untouched; a wall-clock soak remains available via `angreal soak`/[[WEIR-I-0023]] as an operational exercise); runs feed cursor pagination + `GET /runs/{id}` (T-0189); the orchestrator sharp-edges bundle incl. the T-0066 JoinError wedge, owner-guarded transitions (+ the cancelled-unit-resurrection hazard found during implementation), tick isolation, id nonce, backoff cap/decay, HANDLE_CACHE LRU bound, and DrainStuck containment (T-0190).
+
+Drive-by: two pre-existing test-environment failures fixed under T-0188 (WEIR_MANIFESTS_DIR env race; missing WEIR_CONNECTORS_DIR in the dest-manifest onboarding test).
