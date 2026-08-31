@@ -34,7 +34,7 @@ Admins can address any tenant explicitly via the mirrored `/tenants/{id}/…` ro
 | --- | --- |
 | **Connections** | `GET /connections`, `POST /connections`, `GET/DELETE /connections/{name}`, `POST /connections/{name}/run`, `GET /connections/{name}/{runs,dead-letters,logs,state,schema}`, `POST /connections/{name}/schema/accept` |
 | **Catalog** | `GET /catalog`, `GET /catalog/available`, `POST /catalog/{import,preview}`, `DELETE /catalog/{name}/{version}`, `GET/POST /connectors/{plugin}/{spec,discover}` |
-| **Ops / health** | `GET /runs`, `GET /overview`, `GET /platform/health` (admin), `GET /metrics` (Prometheus, public), `GET /health` (public) |
+| **Ops / health** | `GET /runs` (`?limit=&before=` — cursor pagination: pass the smallest `id` of the previous page as `before` to walk history), `GET /runs/{id}` (single run + log tail), `GET /overview`, `GET /platform/health` (admin), `GET /metrics` (Prometheus, public), `GET /health` (public) |
 | **Tenants** (admin) | `GET/POST /tenants`, `DELETE /tenants/{id}`, `GET/POST /tenants/{id}/keys`, `DELETE /tenants/{id}/keys/{kid}`, the `/tenants/{id}/…` mirror |
 | **Auth** | `GET /auth/me`, `GET /auth/{login,callback,logout}` |
 

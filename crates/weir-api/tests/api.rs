@@ -183,6 +183,53 @@ async fn failed_run_surfaces_error_and_dead_letters() {
         boom["error"]
     );
 
+    // GET /runs/{id} ([[WEIR-T-0189]]): full detail for a real run, 404 for an
+    // unknown id; ?limit caps the feed page.
+    let boom_id = boom["id"].as_i64().unwrap();
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::get(format!("/runs/{boom_id}"))
+                .header("authorization", token.as_str())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let detail = json(resp).await;
+    assert_eq!(detail["id"].as_i64(), Some(boom_id));
+    assert_eq!(detail["state"], "failed");
+    assert_eq!(detail["connection"], "boom");
+    assert!(detail["logs"].is_array(), "detail carries a run-log tail");
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::get("/runs/999999999")
+                .header("authorization", token.as_str())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::get("/runs?limit=1")
+                .header("authorization", token.as_str())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let one = json(resp).await;
+    assert_eq!(
+        one.as_array().map(Vec::len),
+        Some(1),
+        "?limit=1 caps the feed page"
+    );
+
     // The dead-letter endpoint returns the rejected record + reason.
     let resp = router
         .oneshot(

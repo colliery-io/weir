@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use axum::{
     Json, Router,
-    extract::{Path, Request, State},
+    extract::{Path, Query, Request, State},
     http::{StatusCode, Uri, header},
     middleware::Next,
     response::{IntoResponse, Response},
@@ -192,6 +192,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/catalog/preview", post(catalog_preview))
         .route("/catalog/{name}/{version}", delete(catalog_unregister))
         .route("/runs", get(recent))
+        .route("/runs/{id}", get(run_detail))
         // Holistic ops health ([[WEIR-T-0110]] / [[WEIR-I-0024]]) — implicit-tenant per-connection health.
         .route("/overview", get(overview))
         // Tenant administration (platform-admin only — [[WEIR-T-0090]]).
@@ -211,6 +212,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/tenants/{id}/connections/{name}/state", get(t_state))
         .route("/tenants/{id}/catalog", get(t_catalog))
         .route("/tenants/{id}/runs", get(t_recent))
+        .route("/tenants/{id}/runs/{run_id}", get(t_run_detail))
         // Explicit-tenant health (admin cross-tenant) + the platform-wide rollup ([[WEIR-T-0110]]).
         .route("/tenants/{id}/overview", get(t_overview))
         .route("/platform/health", get(platform_overview))
@@ -537,11 +539,44 @@ async fn runs(
     Ok(Json(app.history(tenant_of(&key), &name)?))
 }
 
+/// Runs-feed pagination ([[WEIR-T-0189]]): `limit` (default 50, max 500) and
+/// `before` (an id cursor). Without `before`, the LIVE first page (recent ∪
+/// active). With it, strict id-descending history — pass the smallest `id` of
+/// the previous page to walk further back without dupes or gaps.
+#[derive(serde::Deserialize)]
+struct RunsQuery {
+    limit: Option<i64>,
+    before: Option<i64>,
+}
+
+impl RunsQuery {
+    fn limit(&self) -> i64 {
+        self.limit.unwrap_or(50).clamp(1, 500)
+    }
+}
+
 async fn recent(
     State(app): State<Arc<App>>,
     axum::Extension(key): axum::Extension<AuthenticatedKey>,
+    Query(q): Query<RunsQuery>,
 ) -> Result<Json<Vec<RunRow>>, ApiError> {
-    Ok(Json(app.recent_runs(tenant_of(&key), 50)?))
+    Ok(Json(app.recent_runs_before(
+        tenant_of(&key),
+        q.limit(),
+        q.before,
+    )?))
+}
+
+/// One run by id ([[WEIR-T-0189]]) — full detail + a run-log tail. 404 for an
+/// unknown id or another tenant's run.
+async fn run_detail(
+    State(app): State<Arc<App>>,
+    axum::Extension(key): axum::Extension<AuthenticatedKey>,
+    Path(id): Path<i64>,
+) -> Result<Json<weir_app::RunDetail>, ApiError> {
+    app.run_detail(tenant_of(&key), id)?
+        .map(Json)
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no run `{id}`")))
 }
 
 /// Recent dead-lettered records for a connection — the *what + why* behind the count.
@@ -966,8 +1001,19 @@ async fn t_catalog(
 async fn t_recent(
     State(app): State<Arc<App>>,
     Path(tid): Path<String>,
+    Query(q): Query<RunsQuery>,
 ) -> Result<Json<Vec<RunRow>>, ApiError> {
-    Ok(Json(app.recent_runs(&tid, 50)?))
+    Ok(Json(app.recent_runs_before(&tid, q.limit(), q.before)?))
+}
+
+/// Admin cross-tenant single-run fetch ([[WEIR-T-0189]]).
+async fn t_run_detail(
+    State(app): State<Arc<App>>,
+    Path((tid, run_id)): Path<(String, i64)>,
+) -> Result<Json<weir_app::RunDetail>, ApiError> {
+    app.run_detail(&tid, run_id)?
+        .map(Json)
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no run `{run_id}`")))
 }
 
 /// Maps an [`AppError`] to an HTTP response.

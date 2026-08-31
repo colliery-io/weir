@@ -22,10 +22,32 @@ use weir_connector::{Config, ConfiguredStream, ConnectorRole, MappingSpec, SyncM
 pub use weir_connector::{Field, FieldType, StreamSchema};
 use weir_engine::Store;
 pub use weir_engine::{DeadLetterRecord, LogRecord};
+
+/// One run in full ([[WEIR-T-0189]]): the feed fields plus `stream`, the raw
+/// timestamps, and a recent run-log tail for the run's connection.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RunDetail {
+    pub id: i64,
+    pub connection: String,
+    pub stream: String,
+    pub state: String,
+    pub attempt: i64,
+    pub rows_written: i64,
+    pub dead_lettered: i64,
+    pub started_at: Option<i64>,
+    pub finished_at: Option<i64>,
+    /// Wall-clock duration in ms once finished; `None` while in flight.
+    pub duration_ms: Option<i64>,
+    /// Why the run failed (the connector/engine error), if it did.
+    pub error: Option<String>,
+    /// Recent run logs for the run's connection (run logs are
+    /// connection-scoped, not per-unit), newest last.
+    pub logs: Vec<LogRecord>,
+}
 pub use weir_orchestrator::ScalePolicy;
 use weir_orchestrator::{
-    Clock, ConnectorRef, ExecutionMode, Fleet, InProcessExecutor, Relay, WorkSpec, Worker,
-    WorkerConfig,
+    Clock, ConnectorRef, ExecutionMode, Fleet, InProcessExecutor, Relay, RetentionConfig, WorkSpec,
+    Worker, WorkerConfig,
 };
 pub use weir_orchestrator::{Origin, RunRow, WorkUnitStatus};
 pub use weir_orchestrator::{Scheduler, SystemClock};
@@ -942,12 +964,30 @@ impl App {
     /// Recent runs for `tenant`, newest first (the live feed) — scoped by
     /// `work_units.tenant_id`.
     pub fn recent_runs(&self, tenant: &str, limit: i64) -> Result<Vec<RunRow>, AppError> {
+        self.recent_runs_before(tenant, limit, None)
+    }
+
+    /// The runs feed with cursor pagination ([[WEIR-T-0189]]). `before = None`
+    /// is the LIVE first page (recent window ∪ every active unit, so a running
+    /// resident is never hidden); `before = Some(id)` walks strict id-descending
+    /// history. The next-page cursor is the smallest `id` in the returned page
+    /// (ids are monotonic), so the walk has no dupes and no gaps.
+    pub fn recent_runs_before(
+        &self,
+        tenant: &str,
+        limit: i64,
+        before: Option<i64>,
+    ) -> Result<Vec<RunRow>, AppError> {
         let mut conn = self
             .store
             .pool()
             .get()
             .map_err(|e| AppError::Config(e.to_string()))?;
-        Ok(store::run_feed(&mut conn, tenant, limit)?
+        let rows = match before {
+            None => store::run_feed(&mut conn, tenant, limit)?,
+            Some(b) => store::run_feed_before(&mut conn, tenant, limit, b)?,
+        };
+        Ok(rows
             .into_iter()
             .map(|r| RunRow {
                 id: r.id,
@@ -964,6 +1004,40 @@ impl App {
                 error: r.error,
             })
             .collect())
+    }
+
+    /// One run by id ([[WEIR-T-0189]]) — the feed fields plus `stream`, raw
+    /// timestamps, and a recent run-log tail for the run's connection (run logs
+    /// are connection-scoped, not per-unit). `None` for an unknown id or another
+    /// tenant's run (no cross-tenant leak).
+    pub fn run_detail(&self, tenant: &str, id: i64) -> Result<Option<RunDetail>, AppError> {
+        let mut conn = self
+            .store
+            .pool()
+            .get()
+            .map_err(|e| AppError::Config(e.to_string()))?;
+        let Some(r) = store::run_by_id(&mut conn, tenant, id)? else {
+            return Ok(None);
+        };
+        drop(conn);
+        let logs = self.logs(tenant, &r.connection, 50).unwrap_or_default();
+        Ok(Some(RunDetail {
+            id: r.id,
+            connection: r.connection,
+            stream: r.stream,
+            state: r.state,
+            attempt: r.attempt,
+            rows_written: r.rows_written,
+            dead_lettered: r.dead_lettered,
+            started_at: r.started_at,
+            finished_at: r.finished_at,
+            duration_ms: match (r.started_at, r.finished_at) {
+                (Some(s), Some(f)) => Some((f - s).max(0)),
+                _ => None,
+            },
+            error: r.error,
+            logs,
+        }))
     }
 
     /// Recent dead-lettered records for a connection within `tenant` (newest first) —
@@ -1270,6 +1344,8 @@ impl App {
         let sched_owner = format!("weir-serve-{}", std::process::id());
         let lease_ttl = poll * 3; // comfortably over the poll, so a live leader keeps renewing
         let scheduling_enabled = std::env::var("WEIR_DISABLE_SCHEDULER").is_err();
+        // Retention knobs ([[WEIR-T-0188]]): WEIR_RETENTION_DAYS / WEIR_RETENTION_MAX_ROWS.
+        let retention = RetentionConfig::from_env();
         // A per-tenant runner fleet ([[WEIR-T-0091]]): each poll drains every active tenant in its
         // own isolated worker. Idle tenants get no runner (natural reaping).
         let store = Arc::clone(&self.store);
@@ -1307,6 +1383,11 @@ impl App {
                         }
                         if let Err(e) = scheduler.tick() {
                             tracing::warn!(target: "weir_app", error = %e, "scheduler tick failed");
+                        }
+                        // Retention ([[WEIR-T-0188]]): leader-only, so one replica
+                        // prunes; usually a no-op (indexed deletes past the caps).
+                        if let Err(e) = self.relay.prune_retention(&retention) {
+                            tracing::warn!(target: "weir_app", error = %e, "retention prune failed");
                         }
                     }
                     if let Err(e) = fleet.run_until_idle().await {
@@ -2202,6 +2283,101 @@ fn extract_mapping(config_json: &str) -> (MappingSpec, String) {
     (mapping, json)
 }
 
+/// Serializes tests that mutate the process-global `WEIR_MANIFESTS_DIR` — the
+/// test binary is multithreaded, so two tests set_var-ing it race and one reads
+/// the other's directory (the `registration_fills_verified_at_from_ledger` vs
+/// `vendored_manifests_list_and_onboard` flake).
+#[cfg(test)]
+pub(crate) static MANIFESTS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+mod runs_feed_tests {
+    use super::*;
+    use diesel::prelude::*;
+    use weir_schema::work_units;
+
+    fn insert_unit(store: &Store, id: i64, tenant: &str, state: &str) {
+        let mut c = store.pool().get().unwrap();
+        diesel::insert_into(work_units::table)
+            .values((
+                work_units::id.eq(id),
+                work_units::tenant_id.eq(tenant),
+                work_units::connection.eq("c"),
+                work_units::stream.eq("s"),
+                work_units::source_ref.eq("{}"),
+                work_units::dest_ref.eq("{}"),
+                work_units::state.eq(state),
+                work_units::finished_at.eq((state == "done").then(|| 1i64)),
+            ))
+            .execute(&mut c)
+            .unwrap();
+    }
+
+    /// [[WEIR-T-0189]]: the cursor walk (`before` = smallest id of the previous
+    /// page) visits strict history exactly once — no dupes, no gaps — while the
+    /// cursorless first page keeps the live active-union semantics.
+    #[test]
+    fn cursor_walk_covers_history_exactly_once() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = tmp.path().join("weir.db");
+        let app = App::open(db.to_str().unwrap()).unwrap();
+        let store = Store::open(db.to_str().unwrap()).unwrap();
+
+        for id in 1..=25 {
+            insert_unit(&store, id, DEFAULT_TENANT, "done");
+        }
+        // An old RUNNING unit: unioned into the live first page despite its id.
+        insert_unit(&store, 0, DEFAULT_TENANT, "running");
+        // Another tenant's unit must never appear.
+        insert_unit(&store, 999, "other", "done");
+
+        // Live page: 10 most recent + the active unit.
+        let page1 = app.recent_runs_before(DEFAULT_TENANT, 10, None).unwrap();
+        let ids: Vec<i64> = page1.iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec![25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 0]);
+
+        // Walk strict history from the smallest non-active id, page size 10.
+        let mut walked: Vec<i64> = Vec::new();
+        let mut before = 16i64;
+        loop {
+            let page = app
+                .recent_runs_before(DEFAULT_TENANT, 10, Some(before))
+                .unwrap();
+            if page.is_empty() {
+                break;
+            }
+            walked.extend(page.iter().map(|r| r.id));
+            before = page.last().unwrap().id;
+        }
+        assert_eq!(
+            walked,
+            vec![15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0],
+            "the walk covers every older unit exactly once, in id order"
+        );
+    }
+
+    /// [[WEIR-T-0189]]: single-run fetch — full detail for the owner, `None`
+    /// for an unknown id or another tenant's run (no cross-tenant leak).
+    #[test]
+    fn run_detail_scopes_by_tenant() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = tmp.path().join("weir.db");
+        let app = App::open(db.to_str().unwrap()).unwrap();
+        let store = Store::open(db.to_str().unwrap()).unwrap();
+
+        insert_unit(&store, 7, DEFAULT_TENANT, "done");
+        let got = app.run_detail(DEFAULT_TENANT, 7).unwrap().expect("found");
+        assert_eq!((got.id, got.state.as_str()), (7, "done"));
+        assert_eq!((got.connection.as_str(), got.stream.as_str()), ("c", "s"));
+
+        assert!(app.run_detail(DEFAULT_TENANT, 12345).unwrap().is_none());
+        assert!(
+            app.run_detail("other", 7).unwrap().is_none(),
+            "another tenant must not see the run"
+        );
+    }
+}
+
 #[cfg(test)]
 mod worker_config_tests {
     use std::time::Duration;
@@ -2700,6 +2876,9 @@ streams:
     /// stay honestly unverified.
     #[test]
     fn registration_fills_verified_at_from_ledger() {
+        let _env = crate::MANIFESTS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mdir = tempfile::TempDir::new().unwrap();
         std::fs::write(
             mdir.path().join("verified.json"),

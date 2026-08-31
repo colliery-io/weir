@@ -6,7 +6,26 @@ between releases and are called out here.
 
 ## [Unreleased]
 
+### Added
+- Runs API: `GET /runs` takes `?limit=` (default 50, max 500) and `?before=<id>`
+  for cursor pagination (pass the smallest `id` of the previous page to walk
+  history), and `GET /runs/{id}` returns one run in full — stream, timestamps,
+  error, and a run-log tail. Tenant-scoped; admin mirrors under
+  `/tenants/{id}/runs`.
+- Retention: `weir serve` now prunes finished run history, run logs, and dead
+  letters on the scheduler tick — age cap `WEIR_RETENTION_DAYS` (default 30)
+  and per-tenant row cap `WEIR_RETENTION_MAX_ROWS` (default 10000); `0`
+  disables. In-flight runs are never touched.
+
 ### Changed
+- The declarative `rest` runtime now **streams checkpoints per page** instead of
+  buffering the whole paginated read: a run that dies at page N keeps pages
+  1..N-1 committed and the next run resumes from the saved position (carried in
+  the stream's opaque state), memory is bounded by page size, and the page cap
+  (`max_pages`, default 1000, now per run and configurable) logs a loud warning
+  and checkpoints resumably instead of silently truncating. The incremental
+  cursor query param is now snapshotted for the whole read rather than
+  advancing between pages of the same run.
 - **Breaking (v0-unstable):** the `postgres` destination now lands **typed
   relational columns** inferred from the records (bigint/double
   precision/boolean/timestamptz/text, per-column jsonb fallback) instead of a
@@ -19,9 +38,34 @@ between releases and are called out here.
   `weir-tiberius` fork (TDS 7.x in-PRELOGIN handshake).
 
 ### Fixed
+- Orchestrator hardening for long continuous operation: work-unit completion is
+  now owner-guarded (a lease-expired worker finishing late can no longer
+  clobber a re-claimed unit's state, and a worker's exit can no longer
+  resurrect a cancelled run); one run's executor error — including a panicking
+  connector run — fails only that run instead of aborting the whole drain pass
+  and stranding its lease; one broken schedule no longer stops the remaining
+  schedules from firing; work-unit ids are nonce-seeded per process so a
+  restart can't re-mint an id; resident restart backoff is capped (5 min) and
+  resets after a minute of healthy uptime; the connector handle cache is
+  LRU-bounded; and a perpetually-requeuing unit fails the drain loudly instead
+  of spinning it forever.
+- Outbound query values were never URL-encoded: an ISO datetime cursor with a
+  `+02:00` offset arrived server-side with a space, and reserved characters
+  (`& = #`) in a cursor, opaque page token, or query-param API key corrupted
+  the query string. Values (rest runtime + host-injected query credentials) are
+  now percent-encoded exactly once at build time; param names go verbatim.
+- The `rest` runtime treated ANY error page past page 1 as normal end-of-data,
+  so a mid-sync auth expiry or rate limit ended the run "successfully" with
+  partial data. Stops are now status-aware: an error status fails the run
+  naming the status + page (safe — prior pages are checkpointed and the retry
+  resumes), a 401 is transient so the worker re-runs with a freshly resolved
+  credential, and only a 2xx empty page or a 404 one-past-the-end still count
+  as the legitimate end.
 - Incremental cursors on typed (numeric/timestamp) columns compared
-  lexicographically and could re-deliver rows; the predicate now compares in
-  the column's native type.
+  lexicographically and could re-deliver rows; the postgres predicate now
+  compares in the column's native type, and the client-side cursor advance in
+  the rest/mssql/snowflake connectors uses a shared numeric-aware compare
+  (`"9" < "12"`; strings/timestamps unchanged).
 - SigV4 signing double-encoded already-encoded query values (S3 listing
   continuation tokens, escaped prefixes) → 403s; canonicalization now encodes
   exactly once.

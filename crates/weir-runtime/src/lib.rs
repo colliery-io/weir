@@ -771,7 +771,11 @@ fn inject_header(
     Ok(())
 }
 
-/// Append `?<param>=<value>` (or `&…`) to the outbound URI.
+/// Append `?<param>=<value>` (or `&…`) to the outbound URI. The value is the RAW
+/// secret and is percent-encoded exactly once here ([[WEIR-T-0185]]) — a key with
+/// `& = + #` would otherwise corrupt the query (or truncate it as a fragment). The
+/// param name is author-controlled config and goes verbatim. SigV4 canonicalization
+/// stays consistent: it decodes the wire query then re-encodes once.
 fn append_query(
     parts: &mut weir_connector::fidius::http_types::request::Parts,
     param: &str,
@@ -785,7 +789,7 @@ fn append_query(
     });
     s.push_str(param);
     s.push('=');
-    s.push_str(value);
+    s.push_str(&uri_encode(value, false));
     parts.uri = s
         .parse()
         .map_err(|e| EgressDenied::new(format!("uri rewrite for query-param auth failed: {e}")))?;
@@ -1969,6 +1973,22 @@ mod snowflake_keypair_tests {
                 .get("x-snowflake-authorization-token-type")
                 .expect("token-type header"),
             "KEYPAIR_JWT"
+        );
+    }
+
+    /// [[WEIR-T-0185]]: the query-param credential value is percent-encoded exactly
+    /// once — a key with `+ & = #` must not corrupt (or truncate) the query.
+    #[test]
+    fn append_query_percent_encodes_the_credential_value() {
+        let req = weir_connector::fidius::http_types::Request::builder()
+            .uri("https://api.example.com/v1/items?page=2")
+            .body(())
+            .unwrap();
+        let (mut parts, _) = req.into_parts();
+        append_query(&mut parts, "apikey", "k+&=#z").expect("append");
+        assert_eq!(
+            parts.uri.query().expect("query"),
+            "page=2&apikey=k%2B%26%3D%23z"
         );
     }
 }
