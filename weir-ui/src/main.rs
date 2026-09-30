@@ -961,10 +961,11 @@ fn App() -> impl IntoView {
                     }.into_any())
                     header=Box::new(move || view! {
                         <Group justify="end" gap="sm" wrap=true>
-                            <Text size="xs" dimmed=true mono=true>{move || format!("{} runs", runs.get().len())}</Text>
-                            <Text size="xs" dimmed=true mono=true>
-                                {move || format!("{} rows", runs.get().iter().map(|r| r.rows_written).sum::<i64>())}
-                            </Text>
+                            <span class="weir-hide-narrow">
+                                <Text size="xs" dimmed=true mono=true>{move || format!(
+                                    "{} runs · {} rows", runs.get().len(),
+                                    runs.get().iter().map(|r| r.rows_written).sum::<i64>())}</Text>
+                            </span>
                             // Tenant context ([[WEIR-T-0095]]): a platform-admin gets a switcher; others a chip.
                             // The switcher stays a raw `cl-select`: an inline top-bar control with no visible
                             // label, and Aurora's `Select` has no `aria-label` for its <select>.
@@ -1157,6 +1158,9 @@ fn App() -> impl IntoView {
                                 <Table label="Keys">
                                     <thead><tr><th>"name"</th><th>"role"</th><th>"state"</th><th></th></tr></thead>
                                     <tbody>
+                                        {move || tenant_keys.get().is_empty().then(|| view! {
+                                            <TableEmpty message="No keys yet." colspan=4/>
+                                        })}
                                         {move || tenant_keys.get().into_iter().map(|(kid, name, role, revoked)| {
                                             view! { <tr>
                                                 <td>{name}</td><td>{role}</td>
@@ -1549,7 +1553,8 @@ fn operations_view(
                     view! { <Text size="sm" dimmed=true>"No runs yet."</Text> }.into_any()
                 } else {
                     view! {
-                        <Table mono=true fixed=true widths=vec!["64px".into(), "24%".into(), "120px".into(), "auto".into()] label="Run feed">
+                        <Table mono=true fixed=true widths=vec!["190px".into(), "22%".into(), "110px".into(), "auto".into()]
+                            label="Run feed" min_width="680px">
                             <thead><tr><th>"#"</th><th>"connection"</th><th>"state"</th><th>"detail"</th></tr></thead>
                             <tbody>
                                 {rs.into_iter().map(|r| {
@@ -1578,9 +1583,10 @@ fn operations_view(
 #[component]
 fn ConnectionCard(conn: Connection, last: Option<RunRow>, actions: ConnActions) -> impl IntoView {
     let state = last.as_ref().map(|r| r.state.clone()).unwrap_or_else(|| "idle".to_string());
-    let when = match &last {
-        Some(r) => format!("#{} · {}", r.id, run_metrics(r)),
-        None => "no runs yet".to_string(),
+    // The run id is a long snowflake: it goes in the tooltip, the metrics stay in sight.
+    let (when, when_title) = match &last {
+        Some(r) => (run_metrics(r), format!("run #{}", r.id)),
+        None => ("no runs yet".to_string(), String::new()),
     };
     // F1 ([[WEIR-I-0035]]): a resident source shows a live/stopped badge + Start/Stop instead of Run.
     // "live" = it holds an active (leased/pending) run; otherwise it's stopped.
@@ -1609,7 +1615,7 @@ fn ConnectionCard(conn: Connection, last: Option<RunRow>, actions: ConnActions) 
                 </Group>
                 <Text size="xs" dimmed=true mono=true>{format!("stream · {}", conn.stream)}</Text>
                 <Group justify="between" gap="sm">
-                    <Text size="xs" dimmed=true mono=true>{when}</Text>
+                    <span title=when_title><Text size="xs" dimmed=true mono=true>{when}</Text></span>
                     <Group gap="xs">
                         <Button variant="default" size="xs" bad=true stop_propagation=true
                             on_click=Callback::new(move |_| actions.on_delete.run(n_del.clone()))>"Delete"</Button>
@@ -1641,12 +1647,19 @@ const LAYOUT_CSS: &str = r#"
   background: var(--aurora-3); -webkit-background-clip: text; background-clip: text; color: transparent; }
 .weir-glyph { font-size: 19px; } .weir-wordmark { font-size: 20px; letter-spacing: .05em; }
 .weir-page { max-width: 1180px; margin: 0 auto; display: grid; gap: var(--space-lg); }
+/* grid items keep the page width: a wide table scrolls in its own box. */
+.weir-page > * { min-width: 0; }
 .weir-alert-slot { position: sticky; top: 60px; z-index: 30; }
 .weir-arr { color: var(--ice); font-family: var(--font-mono); font-size: var(--fs-xs); }
 .weir-form { display: grid; gap: var(--space-md); }
 .weir-tenant { width: auto; max-width: 220px; height: var(--h-xs); font-size: var(--fs-xs); }
+/* Aurora 0.4.0 declares .cl-mono before .cl-input, so `mono` on a field does not win. */
+.cl-input.cl-mono { font-family: var(--font-mono); }
 @media (max-width: 768px) {
   .weir-page .cl-simple-grid { grid-template-columns: minmax(0, 1fr) !important; }
+  .cl-appshell__header { flex-wrap: wrap; }
+  .cl-appshell__header-content { flex-basis: 100%; }
+  .weir-hide-narrow { display: none; }
 }
 "#;
 
