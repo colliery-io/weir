@@ -1,12 +1,16 @@
-//! weir control-plane UI — Leptos (CSR) on the Colliery Aurora Dark design system
-//! ([[WEIR-A-0035]]). Aurora ships the chrome; weir supplies the data + vocabulary.
+//! weir control-plane UI — Leptos (CSR) on the Colliery Aurora design system
+//! ([[WEIR-A-0035]]), light and dark ([[COLLIERY-T-1838]]). Aurora ships the chrome;
+//! weir supplies the data + vocabulary.
 //! Shell + Operations + Setup ([[WEIR-T-0079]]/[[WEIR-T-0080]]/[[WEIR-T-0081]]).
 
 use aurora_leptos::components::*;
+use aurora_leptos::theme::{provide_theme, ThemeToggle};
 use aurora_leptos::tokens::token;
+use aurora_leptos::widgets::Banner;
 use aurora_leptos::AuroraStyles;
 use leptos::prelude::*;
 use std::collections::HashSet;
+use std::sync::Arc;
 
 fn main() {
     leptos::mount::mount_to_body(App);
@@ -389,27 +393,6 @@ fn fmt_lag(ms: Option<i64>) -> String {
     }
 }
 
-/// Sparkline points (`x,y …`) over a 120×22 box, or `None` for no data.
-fn spark_points(vals: &[i64]) -> Option<String> {
-    if vals.is_empty() {
-        return None;
-    }
-    let max = (*vals.iter().max().unwrap_or(&1)).max(1);
-    let n = vals.len();
-    let (w, h) = (120.0_f64, 22.0_f64);
-    let pts = vals
-        .iter()
-        .enumerate()
-        .map(|(i, v)| {
-            let x = if n > 1 { i as f64 / (n - 1) as f64 * w } else { 0.0 };
-            let y = h - (*v as f64 / max as f64) * h;
-            format!("{x:.1},{y:.1}")
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
-    Some(pts)
-}
-
 /// Friendly picker label for an onboardable connector.
 fn friendly(p: &AvailableItem) -> String {
     match p.kind.as_str() {
@@ -468,6 +451,8 @@ fn cfg_set(cfg: &str, key: &str, val: &str, kind: &str) -> String {
 
 #[component]
 fn App() -> impl IntoView {
+    // Light / dark / system ([[COLLIERY-T-1838]]); THEME_INIT_SCRIPT in index.html sets the first paint.
+    provide_theme();
     let view = RwSignal::new("Operations".to_string());
 
     // Auth gate ([[WEIR-T-0087]]): probe `/auth/me` → `authed` (None=checking, Some(false)=needs sign-in).
@@ -542,19 +527,14 @@ fn App() -> impl IntoView {
 
     let connections = RwSignal::new(Vec::<Connection>::new());
     let runs = RwSignal::new(Vec::<RunRow>::new());
-    let toast = RwSignal::new(Option::<(bool, String)>::None);
-    // Auto-dismiss after 6s unless a newer toast replaced this one; also closable in the view.
-    let toast_seq = StoredValue::new(0u64);
+    // Aurora toasts: one queue at the root, one ToastStack in the view (6s, click to dismiss).
+    let toaster = provide_toaster();
     let flash = move |ok: bool, msg: String| {
-        let id = toast_seq.get_value() + 1;
-        toast_seq.set_value(id);
-        toast.set(Some((ok, msg)));
-        leptos::task::spawn_local(async move {
-            gloo_timers::future::TimeoutFuture::new(6_000).await;
-            if toast_seq.get_value() == id {
-                toast.set(None);
-            }
-        });
+        if ok {
+            toaster.success(msg);
+        } else {
+            toaster.error(msg);
+        }
     };
     // Control-plane reachability ([[WEIR-T-0167]]): Some(reason) renders the error banner —
     // an outage must never masquerade as "No connections yet".
@@ -928,618 +908,676 @@ fn App() -> impl IntoView {
         });
     };
 
+
+    // Confirm-destroy ([[COLLIERY-T-1838]]): delete + revoke go through Aurora's ConfirmDialog.
+    let del_open = RwSignal::new(false);
+    let del_name = RwSignal::new(String::new());
+    let ask_delete = Callback::new(move |n: String| {
+        del_name.set(n);
+        del_open.set(true);
+    });
+    let revoke_open = RwSignal::new(false);
+    let revoke_id = RwSignal::new(String::new());
+
+    // Only a definite "not signed in" swaps the app for the sign-in screen; the first
+    // probe (None) keeps the shell, so it does not re-render on None → Some(true).
+    let needs_signin = Memo::new(move |_| authed.get() == Some(false));
+
     view! {
         <AuroraStyles/>
         <style>{LAYOUT_CSS}</style>
-        <header class="weir-header">
-            <Group justify="between" top=true>
-                <Group gap="sm">
-                    <span class="weir-glyph">"≋"</span>
-                    <span class="weir-wordmark">"weir"</span>
-                    <Text size="xs" dimmed=true mono=true>"control plane"</Text>
-                </Group>
-                <Group gap="sm">
-                    <span class="weir-stat">{move || format!("{} runs", runs.get().len())}</span>
-                    <span class="weir-stat">
-                        {move || format!("{} rows", runs.get().iter().map(|r| r.rows_written).sum::<i64>())}
-                    </span>
-                    // Tenant context ([[WEIR-T-0095]]): a platform-admin gets a switcher; others a chip.
-                    {move || if is_admin.get() {
-                        view! {
-                            <select class="weir-tenant"
-                                title="view another tenant"
-                                on:change=move |ev| {
-                                    let v = leptos::prelude::event_target_value(&ev);
-                                    if let Some(store) = local_storage() {
-                                        if v.is_empty() { let _ = store.remove_item("weir_active_tenant"); }
-                                        else { let _ = store.set_item("weir_active_tenant", &v); }
-                                    }
-                                    if let Some(w) = web_sys::window() { let _ = w.location().reload(); }
-                                }>
-                                <option value="" selected=active_tenant().is_none()>"⊙ self (default)"</option>
-                                {tenants.get().into_iter().map(|(id, name)| {
-                                    let sel = active_tenant().as_deref() == Some(id.as_str());
-                                    view! { <option value=id.clone() selected=sel>{format!("{name} · {id}")}</option> }
-                                }).collect::<Vec<_>>()}
-                            </select>
-                        }.into_any()
-                    } else {
-                        view! { <span class="weir-tenant-chip">{move || format!("⊙ {}", my_tenant.get())}</span> }.into_any()
-                    }}
-                    {move || {
-                        let mut opts = vec!["Operations".to_string(), "Health".to_string(), "Setup".to_string()];
-                        if is_admin.get() { opts.insert(2, "Platform".to_string()); }
-                        view! { <SegmentedControl options=opts value=view/> }
-                    }}
-                    {move || is_admin.get().then(|| view! {
-                        <span class="weir-signout" title="administer tenants"
-                            on:click=move |_| { reload_tenants(); show_tenants.set(true); }>"tenants"</span>
-                    })}
-                    <span class="weir-signout" on:click=move |_| sign_out()
-                        title=move || format!("signed in as {}", signed_in_as.get())>"sign out"</span>
-                </Group>
-            </Group>
-        </header>
-
-        <main class="weir-main">
-            {move || match view.get().as_str() {
-                "Setup" => {
-                    // Picker options (raw_name, friendly, summary), onboarded dropped.
-                    let cat = catalog.get();
-                    let avail = available.get();
-                    let registered: HashSet<String> = cat.iter().map(|c| c.name.clone()).collect();
-                    let mut opts: Vec<(String, String, String)> = Vec::new();
-                    for want in ["manifest", "dest-manifest", "other"] {
-                        for p in avail.iter().filter(|p| {
-                            let k = if want == "other" { p.kind != "manifest" && p.kind != "dest-manifest" } else { p.kind == want };
-                            k && !is_onboarded(p, &registered)
-                        }) {
-                            opts.push((p.name.clone(), friendly(p), p.summary.clone()));
-                        }
-                    }
-                    let sources: Vec<CatalogItem> = cat.iter().filter(|c| c.roles.iter().any(|r| r == "Source")).cloned().collect();
-                    let dests: Vec<CatalogItem> = cat.iter().filter(|c| c.roles.iter().any(|r| r == "Destination" || r == "ReverseEtl")).cloned().collect();
-                    let prop_list = props.get();
-                    let stream_list = streams.get();
-
-                    view! {
-                        <Panel title="Add a connector" caption="discover · onboard">
-                            <div class="weir-form">
-                                <label class="weir-fld">"pick a connector"
-                                    <select class="cl-input cl-select" prop:value=move || add_pkg.get()
-                                        on:change=move |e| add_pkg.set(event_target_value(&e))>
-                                        <option value="">"— select a connector —"</option>
-                                        {opts.into_iter().map(|(val, lbl, summ)| view! {
-                                            <option value=val.clone() title=summ>{lbl}</option>
-                                        }).collect_view()}
-                                    </select>
-                                </label>
-                                <div><Button on_click=Callback::new(move |_| onboard_pick())>"Onboard"</Button></div>
-                            </div>
-                        </Panel>
-
-                        <Panel title="Bring your own" caption="paste a manifest · or a crate path">
-                            <div class="weir-form">
-                                <label class="weir-fld">"paste a declarative manifest (YAML)"
-                                    <textarea class="cl-input" rows="6"
-                                        placeholder="type: DeclarativeSource\nstreams:\n  - ..."
-                                        prop:value=move || add_manifest.get()
-                                        on:input=move |e| add_manifest.set(event_target_value(&e))></textarea>
-                                </label>
-                                <label class="weir-fld">"or a crate path (full-code)"
-                                    <input class="cl-input" placeholder="/path/to/weir-connector-foo"
-                                        prop:value=move || add_path.get()
-                                        on:input=move |e| add_path.set(event_target_value(&e))/>
-                                </label>
-                                <Group gap="sm">
-                                    <Button variant="default" on_click=Callback::new(move |_| do_preview())>"Preview"</Button>
-                                    <Button on_click=Callback::new(move |_| onboard_byo())>"Onboard"</Button>
-                                </Group>
-                                {move || preview.get().map(|rep| view! {
-                                    <div class="weir-preview">
-                                        <Text size="xs" mono=true>
-                                            {format!("preview · tier {} · confidence {:.2} · streams {}", rep.tier, rep.confidence, rep.streams.len())}
-                                        </Text>
-                                        {if rep.unsupported.is_empty() {
-                                            view! { <Text size="xs" dimmed=true>"fully supported by the runtime"</Text> }.into_any()
-                                        } else {
-                                            view! { <Text size="xs" dimmed=true>{format!("gaps: {}", rep.unsupported.join(", "))}</Text> }.into_any()
-                                        }}
-                                    </div>
-                                })}
-                            </div>
-                        </Panel>
-
-                        <Panel title="New / edit connection" caption="wire a source to a destination">
-                            <div class="weir-form">
-                                <label class="weir-fld">"name"
-                                    <input class="cl-input" placeholder="my-sync"
-                                        prop:value=move || name.get()
-                                        on:input=move |e| name.set(event_target_value(&e))/>
-                                </label>
-                                <div class="weir-two">
-                                    <label class="weir-fld">"source"
-                                        <select class="cl-input cl-select" prop:value=move || src.get()
-                                            on:change=move |e| src.set(event_target_value(&e))>
-                                            <option value="">"— source —"</option>
-                                            {sources.into_iter().map(|c| view! {
-                                                <option value=c.name.clone()>{format!("{} · {}", c.name, c.version)}</option>
-                                            }).collect_view()}
-                                        </select>
-                                    </label>
-                                    <label class="weir-fld">"destination"
-                                        <select class="cl-input cl-select" prop:value=move || dst.get()
-                                            on:change=move |e| dst.set(event_target_value(&e))>
-                                            <option value="">"— destination —"</option>
-                                            {dests.into_iter().map(|c| view! {
-                                                <option value=c.name.clone()>{format!("{} · {}", c.name, c.version)}</option>
-                                            }).collect_view()}
-                                        </select>
-                                    </label>
-                                </div>
-                                <div class="weir-two">
-                                    <label class="weir-fld">"stream"
-                                        {if stream_list.is_empty() {
-                                            view! {
-                                                <input class="cl-input" prop:value=move || stream.get()
-                                                    on:input=move |e| stream.set(event_target_value(&e))/>
-                                            }.into_any()
-                                        } else {
-                                            view! {
-                                                <select class="cl-input cl-select" prop:value=move || stream.get()
-                                                    on:change=move |e| stream.set(event_target_value(&e))>
-                                                    {stream_list.into_iter().map(|s| { let v = s.clone(); view! { <option value=v>{s}</option> } }).collect_view()}
-                                                </select>
-                                            }.into_any()
-                                        }}
-                                    </label>
-                                    <label class="weir-fld">
-                                        {move || if exec_mode.get() == "resident" { "every (secs) · emit cadence" } else { "every (secs)" }}
-                                        <input class="cl-input" placeholder="—"
-                                            prop:value=move || every.get()
-                                            on:input=move |e| every.set(event_target_value(&e))/>
-                                    </label>
-                                </div>
-                                <label class="weir-fld">"execution mode"
-                                    <select class="cl-input cl-select" prop:value=move || exec_mode.get()
-                                        on:change=move |e| exec_mode.set(event_target_value(&e))>
-                                        <option value="run_once">"run once · scheduled / batch"</option>
-                                        <option value="resident">"resident · long-lived (Start/Stop; every = cadence)"</option>
-                                    </select>
-                                </label>
-                                {(!prop_list.is_empty()).then(|| view! {
-                                    <div class="weir-schema">
-                                        <Text size="xs" dimmed=true mono=true>{move || format!("config · {} contract", src.get())}</Text>
-                                        {prop_list.into_iter().map(|p| {
-                                            let (key, kind) = (p.key.clone(), p.kind.clone());
-                                            let kg = key.clone();
-                                            let kind_ph = p.kind.clone();
-                                            view! {
-                                                <label class="weir-fld">{p.key.clone()}
-                                                    <input class="cl-input"
-                                                        r#type=if p.secret { "password" } else { "text" }
-                                                        placeholder=kind_ph
-                                                        prop:value=move || cfg_get(&config.get(), &kg)
-                                                        on:input=move |e| config.set(cfg_set(&config.get_untracked(), &key, &event_target_value(&e), &kind))/>
-                                                </label>
-                                            }
-                                        }).collect_view()}
-                                    </div>
-                                })}
-                                <label class="weir-fld">"config (JSON)"
-                                    <textarea class="cl-input" rows="3"
-                                        prop:value=move || config.get()
-                                        on:input=move |e| config.set(event_target_value(&e))></textarea>
-                                </label>
-                                <div><Button on_click=Callback::new(move |_| save_conn())>"Save connection"</Button></div>
-                            </div>
-                        </Panel>
-                    }.into_any()
-                }
-                "Health" => view! {
-                    <Panel title="Needs attention" caption="amber + red connections, worst first">
-                        {move || {
-                            let mut hs = health.get();
-                            hs.sort_by_key(|h| health_rank(&h.status));
-                            let attn: Vec<ConnHealth> = hs.into_iter()
-                                .filter(|h| h.status == "red" || h.status == "amber").collect();
-                            if attn.is_empty() {
-                                view! { <Text dimmed=true>"All connections healthy."</Text> }.into_any()
-                            } else {
-                                view! {
-                                    <Table mono=true>
-                                        <thead><tr><th>"status"</th><th>"connection"</th><th>"lag"</th><th>"errors"</th><th>"dead"</th></tr></thead>
-                                        <tbody>
-                                            {attn.into_iter().map(|h| {
-                                                let name = h.connection.clone();
-                                                let color = health_color(&h.status).to_string();
-                                                view! {
-                                                    <tr class="weir-feed-row" on:click=move |_| open_detail.run(name.clone())>
-                                                        <td><Pill color=color>{h.status.clone()}</Pill></td>
-                                                        <td>{h.connection.clone()}</td>
-                                                        <td>{fmt_lag(h.lag_ms)}</td>
-                                                        <td>{format!("{:.0}%", h.error_rate * 100.0)}</td>
-                                                        <td>{h.dead_letters.to_string()}</td>
-                                                    </tr>
-                                                }
-                                            }).collect_view()}
-                                        </tbody>
-                                    </Table>
-                                }.into_any()
-                            }
-                        }}
-                    </Panel>
-                    <Panel title="Connection health" caption="freshness · errors · dead letters · throughput">
-                        {move || {
-                            let mut hs = health.get();
-                            hs.sort_by_key(|h| health_rank(&h.status));
-                            if hs.is_empty() {
-                                view! { <Text dimmed=true>"No connections yet — add one in Setup."</Text> }.into_any()
-                            } else {
-                                view! {
-                                    <SimpleGrid cols=3>
-                                        {hs.into_iter().map(|h| {
-                                            let name = h.connection.clone();
-                                            let color = health_color(&h.status).to_string();
-                                            let pts = spark_points(&h.throughput);
-                                            view! {
-                                                <div class="weir-health-card" on:click=move |_| open_detail.run(name.clone())>
-                                                    <div class="weir-health-head">
-                                                        <Pill color=color>{h.status.clone()}</Pill>
-                                                        <span class="weir-health-name">{h.connection.clone()}</span>
-                                                    </div>
-                                                    <div class="weir-health-stats">
-                                                        <span>{format!("lag {}", fmt_lag(h.lag_ms))}</span>
-                                                        <span>{format!("err {:.0}%", h.error_rate * 100.0)}</span>
-                                                        <span>{format!("dl {}", h.dead_letters)}</span>
-                                                        <span>{format!("{} rows", h.rows_recent)}</span>
-                                                    </div>
-                                                    {pts.map(|p| view! {
-                                                        <svg class="weir-spark" viewBox="0 0 120 22" preserveAspectRatio="none">
-                                                            <polyline points=p fill="none" stroke="currentColor" stroke-width="1.5"></polyline>
-                                                        </svg>
-                                                    })}
-                                                </div>
-                                            }
-                                        }).collect_view()}
-                                    </SimpleGrid>
-                                }.into_any()
-                            }
-                        }}
-                    </Panel>
-                }
-                .into_any(),
-                "Platform" => view! {
-                    <Panel title="Platform" caption="cross-tenant health · fleet">
-                        {move || {
-                            let p = platform.get();
-                            view! {
-                                <div class="weir-health-stats">
-                                    <span>{format!("{} tenants", p.tenants.len())}</span>
-                                    <span>{format!("{} active", p.active_tenants)}</span>
-                                    <span>{format!("queue {}", p.total_queue_depth)}</span>
-                                </div>
-                            }
-                        }}
-                    </Panel>
-                    <Panel title="Tenant health" caption="worst first · click to drill in">
-                        {move || {
-                            let mut ts = platform.get().tenants;
-                            ts.sort_by_key(|t| health_rank(&t.status));
-                            if ts.is_empty() {
-                                view! { <Text dimmed=true>"No tenants."</Text> }.into_any()
-                            } else {
-                                view! {
-                                    <SimpleGrid cols=3>
-                                        {ts.into_iter().map(|t| {
-                                            let tid = t.tenant.clone();
-                                            let color = health_color(&t.status).to_string();
-                                            view! {
-                                                <div class="weir-health-card" on:click=move |_| drill_tenant.run(tid.clone())>
-                                                    <div class="weir-health-head">
-                                                        <Pill color=color>{t.status.clone()}</Pill>
-                                                        <span class="weir-health-name">{t.tenant.clone()}</span>
-                                                    </div>
-                                                    <div class="weir-health-stats">
-                                                        <span>{format!("{} conns", t.connections)}</span>
-                                                        <span>{format!("{} failing", t.needs_attention)}</span>
-                                                        <span>{format!("dl {}", t.dead_letters)}</span>
-                                                        <span>{format!("queue {}", t.queue_depth)}</span>
-                                                    </div>
-                                                </div>
-                                            }
-                                        }).collect_view()}
-                                    </SimpleGrid>
-                                }.into_any()
-                            }
-                        }}
-                    </Panel>
-                    <Panel title="Needs attention" caption="failing connections across all tenants">
-                        {move || {
-                            let attn = platform.get().needs_attention;
-                            if attn.is_empty() {
-                                view! { <Text dimmed=true>"All tenants healthy."</Text> }.into_any()
-                            } else {
-                                view! {
-                                    <Table mono=true>
-                                        <thead><tr><th>"status"</th><th>"tenant"</th><th>"connection"</th></tr></thead>
-                                        <tbody>
-                                            {attn.into_iter().map(|a| {
-                                                let color = health_color(&a.status).to_string();
-                                                let tid = a.tenant.clone();
-                                                view! {
-                                                    <tr class="weir-feed-row" on:click=move |_| drill_tenant.run(tid.clone())>
-                                                        <td><Pill color=color>{a.status.clone()}</Pill></td>
-                                                        <td>{a.tenant.clone()}</td>
-                                                        <td>{a.connection.clone()}</td>
-                                                    </tr>
-                                                }
-                                            }).collect_view()}
-                                        </tbody>
-                                    </Table>
-                                }.into_any()
-                            }
-                        }}
-                    </Panel>
-                }
-                .into_any(),
-                _ => view! {
-                    <Panel title="Connections" caption="live runs">
-                        {move || {
-                            let rs = runs.get();
-                            let cs = connections.get();
-                            if cs.is_empty() {
-                                view! { <Text dimmed=true>"No connections yet — add one in Setup."</Text> }.into_any()
-                            } else {
-                                view! {
-                                    <SimpleGrid cols=3>
-                                        {cs.into_iter().map(|c| {
-                                            let last = latest_run(&rs, &c.name);
-                                            view! { <ConnectionCard conn=c last=last on_open=open_detail on_run=run_conn on_delete=del_conn on_start=start_conn on_stop=stop_conn/> }
-                                        }).collect_view()}
-                                    </SimpleGrid>
-                                }.into_any()
-                            }
-                        }}
-                    </Panel>
-                    <Panel title="Run feed" caption="most recent first">
-                        {move || {
-                            let rs = runs.get();
-                            if rs.is_empty() {
-                                view! { <Text dimmed=true>"No runs yet."</Text> }.into_any()
-                            } else {
-                                view! {
-                                    <Table mono=true>
-                                        <thead><tr><th>"#"</th><th>"connection"</th><th>"state"</th><th>"detail"</th></tr></thead>
-                                        <tbody>
-                                            {rs.into_iter().map(|r| {
-                                                let name = r.connection.clone();
-                                                let color = state_color(&r.state).to_string();
-                                                let metrics = run_metrics(&r);
-                                                let (id, connection, state) = (r.id, r.connection.clone(), r.state.clone());
-                                                view! {
-                                                    <tr class="weir-feed-row" on:click=move |_| open_detail.run(name.clone())>
-                                                        <td>{id}</td>
-                                                        <td>{connection}</td>
-                                                        <td><Pill color=color>{state}</Pill></td>
-                                                        <td>{metrics}</td>
-                                                    </tr>
-                                                }
-                                            }).collect_view()}
-                                        </tbody>
-                                    </Table>
-                                }.into_any()
-                            }
-                        }}
-                    </Panel>
-                }
-                .into_any(),
-            }}
-        </main>
-
-        <Modal open=detail_open title="run detail".to_string()>
-            <Text bold=true mono=true>{move || selected.get()}</Text>
-            // Lineage ([[WEIR-T-0101]]): source · stream → dest + rows/duration, from the run data.
-            <div class="weir-detail-sec"><Text size="xs" dimmed=true>"Lineage"</Text></div>
-            {move || {
-                let name = selected.get();
-                match connections.get().into_iter().find(|c| c.name == name) {
-                    Some(c) => {
-                        let run = runs.get().into_iter().find(|r| r.connection == name);
-                        let rows = run.as_ref().map(|r| r.rows_written).unwrap_or(0);
-                        let dur = run.as_ref().and_then(|r| r.duration_ms).map(fmt_dur).unwrap_or_default();
-                        let metrics = if dur.is_empty() {
-                            format!("· {rows} rows")
-                        } else {
-                            format!("· {rows} rows · {dur}")
-                        };
-                        view! {
-                            <Group gap="sm">
-                                <Text size="xs" bold=true mono=true>{c.source}</Text>
-                                <Text size="xs" dimmed=true>{format!("· {} →", c.stream)}</Text>
-                                <Text size="xs" bold=true mono=true>{c.dest}</Text>
-                                <Text size="xs" dimmed=true mono=true>{metrics}</Text>
-                            </Group>
-                        }.into_any()
-                    }
-                    None => view! { <Text dimmed=true>"—"</Text> }.into_any(),
-                }
-            }}
-            // Typed schema + drift ([[WEIR-T-0121]] / [[WEIR-I-0025]]).
-            <div class="weir-detail-sec"><Text size="xs" dimmed=true>"Schema"</Text></div>
-            {move || {
-                let sv = detail_schema.get();
-                let name = selected.get();
-                let banner = sv.broken.clone().map(|reason| {
-                    let n = name.clone();
-                    view! {
-                        <div class="weir-drift">
-                            <Text size="xs" bold=true>{format!("⚠ schema drift — {reason}")}</Text>
-                            <button class="weir-drift-accept" on:click=move |_| accept_schema.run(n.clone())>
-                                "Accept new schema"
-                            </button>
-                        </div>
-                    }
-                });
-                let body = if sv.fields.is_empty() {
-                    view! { <Text dimmed=true>"no schema captured yet"</Text> }.into_any()
-                } else {
-                    view! {
-                        <List>
-                            {sv.fields.into_iter().map(|f| {
-                                let opt = if f.nullable { "nullable" } else { "required" };
-                                view! {
-                                    <ListItem>
-                                        <Text size="xs" bold=true mono=true>{f.name}</Text>
-                                        <Text size="xs" dimmed=true mono=true>{format!("{} · {opt}", f.ty)}</Text>
-                                    </ListItem>
-                                }
-                            }).collect_view()}
-                        </List>
-                    }.into_any()
-                };
-                view! { <div class="weir-schema-view">{banner}{body}</div> }.into_any()
-            }}
-            <div class="weir-detail-sec"><Text size="xs" dimmed=true>"Dead-letters"</Text></div>
-            {move || {
-                let dls = detail_dls.get();
-                if dls.is_empty() {
-                    view! { <Text dimmed=true>"none"</Text> }.into_any()
-                } else {
-                    view! {
-                        <List>
-                            {dls.into_iter().map(|d| view! {
-                                <ListItem><Text size="xs" bold=true>{d.reason}</Text><Text size="xs" dimmed=true mono=true>{d.record}</Text></ListItem>
-                            }).collect_view()}
-                        </List>
-                    }.into_any()
-                }
-            }}
-            <div class="weir-detail-sec"><Text size="xs" dimmed=true>"Logs"</Text></div>
-            {move || {
-                let logs = detail_logs.get();
-                if logs.is_empty() {
-                    view! { <Text dimmed=true>"no logs"</Text> }.into_any()
-                } else {
-                    view! {
-                        <List>
-                            {logs.into_iter().map(|l| view! {
-                                <ListItem><Text size="xs" mono=true>{format!("{} · {}", l.level, l.message)}</Text></ListItem>
-                            }).collect_view()}
-                        </List>
-                    }.into_any()
-                }
-            }}
-        </Modal>
-
-        // Degraded-control-plane banner ([[WEIR-T-0167]]): persistent while the poll fails.
-        {move || api_error.get().map(|msg| view! {
-            <div class="weir-apierr" title="the dashboards show last-known data until this clears">
-                {format!("⚠ control plane error — {msg}")}
-            </div>
-        })}
-
-        {move || toast.get().map(|(ok, msg)| view! {
-            <div class="weir-toast" class:weir-toast--ok=ok class:weir-toast--err=!ok
-                title="click to dismiss" on:click=move |_| toast.set(None)>{msg}</div>
-        })}
-
-        // Sign-in gate ([[WEIR-T-0087]]) — a full-screen overlay until authenticated.
-        {move || (authed.get() == Some(false)).then(|| view! {
-            <div class="weir-auth-overlay">
-                <div class="weir-auth-card">
-                    <Panel title="Sign in to weir" caption="authenticate to continue">
-                        <div class="weir-form">
+        <ToastStack duration_ms=6000/>
+        {move || if needs_signin.get() {
+            // Sign-in gate ([[WEIR-T-0087]]): Aurora's centred sign-in card.
+            view! {
+                <CenterScreen>
+                    <AuthCard title="Sign in to weir" sub="Authenticate to continue."
+                        brand=Box::new(|| view! { <Brand/> }.into_any())>
+                        <Stack gap="sm">
                             <Button on_click=Callback::new(move |_| {
                                 if let Some(w) = web_sys::window() {
                                     let _ = w.location().set_href("/auth/login");
                                 }
                             })>"Sign in with OIDC"</Button>
-                            <label class="weir-fld">"or paste an API key"
-                                <input class="cl-input" placeholder="weirk_…"
-                                    prop:value=move || key_input.get()
-                                    on:input=move |e| key_input.set(event_target_value(&e))/>
-                            </label>
-                            <div><Button on_click=Callback::new(move |_| use_key())>"Use API key"</Button></div>
-                        </div>
-                    </Panel>
-                </div>
-            </div>
-        })}
+                            <Divider/>
+                            <form class="weir-form" on:submit=move |ev: leptos::ev::SubmitEvent| {
+                                ev.prevent_default();
+                                use_key();
+                            }>
+                                <PasswordInput label="Or paste an API key" placeholder="weirk_…"
+                                    value=key_input autocomplete="off"/>
+                                <Button variant="default" button_type="submit">"Use API key"</Button>
+                            </form>
+                        </Stack>
+                    </AuthCard>
+                </CenterScreen>
+            }.into_any()
+        } else {
+            view! {
+                <AppShell
+                    brand=Arc::new(|| view! {
+                        <Brand/>
+                        <Text size="xs" dimmed=true mono=true>"control plane"</Text>
+                    }.into_any())
+                    header=Box::new(move || view! {
+                        <Group justify="end" gap="sm" wrap=true>
+                            <Text size="xs" dimmed=true mono=true>{move || format!("{} runs", runs.get().len())}</Text>
+                            <Text size="xs" dimmed=true mono=true>
+                                {move || format!("{} rows", runs.get().iter().map(|r| r.rows_written).sum::<i64>())}
+                            </Text>
+                            // Tenant context ([[WEIR-T-0095]]): a platform-admin gets a switcher; others a chip.
+                            // The switcher stays a raw `cl-select`: an inline top-bar control with no visible
+                            // label, and Aurora's `Select` has no `aria-label` for its <select>.
+                            {move || if is_admin.get() {
+                                view! {
+                                    <select class="cl-input cl-select weir-tenant" data-testid="tenant-switcher"
+                                        aria-label="Tenant" title="view another tenant"
+                                        on:change=move |ev| {
+                                            let v = event_target_value(&ev);
+                                            if let Some(store) = local_storage() {
+                                                if v.is_empty() { let _ = store.remove_item("weir_active_tenant"); }
+                                                else { let _ = store.set_item("weir_active_tenant", &v); }
+                                            }
+                                            if let Some(w) = web_sys::window() { let _ = w.location().reload(); }
+                                        }>
+                                        <option value="" selected=active_tenant().is_none()>"⊙ self (default)"</option>
+                                        {tenants.get().into_iter().map(|(id, name)| {
+                                            let sel = active_tenant().as_deref() == Some(id.as_str());
+                                            view! { <option value=id.clone() selected=sel>{format!("{name} · {id}")}</option> }
+                                        }).collect_view()}
+                                    </select>
+                                }.into_any()
+                            } else {
+                                view! { <Pill color=token::MUTED>{move || format!("⊙ {}", my_tenant.get())}</Pill> }.into_any()
+                            }}
+                            {move || {
+                                let mut opts = vec!["Operations".to_string(), "Health".to_string(), "Setup".to_string()];
+                                if is_admin.get() { opts.insert(2, "Platform".to_string()); }
+                                view! { <SegmentedControl options=opts value=view/> }
+                            }}
+                            {move || is_admin.get().then(|| view! {
+                                <Button variant="subtle" size="xs" title="administer tenants"
+                                    on_click=Callback::new(move |_| { reload_tenants(); show_tenants.set(true); })>
+                                    "Tenants"
+                                </Button>
+                            })}
+                            {move || view! {
+                                <Button variant="subtle" size="xs" title=format!("signed in as {}", signed_in_as.get())
+                                    on_click=Callback::new(move |_| sign_out())>"Sign out"</Button>
+                            }}
+                            <ThemeToggle/>
+                        </Group>
+                    }.into_any())
+                >
+                    <div class="weir-page">
+                        // Degraded-control-plane banner ([[WEIR-T-0167]]): persistent while the poll fails;
+                        // sticky under the top bar so it stays in sight.
+                        {move || api_error.get().map(|msg| view! {
+                            <div class="weir-alert-slot" data-testid="api-error"
+                                title="the dashboards show last-known data until this clears">
+                                <Banner color=token::BAD>{format!("control plane error — {msg}")}</Banner>
+                            </div>
+                        })}
+                        {move || match view.get().as_str() {
+                            "Setup" => setup_view(SetupState {
+                                catalog, available, props, streams, add_pkg, add_manifest, add_path, preview,
+                                name, src, dst, stream, config, every, exec_mode,
+                                onboard_pick: Callback::new(move |_| onboard_pick()),
+                                do_preview: Callback::new(move |_| do_preview()),
+                                onboard_byo: Callback::new(move |_| onboard_byo()),
+                                save_conn: Callback::new(move |_| save_conn()),
+                            }),
+                            "Health" => health_view(health, open_detail),
+                            "Platform" => platform_view(platform, drill_tenant),
+                            _ => operations_view(connections, runs, ConnActions {
+                                on_open: open_detail, on_run: run_conn, on_delete: ask_delete,
+                                on_start: start_conn, on_stop: stop_conn,
+                            }),
+                        }}
+                    </div>
 
-        // Tenants admin overlay ([[WEIR-T-0096]]) — platform-admin CRUD tenants + their keys.
-        {move || show_tenants.get().then(|| view! {
-            <div class="weir-auth-overlay">
-                <div class="weir-tenants-card">
-                    <Panel title="Tenants" caption="administer tenants + their keys">
-                        <div class="weir-form">
-                            <div class="weir-signout" on:click=move |_| show_tenants.set(false)>"✕ close"</div>
-                            <label class="weir-fld">"new tenant id"
-                                <input class="cl-input" placeholder="acme"
-                                    prop:value=move || new_tenant_id.get()
-                                    on:input=move |e| new_tenant_id.set(event_target_value(&e))/>
-                            </label>
+                    <Modal open=detail_open title="Run detail" size="lg">
+                        <Text bold=true mono=true>{move || selected.get()}</Text>
+                        // Lineage ([[WEIR-T-0101]]): source · stream → dest + rows/duration, from the run data.
+                        <SectionLabel label="Lineage" divider=true/>
+                        {move || {
+                            let name = selected.get();
+                            match connections.get().into_iter().find(|c| c.name == name) {
+                                Some(c) => {
+                                    let run = runs.get().into_iter().find(|r| r.connection == name);
+                                    let rows = run.as_ref().map(|r| r.rows_written).unwrap_or(0);
+                                    let dur = run.as_ref().and_then(|r| r.duration_ms).map(fmt_dur).unwrap_or_default();
+                                    let metrics = if dur.is_empty() {
+                                        format!("· {rows} rows")
+                                    } else {
+                                        format!("· {rows} rows · {dur}")
+                                    };
+                                    view! {
+                                        <Group gap="sm">
+                                            <Text size="xs" bold=true mono=true>{c.source}</Text>
+                                            <Text size="xs" dimmed=true>{format!("· {} →", c.stream)}</Text>
+                                            <Text size="xs" bold=true mono=true>{c.dest}</Text>
+                                            <Text size="xs" dimmed=true mono=true>{metrics}</Text>
+                                        </Group>
+                                    }.into_any()
+                                }
+                                None => view! { <Text dimmed=true>"—"</Text> }.into_any(),
+                            }
+                        }}
+                        // Typed schema + drift ([[WEIR-T-0121]] / [[WEIR-I-0025]]).
+                        <SectionLabel label="Schema" divider=true/>
+                        {move || {
+                            let sv = detail_schema.get();
+                            let name = selected.get();
+                            let drift = sv.broken.clone().map(|reason| {
+                                let n = name.clone();
+                                view! {
+                                    <Alert title="Schema drift" color=token::BAD>
+                                        <Stack gap="xs">
+                                            <Text size="sm">{reason}</Text>
+                                            <div>
+                                                <Button variant="default" size="xs"
+                                                    on_click=Callback::new(move |_| accept_schema.run(n.clone()))>
+                                                    "Accept new schema"
+                                                </Button>
+                                            </div>
+                                        </Stack>
+                                    </Alert>
+                                }
+                            });
+                            let body = if sv.fields.is_empty() {
+                                view! { <Text size="sm" dimmed=true>"No schema captured yet."</Text> }.into_any()
+                            } else {
+                                view! {
+                                    <DetailList mono=true>
+                                        {sv.fields.into_iter().map(|f| {
+                                            let opt = if f.nullable { "nullable" } else { "required" };
+                                            view! { <KeyValue label=f.name>{format!("{} · {opt}", f.ty)}</KeyValue> }
+                                        }).collect_view()}
+                                    </DetailList>
+                                }.into_any()
+                            };
+                            view! { <Stack gap="sm">{drift}{body}</Stack> }.into_any()
+                        }}
+                        <SectionLabel label="Dead-letters" count=Signal::derive(move || Some(detail_dls.get().len())) divider=true/>
+                        {move || {
+                            let dls = detail_dls.get();
+                            if dls.is_empty() {
+                                view! { <Text size="sm" dimmed=true>"None."</Text> }.into_any()
+                            } else {
+                                view! {
+                                    <Table mono=true fixed=true widths=vec!["38%".into(), "62%".into()] label="Dead-letters">
+                                        <thead><tr><th>"reason"</th><th>"record"</th></tr></thead>
+                                        <tbody>
+                                            {dls.into_iter().map(|d| view! {
+                                                <tr><td title=d.reason.clone()>{d.reason.clone()}</td><td title=d.record.clone()>{d.record.clone()}</td></tr>
+                                            }).collect_view()}
+                                        </tbody>
+                                    </Table>
+                                }.into_any()
+                            }
+                        }}
+                        <SectionLabel label="Logs" divider=true/>
+                        <LogView label="Logs" empty="No logs." max_height="260px"
+                            lines=Signal::derive(move || detail_logs.get().into_iter()
+                                .map(|l| LogLine::new(l.message).level_color(l.level.clone(), log_color(&l.level)))
+                                .collect::<Vec<_>>())/>
+                    </Modal>
+
+                    // Tenants admin ([[WEIR-T-0096]]) — platform-admin CRUD tenants + their keys.
+                    <Modal open=show_tenants title="Tenants" size="lg" on_close=Callback::new(move |_| minted_key.set(None))>
+                        <Stack>
+                            <Text size="sm" dimmed=true>"Administer tenants + their keys."</Text>
+                            <TextInput label="New tenant id" placeholder="acme" value=new_tenant_id mono=true/>
                             <div><Button on_click=Callback::new(move |_| create_tenant())>"Create tenant"</Button></div>
-                            <table class="weir-ttable">
+                            <Table label="Tenants">
                                 <thead><tr><th>"tenant"</th><th>"name"</th><th></th></tr></thead>
                                 <tbody>
                                     {move || tenants.get().into_iter().map(|(id, name)| {
-                                        let id2 = id.clone();
-                                        view! { <tr>
-                                            <td><code>{id.clone()}</code></td><td>{name}</td>
-                                            <td><span class="weir-signout" on:click=move |_| { minted_key.set(None); load_keys(id2.clone()); }>"keys →"</span></td>
-                                        </tr> }
-                                    }).collect::<Vec<_>>()}
+                                        let (id2, id3) = (id.clone(), id.clone());
+                                        view! {
+                                            <TableRow label=format!("keys of {id}") selected=Signal::derive(move || sel_tenant.get() == id3)
+                                                on_click=Callback::new(move |_| { minted_key.set(None); load_keys(id2.clone()); })>
+                                                <td><Code>{id.clone()}</Code></td>
+                                                <td>{name}</td>
+                                                <td class="cl-num"><Text size="xs" dimmed=true>"Keys →"</Text></td>
+                                            </TableRow>
+                                        }
+                                    }).collect_view()}
                                 </tbody>
-                            </table>
+                            </Table>
                             {move || (!sel_tenant.get().is_empty()).then(|| view! {
-                                <div class="weir-keys">
-                                    <Text size="xs" dimmed=true>{move || format!("keys · {}", sel_tenant.get())}</Text>
-                                    {move || minted_key.get().map(|k| view! {
-                                        <div class="weir-minted">"new key — copy now: "<code>{k}</code></div>
-                                    })}
-                                    <label class="weir-fld">"new key name"
-                                        <input class="cl-input" placeholder="ci"
-                                            prop:value=move || new_key_name.get()
-                                            on:input=move |e| new_key_name.set(event_target_value(&e))/>
-                                    </label>
-                                    <div><Button on_click=Callback::new(move |_| mint_key())>"Mint key"</Button></div>
-                                    <table class="weir-ttable">
-                                        <tbody>
-                                            {move || tenant_keys.get().into_iter().map(|(kid, name, role, revoked)| {
-                                                let kid2 = kid.clone();
-                                                view! { <tr>
-                                                    <td>{name}</td><td>{role}</td>
-                                                    <td>{if revoked { "revoked" } else { "" }}</td>
-                                                    <td>{(!revoked).then(|| view! {
-                                                        <span class="weir-signout" on:click=move |_| revoke_key(kid2.clone())>"revoke"</span>
-                                                    })}</td>
-                                                </tr> }
-                                            }).collect::<Vec<_>>()}
-                                        </tbody>
-                                    </table>
-                                </div>
+                                <SectionLabel label=format!("Keys · {}", sel_tenant.get()) divider=true/>
+                                {move || minted_key.get().map(|k| view! {
+                                    <SecretReveal secret=k label="New API key"
+                                        on_done=Callback::new(move |_| minted_key.set(None))/>
+                                })}
+                                <TextInput label="New key name" placeholder="ci" value=new_key_name/>
+                                <div><Button on_click=Callback::new(move |_| mint_key())>"Mint key"</Button></div>
+                                <Table label="Keys">
+                                    <thead><tr><th>"name"</th><th>"role"</th><th>"state"</th><th></th></tr></thead>
+                                    <tbody>
+                                        {move || tenant_keys.get().into_iter().map(|(kid, name, role, revoked)| {
+                                            view! { <tr>
+                                                <td>{name}</td><td>{role}</td>
+                                                <td>{if revoked {
+                                                    view! { <Pill color=token::MUTED>"revoked"</Pill> }.into_any()
+                                                } else {
+                                                    view! { <Pill color=token::OK>"active"</Pill> }.into_any()
+                                                }}</td>
+                                                <td class="cl-num">{(!revoked).then(|| view! {
+                                                    <Button variant="subtle" size="xs" bad=true
+                                                        on_click=Callback::new(move |_| { revoke_id.set(kid.clone()); revoke_open.set(true); })>
+                                                        "Revoke"
+                                                    </Button>
+                                                })}</td>
+                                            </tr> }
+                                        }).collect_view()}
+                                    </tbody>
+                                </Table>
                             })}
-                        </div>
-                    </Panel>
-                </div>
-            </div>
-        })}
+                        </Stack>
+                    </Modal>
+
+                    <ConfirmDialog open=del_open title="Delete connection?" confirm_label="Delete"
+                        message="This removes the connection and stops its schedule. Its run history stays."
+                        on_confirm=Callback::new(move |_| { del_conn.run(del_name.get_untracked()); del_open.set(false); })>
+                        <Text mono=true bold=true>{move || del_name.get()}</Text>
+                    </ConfirmDialog>
+                    <ConfirmDialog open=revoke_open title="Revoke key?" confirm_label="Revoke"
+                        message="A revoked key stops working at once. This cannot be undone."
+                        on_confirm=Callback::new(move |_| { revoke_key(revoke_id.get_untracked()); revoke_open.set(false); })/>
+                </AppShell>
+            }.into_any()
+        }}
     }
 }
 
+/// The weir mark: the gradient glyph + wordmark (brand stays in the product).
 #[component]
-fn ConnectionCard(
-    conn: Connection,
-    last: Option<RunRow>,
+fn Brand() -> impl IntoView {
+    view! {
+        <span class="weir-brand">
+            <span class="weir-glyph">"≋"</span>
+            <span class="weir-wordmark">"weir"</span>
+        </span>
+    }
+}
+
+/// Log level → an Aurora hue token.
+fn log_color(level: &str) -> &'static str {
+    match level.to_ascii_lowercase().as_str() {
+        "error" => token::BAD,
+        "warn" | "warning" => token::GOLD,
+        "info" => token::ICE,
+        _ => token::MUTED,
+    }
+}
+
+// ---------------------------------------------------------------------------- views
+
+/// The Setup view's signals + actions.
+struct SetupState {
+    catalog: RwSignal<Vec<CatalogItem>>,
+    available: RwSignal<Vec<AvailableItem>>,
+    props: RwSignal<Vec<Prop>>,
+    streams: RwSignal<Vec<String>>,
+    add_pkg: RwSignal<String>,
+    add_manifest: RwSignal<String>,
+    add_path: RwSignal<String>,
+    preview: RwSignal<Option<PreviewReport>>,
+    name: RwSignal<String>,
+    src: RwSignal<String>,
+    dst: RwSignal<String>,
+    stream: RwSignal<String>,
+    config: RwSignal<String>,
+    every: RwSignal<String>,
+    exec_mode: RwSignal<String>,
+    onboard_pick: Callback<()>,
+    do_preview: Callback<()>,
+    onboard_byo: Callback<()>,
+    save_conn: Callback<()>,
+}
+
+fn setup_view(s: SetupState) -> AnyView {
+    let SetupState {
+        catalog, available, props, streams, add_pkg, add_manifest, add_path, preview,
+        name, src, dst, stream, config, every, exec_mode,
+        onboard_pick, do_preview, onboard_byo, save_conn,
+    } = s;
+    // Picker options (raw_name, friendly), onboarded dropped.
+    let cat = catalog.get();
+    let avail = available.get();
+    let registered: HashSet<String> = cat.iter().map(|c| c.name.clone()).collect();
+    let mut opts: Vec<(String, String)> = Vec::new();
+    for want in ["manifest", "dest-manifest", "other"] {
+        for p in avail.iter().filter(|p| {
+            let k = if want == "other" { p.kind != "manifest" && p.kind != "dest-manifest" } else { p.kind == want };
+            k && !is_onboarded(p, &registered)
+        }) {
+            opts.push((p.name.clone(), friendly(p)));
+        }
+    }
+    let versioned = |c: &CatalogItem| (c.name.clone(), format!("{} · {}", c.name, c.version));
+    let sources: Vec<(String, String)> =
+        cat.iter().filter(|c| c.roles.iter().any(|r| r == "Source")).map(versioned).collect();
+    let dests: Vec<(String, String)> = cat
+        .iter()
+        .filter(|c| c.roles.iter().any(|r| r == "Destination" || r == "ReverseEtl"))
+        .map(versioned)
+        .collect();
+    let prop_list = props.get();
+    let stream_list = streams.get();
+    let modes = vec![
+        ("run_once".to_string(), "run once · scheduled / batch".to_string()),
+        ("resident".to_string(), "resident · long-lived (Start/Stop; every = cadence)".to_string()),
+    ];
+
+    view! {
+        <Panel title="Add a connector" caption="discover · onboard">
+            <div class="weir-form">
+                <Select label="Pick a connector" placeholder="— select a connector —" option_pairs=opts value=add_pkg/>
+                <div><Button on_click=onboard_pick>"Onboard"</Button></div>
+            </div>
+        </Panel>
+
+        <Panel title="Bring your own" caption="paste a manifest · or a crate path">
+            <div class="weir-form">
+                <Textarea label="Paste a declarative manifest (YAML)" rows=6 mono=true
+                    placeholder="type: DeclarativeSource\nstreams:\n  - ..." value=add_manifest/>
+                <TextInput label="Or a crate path (full-code)" placeholder="/path/to/weir-connector-foo"
+                    value=add_path mono=true/>
+                <Group gap="sm">
+                    <Button variant="default" on_click=do_preview>"Preview"</Button>
+                    <Button on_click=onboard_byo>"Onboard"</Button>
+                </Group>
+                {move || preview.get().map(|rep| view! {
+                    <Alert title="Preview" color=token::ICE>
+                        <Text size="xs" mono=true>
+                            {format!("tier {} · confidence {:.2} · streams {}", rep.tier, rep.confidence, rep.streams.len())}
+                        </Text>
+                        {if rep.unsupported.is_empty() {
+                            view! { <Text size="xs" dimmed=true>"Fully supported by the runtime."</Text> }.into_any()
+                        } else {
+                            view! { <Text size="xs" dimmed=true>{format!("gaps: {}", rep.unsupported.join(", "))}</Text> }.into_any()
+                        }}
+                    </Alert>
+                })}
+            </div>
+        </Panel>
+
+        <Panel title="New / edit connection" caption="wire a source to a destination">
+            <div class="weir-form">
+                <TextInput label="Name" placeholder="my-sync" value=name mono=true/>
+                <SimpleGrid cols=2>
+                    <Select label="Source" placeholder="— source —" option_pairs=sources value=src/>
+                    <Select label="Destination" placeholder="— destination —" option_pairs=dests value=dst/>
+                </SimpleGrid>
+                <SimpleGrid cols=2>
+                    {if stream_list.is_empty() {
+                        view! { <TextInput label="Stream" value=stream mono=true/> }.into_any()
+                    } else {
+                        view! { <Select label="Stream" placeholder="— stream —" options=stream_list value=stream/> }.into_any()
+                    }}
+                    {move || {
+                        let label = if exec_mode.get() == "resident" { "Every (secs) · emit cadence" } else { "Every (secs)" };
+                        view! { <TextInput label=label placeholder="—" value=every mono=true/> }
+                    }}
+                </SimpleGrid>
+                <Select label="Execution mode" option_pairs=modes value=exec_mode/>
+                {(!prop_list.is_empty()).then(|| view! {
+                    <SectionLabel label=format!("config · {} contract", src.get_untracked()) divider=true/>
+                    <SimpleGrid cols=2>
+                        {prop_list.into_iter().map(|p| config_field(p, config)).collect_view()}
+                    </SimpleGrid>
+                })}
+                <Textarea label="Config (JSON)" rows=3 mono=true value=config/>
+                <div><Button on_click=save_conn>"Save connection"</Button></div>
+            </div>
+        </Panel>
+    }
+    .into_any()
+}
+
+/// One field of a connector's config contract, bound both ways to the config JSON.
+fn config_field(p: Prop, config: RwSignal<String>) -> impl IntoView {
+    let field = RwSignal::new(cfg_get(&config.get_untracked(), &p.key));
+    let (k_sync, k_set, kind_sync, kind_set) = (p.key.clone(), p.key.clone(), p.kind.clone(), p.kind.clone());
+    // The JSON textarea can change the config too: follow it, unless the config already
+    // holds what this field's text means (so typing "1." is not rewritten to "1").
+    Effect::new(move |_| {
+        let now = cfg_get(&config.get(), &k_sync);
+        let mine = field.get_untracked();
+        if now != cfg_get(&cfg_set("{}", &k_sync, &mine, &kind_sync), &k_sync) {
+            field.set(now);
+        }
+    });
+    let on_input = Callback::new(move |v: String| {
+        config.set(cfg_set(&config.get_untracked(), &k_set, &v, &kind_set));
+    });
+    let input_type = if p.secret { "password" } else { "text" };
+    view! { <TextInput label=p.key placeholder=p.kind value=field input_type=input_type on_input=on_input mono=true/> }
+}
+
+fn health_view(health: RwSignal<Vec<ConnHealth>>, open_detail: Callback<String>) -> AnyView {
+    view! {
+        <Panel title="Needs attention" caption="amber + red connections, worst first">
+            {move || {
+                let mut hs = health.get();
+                hs.sort_by_key(|h| health_rank(&h.status));
+                let attn: Vec<ConnHealth> = hs.into_iter()
+                    .filter(|h| h.status == "red" || h.status == "amber").collect();
+                if attn.is_empty() {
+                    view! { <Text size="sm" dimmed=true>"All connections healthy."</Text> }.into_any()
+                } else {
+                    view! {
+                        <Table mono=true label="Needs attention">
+                            <thead><tr><th>"status"</th><th>"connection"</th><th class="cl-num">"lag"</th><th class="cl-num">"errors"</th><th class="cl-num">"dead"</th></tr></thead>
+                            <tbody>
+                                {attn.into_iter().map(|h| {
+                                    let name = h.connection.clone();
+                                    view! {
+                                        <TableRow label=h.connection.clone() on_click=Callback::new(move |_| open_detail.run(name.clone()))>
+                                            <td><Pill color=health_color(&h.status)>{h.status.clone()}</Pill></td>
+                                            <td>{h.connection.clone()}</td>
+                                            <td class="cl-num">{fmt_lag(h.lag_ms)}</td>
+                                            <td class="cl-num">{format!("{:.0}%", h.error_rate * 100.0)}</td>
+                                            <td class="cl-num">{h.dead_letters.to_string()}</td>
+                                        </TableRow>
+                                    }
+                                }).collect_view()}
+                            </tbody>
+                        </Table>
+                    }.into_any()
+                }
+            }}
+        </Panel>
+        <Panel title="Connection health" caption="freshness · errors · dead letters · throughput">
+            {move || {
+                let mut hs = health.get();
+                hs.sort_by_key(|h| health_rank(&h.status));
+                if hs.is_empty() {
+                    view! { <Text size="sm" dimmed=true>"No connections yet — add one in Setup."</Text> }.into_any()
+                } else {
+                    view! {
+                        <SimpleGrid cols=3>
+                            {hs.into_iter().map(|h| {
+                                let name = h.connection.clone();
+                                let spark: Vec<f64> = h.throughput.iter().map(|v| *v as f64).collect();
+                                let spark_label = format!("{} throughput", h.connection);
+                                view! {
+                                    <Card label=h.connection.clone() on_click=Callback::new(move |_| open_detail.run(name.clone()))
+                                        attr:data-testid="health-card">
+                                        <Stack gap="xs">
+                                            <Group gap="sm">
+                                                <Pill color=health_color(&h.status)>{h.status.clone()}</Pill>
+                                                <Text bold=true mono=true>{h.connection.clone()}</Text>
+                                            </Group>
+                                            <Group gap="sm" wrap=true>
+                                                <Text size="xs" dimmed=true mono=true>{format!("lag {}", fmt_lag(h.lag_ms))}</Text>
+                                                <Text size="xs" dimmed=true mono=true>{format!("err {:.0}%", h.error_rate * 100.0)}</Text>
+                                                <Text size="xs" dimmed=true mono=true>{format!("dl {}", h.dead_letters)}</Text>
+                                                <Text size="xs" dimmed=true mono=true>{format!("{} rows", h.rows_recent)}</Text>
+                                            </Group>
+                                            {(!spark.is_empty()).then(|| view! {
+                                                <Sparkline values=spark fluid=true height=22.0 color=token::ICE
+                                                    label=spark_label.clone()/>
+                                            })}
+                                        </Stack>
+                                    </Card>
+                                }
+                            }).collect_view()}
+                        </SimpleGrid>
+                    }.into_any()
+                }
+            }}
+        </Panel>
+    }
+    .into_any()
+}
+
+fn platform_view(platform: RwSignal<PlatformHealth>, drill_tenant: Callback<String>) -> AnyView {
+    view! {
+        <SimpleGrid cols=3>
+            <StatTile label="Tenants" value=Signal::derive(move || platform.get().tenants.len().to_string())/>
+            <StatTile label="Active" value=Signal::derive(move || platform.get().active_tenants.to_string()) color=token::OK/>
+            <StatTile label="Queue depth" value=Signal::derive(move || platform.get().total_queue_depth.to_string()) sub="runs waiting, all tenants"/>
+        </SimpleGrid>
+        <Panel title="Tenant health" caption="worst first · click to drill in">
+            {move || {
+                let mut ts = platform.get().tenants;
+                ts.sort_by_key(|t| health_rank(&t.status));
+                if ts.is_empty() {
+                    view! { <Text size="sm" dimmed=true>"No tenants."</Text> }.into_any()
+                } else {
+                    view! {
+                        <SimpleGrid cols=3>
+                            {ts.into_iter().map(|t| {
+                                let tid = t.tenant.clone();
+                                view! {
+                                    <Card label=t.tenant.clone() on_click=Callback::new(move |_| drill_tenant.run(tid.clone()))
+                                        attr:data-testid="tenant-card">
+                                        <Stack gap="xs">
+                                            <Group gap="sm">
+                                                <Pill color=health_color(&t.status)>{t.status.clone()}</Pill>
+                                                <Text bold=true mono=true>{t.tenant.clone()}</Text>
+                                            </Group>
+                                            <Group gap="sm" wrap=true>
+                                                <Text size="xs" dimmed=true mono=true>{format!("{} conns", t.connections)}</Text>
+                                                <Text size="xs" dimmed=true mono=true>{format!("{} failing", t.needs_attention)}</Text>
+                                                <Text size="xs" dimmed=true mono=true>{format!("dl {}", t.dead_letters)}</Text>
+                                                <Text size="xs" dimmed=true mono=true>{format!("queue {}", t.queue_depth)}</Text>
+                                            </Group>
+                                        </Stack>
+                                    </Card>
+                                }
+                            }).collect_view()}
+                        </SimpleGrid>
+                    }.into_any()
+                }
+            }}
+        </Panel>
+        <Panel title="Needs attention" caption="failing connections across all tenants">
+            {move || {
+                let attn = platform.get().needs_attention;
+                if attn.is_empty() {
+                    view! { <Text size="sm" dimmed=true>"All tenants healthy."</Text> }.into_any()
+                } else {
+                    view! {
+                        <Table mono=true label="Needs attention">
+                            <thead><tr><th>"status"</th><th>"tenant"</th><th>"connection"</th></tr></thead>
+                            <tbody>
+                                {attn.into_iter().map(|a| {
+                                    let tid = a.tenant.clone();
+                                    view! {
+                                        <TableRow label=format!("{} · {}", a.tenant, a.connection)
+                                            on_click=Callback::new(move |_| drill_tenant.run(tid.clone()))>
+                                            <td><Pill color=health_color(&a.status)>{a.status.clone()}</Pill></td>
+                                            <td>{a.tenant.clone()}</td>
+                                            <td>{a.connection.clone()}</td>
+                                        </TableRow>
+                                    }
+                                }).collect_view()}
+                            </tbody>
+                        </Table>
+                    }.into_any()
+                }
+            }}
+        </Panel>
+    }
+    .into_any()
+}
+
+/// What a connection card can do.
+#[derive(Clone, Copy)]
+struct ConnActions {
     on_open: Callback<String>,
     on_run: Callback<String>,
     on_delete: Callback<String>,
     on_start: Callback<String>,
     on_stop: Callback<String>,
-) -> impl IntoView {
+}
+
+fn operations_view(
+    connections: RwSignal<Vec<Connection>>,
+    runs: RwSignal<Vec<RunRow>>,
+    actions: ConnActions,
+) -> AnyView {
+    view! {
+        <Panel title="Connections" caption="live runs">
+            {move || {
+                let rs = runs.get();
+                let cs = connections.get();
+                if cs.is_empty() {
+                    view! { <Text size="sm" dimmed=true>"No connections yet — add one in Setup."</Text> }.into_any()
+                } else {
+                    view! {
+                        <SimpleGrid cols=3>
+                            {cs.into_iter().map(|c| {
+                                let last = latest_run(&rs, &c.name);
+                                view! { <ConnectionCard conn=c last=last actions=actions/> }
+                            }).collect_view()}
+                        </SimpleGrid>
+                    }.into_any()
+                }
+            }}
+        </Panel>
+        <Panel title="Run feed" caption="most recent first">
+            {move || {
+                let rs = runs.get();
+                if rs.is_empty() {
+                    view! { <Text size="sm" dimmed=true>"No runs yet."</Text> }.into_any()
+                } else {
+                    view! {
+                        <Table mono=true fixed=true widths=vec!["64px".into(), "24%".into(), "120px".into(), "auto".into()] label="Run feed">
+                            <thead><tr><th>"#"</th><th>"connection"</th><th>"state"</th><th>"detail"</th></tr></thead>
+                            <tbody>
+                                {rs.into_iter().map(|r| {
+                                    let name = r.connection.clone();
+                                    let metrics = run_metrics(&r);
+                                    view! {
+                                        <TableRow label=format!("run {} · {}", r.id, r.connection)
+                                            on_click=Callback::new(move |_| actions.on_open.run(name.clone()))>
+                                            <td>{r.id}</td>
+                                            <td>{r.connection.clone()}</td>
+                                            <td><Pill color=state_color(&r.state)>{r.state.clone()}</Pill></td>
+                                            <td title=metrics.clone()>{metrics.clone()}</td>
+                                        </TableRow>
+                                    }
+                                }).collect_view()}
+                            </tbody>
+                        </Table>
+                    }.into_any()
+                }
+            }}
+        </Panel>
+    }
+    .into_any()
+}
+
+#[component]
+fn ConnectionCard(conn: Connection, last: Option<RunRow>, actions: ConnActions) -> impl IntoView {
     let state = last.as_ref().map(|r| r.state.clone()).unwrap_or_else(|| "idle".to_string());
-    let color = state_color(&state).to_string();
     let when = match &last {
         Some(r) => format!("#{} · {}", r.id, run_metrics(r)),
         None => "no runs yet".to_string(),
@@ -1551,108 +1589,101 @@ fn ConnectionCard(
     let (n_open, n_run, n_del, n_start, n_stop) = (
         conn.name.clone(), conn.name.clone(), conn.name.clone(), conn.name.clone(), conn.name.clone(),
     );
+    let (pill_color, pill_label) = if resident {
+        if live { (token::OK, "resident • live".to_string()) } else { (token::MUTED, "resident • stopped".to_string()) }
+    } else {
+        (state_color(&state), state.clone())
+    };
     view! {
-        <div class="weir-card" on:click=move |_| on_open.run(n_open.clone())>
-            <div class="weir-card__top">
-                <span class="weir-card__name">{conn.name.clone()}</span>
-                {if resident {
-                    let (rc, rl) = if live { (token::OK, "resident • live") } else { (token::MUTED, "resident • stopped") };
-                    view! { <Pill color=rc.to_string()>{rl}</Pill> }.into_any()
-                } else {
-                    view! { <Pill color=color.clone()>{state.clone()}</Pill> }.into_any()
-                }}
-            </div>
-            <div class="weir-flow">
-                <span class="weir-node">{conn.source.clone()}</span>
-                <span class="weir-arr">"──▶"</span>
-                <span class="weir-node">{conn.dest.clone()}</span>
-            </div>
-            <Text size="xs" dimmed=true mono=true>{format!("stream · {}", conn.stream)}</Text>
-            <div class="weir-card__foot">
-                <Text size="xs" dimmed=true mono=true>{when}</Text>
-                <div class="weir-foot-btns" on:click=move |e: leptos::ev::MouseEvent| e.stop_propagation()>
-                    <Button variant="default" size="xs" bad=true on_click=Callback::new(move |_| on_delete.run(n_del.clone()))>"del"</Button>
-                    {if resident {
-                        view! {
-                            <Button variant="default" size="xs" on_click=Callback::new(move |_| on_stop.run(n_stop.clone()))>"Stop"</Button>
-                            <Button size="xs" on_click=Callback::new(move |_| on_start.run(n_start.clone()))>"Start"</Button>
-                        }.into_any()
-                    } else {
-                        view! {
-                            <Button size="xs" on_click=Callback::new(move |_| on_run.run(n_run.clone()))>"Run"</Button>
-                        }.into_any()
-                    }}
-                </div>
-            </div>
-        </div>
+        <Card label=conn.name.clone() on_click=Callback::new(move |_| actions.on_open.run(n_open.clone()))
+            attr:data-testid="connection-card">
+            <Stack gap="xs">
+                <Group justify="between" gap="sm">
+                    <Text bold=true mono=true>{conn.name.clone()}</Text>
+                    <Pill color=pill_color>{pill_label}</Pill>
+                </Group>
+                <Group gap="sm">
+                    <Text size="sm" mono=true>{conn.source.clone()}</Text>
+                    <span class="weir-arr" aria-label="to">"──▶"</span>
+                    <Text size="sm" mono=true>{conn.dest.clone()}</Text>
+                </Group>
+                <Text size="xs" dimmed=true mono=true>{format!("stream · {}", conn.stream)}</Text>
+                <Group justify="between" gap="sm">
+                    <Text size="xs" dimmed=true mono=true>{when}</Text>
+                    <Group gap="xs">
+                        <Button variant="default" size="xs" bad=true stop_propagation=true
+                            on_click=Callback::new(move |_| actions.on_delete.run(n_del.clone()))>"Delete"</Button>
+                        {if resident {
+                            view! {
+                                <Button variant="default" size="xs" stop_propagation=true
+                                    on_click=Callback::new(move |_| actions.on_stop.run(n_stop.clone()))>"Stop"</Button>
+                                <Button size="xs" stop_propagation=true
+                                    on_click=Callback::new(move |_| actions.on_start.run(n_start.clone()))>"Start"</Button>
+                            }.into_any()
+                        } else {
+                            view! {
+                                <Button size="xs" stop_propagation=true
+                                    on_click=Callback::new(move |_| actions.on_run.run(n_run.clone()))>"Run"</Button>
+                            }.into_any()
+                        }}
+                    </Group>
+                </Group>
+            </Stack>
+        </Card>
     }
 }
 
-/// Top-nav layout + card/form scaffolding (Aurora's AppShell is sidebar-oriented); colors/type
-/// come from Aurora tokens.
+/// What Aurora does not do for weir: the brand mark, the page width, the sticky error
+/// slot, the connection-flow arrow and the form rhythm. Every colour is an Aurora token.
 const LAYOUT_CSS: &str = r#"
-.weir-header { position: sticky; top: 0; z-index: 5; padding: 14px 26px;
-  border-bottom: 1px solid var(--border); background: var(--sidebar); }
+.weir-brand { display: inline-flex; align-items: baseline; gap: 6px; }
 .weir-glyph, .weir-wordmark { font-family: var(--font-mono); font-weight: 700;
   background: var(--aurora-3); -webkit-background-clip: text; background-clip: text; color: transparent; }
 .weir-glyph { font-size: 19px; } .weir-wordmark { font-size: 20px; letter-spacing: .05em; }
-.weir-stat { font-family: var(--font-mono); font-size: 11px; letter-spacing: .06em;
-  text-transform: uppercase; color: var(--faint); }
-.weir-main { max-width: 1180px; margin: 0 auto; padding: 24px 26px; display: grid; gap: 20px; }
-.weir-card { border: 1px solid var(--border); border-radius: var(--radius-panel);
-  background: var(--panel); padding: 14px 15px; display: grid; gap: 9px; cursor: pointer;
-  transition: border-color .15s, transform .15s; }
-.weir-card:hover { border-color: var(--border-control); transform: translateY(-2px); }
-.weir-card__top { display: flex; align-items: center; justify-content: space-between; }
-.weir-card__name { font-family: var(--font-mono); font-weight: 700; }
-.weir-flow { display: flex; align-items: center; gap: 8px; font-family: var(--font-mono); font-size: 12px; }
-.weir-node { color: var(--fg-2); } .weir-arr { color: var(--ice); }
-.weir-card__foot { display: flex; align-items: center; justify-content: space-between; margin-top: 2px; }
-.weir-foot-btns { display: flex; gap: 6px; }
-.weir-feed-row { cursor: pointer; }
-.weir-health-card { border: 1px solid var(--border); border-radius: var(--radius-panel); padding: 12px 14px;
-    display: grid; gap: 8px; cursor: pointer; transition: border-color .15s, transform .15s; }
-.weir-health-card:hover { border-color: var(--border-control); transform: translateY(-2px); }
-.weir-health-head { display: flex; align-items: center; gap: 8px; }
-.weir-health-name { font-family: var(--font-mono); font-weight: 700; }
-.weir-schema-view { display: grid; gap: 6px; }
-.weir-drift { display: flex; align-items: center; justify-content: space-between; gap: 12px;
-  padding: 8px 12px; margin-bottom: 8px; border: 1px solid var(--bad);
-  border-radius: var(--radius-panel); background: color-mix(in srgb, var(--bad) 12%, var(--panel)); }
-.weir-drift-accept { font-family: var(--font-mono); font-size: 11px; padding: 4px 10px; white-space: nowrap;
-  border: 1px solid var(--border-control); border-radius: var(--radius-panel); background: var(--panel);
-  color: inherit; cursor: pointer; }
-.weir-drift-accept:hover { border-color: var(--bad); }
-.weir-health-stats { display: flex; flex-wrap: wrap; gap: 4px 12px; font-family: var(--font-mono);
-    font-size: 11px; color: var(--fg-2); }
-.weir-spark { width: 100%; height: 22px; color: var(--ice); display: block; }
-.weir-form { display: grid; gap: 12px; }
-.weir-two { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-.weir-fld { display: grid; gap: 5px; font-family: var(--font-mono); font-size: 11px; letter-spacing: .05em;
-  text-transform: uppercase; color: var(--muted); }
-.weir-schema { display: grid; gap: 10px; padding: 12px; border: 1px solid var(--border);
-  border-radius: var(--radius-sm4); background: var(--inset); }
-.weir-preview { padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius-sm4);
-  background: var(--inset); }
-.weir-detail-sec { margin: 12px 0 4px; border-top: 1px solid var(--border); padding-top: 8px; }
-.weir-toast { position: fixed; top: 16px; right: 16px; z-index: 50; font-family: var(--font-mono);
-  font-size: 12.5px; padding: 10px 14px; border-radius: var(--radius-sm4); background: var(--panel);
-  border: 1px solid var(--border); box-shadow: 0 8px 28px rgba(0,0,0,.45); }
-.weir-toast--ok { border-color: var(--ok); } .weir-toast--err { border-color: var(--bad); }
-.weir-apierr { position: fixed; top: 0; left: 0; right: 0; z-index: 60; text-align: center;
-  font-family: var(--font-mono); font-size: 12px; padding: 6px 12px;
-  background: #3a1418; color: #ffb4b4; border-bottom: 1px solid var(--bad); cursor: default; }
-.weir-signout { font-family: var(--font-mono); font-size: 11px; letter-spacing: .05em;
-  text-transform: uppercase; color: var(--faint); cursor: pointer; }
-.weir-signout:hover { color: var(--fg-2); }
-.weir-tenant { font-family: var(--font-mono); font-size: 11px; background: var(--bg-2); color: var(--fg-1); border: 1px solid var(--border); border-radius: 6px; padding: 3px 6px; cursor: pointer; }
-.weir-tenant-chip { font-family: var(--font-mono); font-size: 11px; color: var(--fg-2); background: var(--bg-2); border: 1px solid var(--border); border-radius: 6px; padding: 3px 8px; }
-.weir-tenants-card { width: min(560px, 92vw); max-height: 86vh; overflow: auto; }
-.weir-ttable { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 8px; }
-.weir-ttable th, .weir-ttable td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--border); }
-.weir-keys { margin-top: 14px; border-top: 1px solid var(--border); padding-top: 10px; }
-.weir-minted { font-family: var(--font-mono); font-size: 11px; background: var(--bg-2); border: 1px solid var(--ok, #3a5); border-radius: 6px; padding: 6px 8px; margin: 6px 0; word-break: break-all; }
-.weir-auth-overlay { position: fixed; inset: 0; z-index: 100; display: grid; place-items: center;
-  background: rgba(10, 12, 16, .92); backdrop-filter: blur(3px); }
-.weir-auth-card { width: 360px; max-width: 92vw; }
+.weir-page { max-width: 1180px; margin: 0 auto; display: grid; gap: var(--space-lg); }
+.weir-alert-slot { position: sticky; top: 60px; z-index: 30; }
+.weir-arr { color: var(--ice); font-family: var(--font-mono); font-size: var(--fs-xs); }
+.weir-form { display: grid; gap: var(--space-md); }
+.weir-tenant { width: auto; max-width: 220px; height: var(--h-xs); font-size: var(--fs-xs); }
+@media (max-width: 768px) {
+  .weir-page .cl-simple-grid { grid-template-columns: minmax(0, 1fr) !important; }
+}
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn index_html_carries_the_theme_init_script() {
+        let html = include_str!("../index.html");
+        assert!(html.contains(aurora_leptos::THEME_INIT_SCRIPT), "index.html must inline THEME_INIT_SCRIPT");
+        assert!(html.contains(r#"name="color-scheme" content="light dark""#));
+    }
+
+    #[test]
+    fn layout_css_uses_only_defined_tokens_and_no_raw_colour() {
+        for bad in ["--bg-2", "--fg-1", "--radius-sm4", "rgba(", "rgb(", "#"] {
+            assert!(!LAYOUT_CSS.contains(bad), "LAYOUT_CSS contains {bad}");
+        }
+    }
+
+    #[test]
+    fn status_colours_are_theme_tokens() {
+        for s in ["done", "leased", "failed", "pending", "idle"] {
+            assert!(state_color(s).starts_with("var(--"));
+        }
+        for s in ["green", "amber", "red", "unknown"] {
+            assert!(health_color(s).starts_with("var(--"));
+        }
+        assert_eq!(log_color("ERROR"), token::BAD);
+    }
+
+    #[test]
+    fn config_field_round_trip_keeps_partial_numbers_stable() {
+        let cfg = cfg_set("{}", "rate", "1.5", "number");
+        assert_eq!(cfg_get(&cfg, "rate"), "1.5");
+        assert_eq!(cfg_get(&cfg_set("{}", "port", "", "integer"), "port"), "");
+        assert_eq!(cfg_get(&cfg_set("{}", "flag", "true", "boolean"), "flag"), "true");
+    }
+}

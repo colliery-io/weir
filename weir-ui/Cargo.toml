@@ -6,12 +6,12 @@
 name = "weir-ui"
 version = "0.1.0"
 edition = "2021"
-description = "Leptos web UI for weir (WASM, embedded in the weir binary), built on Colliery Aurora Dark."
+description = "Leptos web UI for weir (WASM, embedded in the weir binary), built on Colliery Aurora."
 
 [dependencies]
 leptos = { version = "0.8", features = ["csr"] }
-# Colliery Aurora Dark design system (published `aurora-leptos`), imported as `aurora_leptos`.
-colliery-io-aurora = "0.1"
+# Colliery Aurora design system (light + dark), imported as `aurora_leptos`.
+colliery-io-aurora = "0.4.0"
 gloo-net = "0.6"
 gloo-timers = { version = "0.3", features = ["futures"] }
 serde = { version = "1", features = ["derive"] }
