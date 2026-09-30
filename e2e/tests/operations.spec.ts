@@ -4,12 +4,14 @@ import { test, expect } from './fixtures';
 // (requires a seeded `fx-demo` connection on the running server).
 test('operations: card opens the run-detail modal', async ({ page }) => {
   await page.goto('/');
-  await expect(page.locator('.weir-card__name', { hasText: 'fx-demo' })).toBeVisible();
+  const card = page.getByTestId('connection-card').filter({ hasText: 'fx-demo' });
+  await expect(card).toBeVisible();
 
-  await page.locator('.weir-card__name').first().click();
-  await expect(page.getByText('run detail')).toBeVisible();
+  await card.first().click();
+  await expect(page.getByRole('dialog', { name: 'Run detail' })).toBeVisible();
   // Lineage panel ([[WEIR-T-0101]]): the source→dest chain renders.
-  await expect(page.getByText('Lineage')).toBeVisible();
-  await expect(page.getByText('Dead-letters')).toBeVisible();
-  await expect(page.getByText('Logs').first()).toBeVisible();
+  const dialog = page.getByRole('dialog', { name: 'Run detail' });
+  await expect(dialog.getByRole('heading', { name: 'Lineage' })).toBeVisible();
+  await expect(dialog.getByRole('heading', { name: 'Dead-letters' })).toBeVisible();
+  await expect(dialog.getByRole('heading', { name: 'Logs' })).toBeVisible();
 });
