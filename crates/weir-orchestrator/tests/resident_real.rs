@@ -15,6 +15,13 @@ use weir_orchestrator::{
     ConnectorRef, ExecutionMode, Fleet, InProcessExecutor, Origin, Relay, WorkSpec, WorkerConfig,
 };
 
+/// The two tests run one at a time. In parallel on a 2-vCPU CI runner they share the
+/// fixture builds and the wasm compile, and the tail run missed its deadline.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Generous for a debug-build wasm compile on a slow shared runner; a real wedge still fails.
+const DRAIN_DEADLINE: Duration = Duration::from_secs(60);
+
 fn stream(name: &str) -> ConfiguredStream {
     ConfiguredStream {
         stream: name.to_string(),
@@ -92,6 +99,7 @@ fn resident_spec() -> WorkSpec {
 
 #[tokio::test]
 async fn resident_does_not_block_runonce_real_executor() {
+    let _serial = SERIAL.lock().await;
     let tmp = tempfile::TempDir::new().unwrap();
     let store = Arc::new(Store::open(tmp.path().join("weir.db").to_str().unwrap()).unwrap());
     let relay = Relay::new(Arc::clone(&store)).unwrap();
@@ -116,7 +124,7 @@ async fn resident_does_not_block_runonce_real_executor() {
 
     // Drive like `serve`: run_until_idle each poll. The run-once units must reach `done`
     // WHILE the resident keeps running. A wedge/regression makes this hang → timeout → fail.
-    let drained = tokio::time::timeout(Duration::from_secs(20), async {
+    let drained = tokio::time::timeout(DRAIN_DEADLINE, async {
         loop {
             fleet.run_until_idle().await.unwrap();
             let all_done = ro
@@ -129,26 +137,25 @@ async fn resident_does_not_block_runonce_real_executor() {
         }
     })
     .await;
+    let resident_state = relay.state(res_id).unwrap();
+
+    // Shutdown ([[WEIR-T-0170]]): fire the resident's stop token — exactly what the
+    // serve/runner daemons now do on ctrl-c — so the blocking run ends at its next poll
+    // boundary and runtime teardown doesn't wait on the blocking pool forever (the wedge
+    // this test used to reproduce). Stop BEFORE asserting: a failed assertion that skips
+    // the stop leaves teardown waiting on the resident, and CI hung for 6 hours.
+    let stopped = relay.stop_all_residents();
 
     assert!(
         drained.is_ok(),
         "run-once did not drain while a resident runs (T-0146 wedge/regression)"
     );
     assert_eq!(
-        relay.state(res_id).unwrap().as_deref(),
+        resident_state.as_deref(),
         Some("leased"),
         "resident should still be running (leased), not completed/failed"
     );
-
-    // Shutdown ([[WEIR-T-0170]]): fire the resident's stop token — exactly what the
-    // serve/runner daemons now do on ctrl-c — so the blocking run ends at its next poll
-    // boundary and runtime teardown doesn't wait on the blocking pool forever (the wedge
-    // this test used to reproduce).
-    assert_eq!(
-        relay.stop_all_residents(),
-        1,
-        "exactly one live resident stopped at shutdown"
-    );
+    assert_eq!(stopped, 1, "exactly one live resident stopped at shutdown");
 }
 
 /// A tail (event-reader) unit: the unified `resident` fixture in `mode:tail` with a finite
@@ -180,6 +187,7 @@ fn tail_spec() -> WorkSpec {
 /// through the real drain path.)
 #[tokio::test]
 async fn tail_arrivals_drain_through_real_fleet() {
+    let _serial = SERIAL.lock().await;
     let tmp = tempfile::TempDir::new().unwrap();
     let store = Arc::new(Store::open(tmp.path().join("weir.db").to_str().unwrap()).unwrap());
     let relay = Relay::new(Arc::clone(&store)).unwrap();
@@ -197,7 +205,7 @@ async fn tail_arrivals_drain_through_real_fleet() {
             },
         )
     };
-    let done = tokio::time::timeout(Duration::from_secs(20), async {
+    let done = tokio::time::timeout(DRAIN_DEADLINE, async {
         loop {
             fleet.run_until_idle().await.unwrap();
             if relay.state(id).unwrap().as_deref() == Some("done") {
