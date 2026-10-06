@@ -19,6 +19,8 @@ jobs:
   check:
     name: Check
     runs-on: ubuntu-latest
+    # A hung test fails the job in an hour, not at the 6-hour runner limit.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
