@@ -221,8 +221,13 @@ services:
     image: bitnamilegacy/minio:2024.9.13@sha256:8a92f71856f4b4b5755fa6afe4e7f9d0db7e18c889318f6772cb342d9b13470d
     environment:
       MC_CONFIG_DIR: /tmp/.mc  # the image runs as uid 1001 with HOME=/
+    # `up --wait` fails when a service exits, even with status 0, so the job stays up after
+    # seeding and reports healthy once the marker file exists.
     healthcheck:
-      disable: true  # a one-shot job; the image's own server healthcheck does not apply
+      test: ["CMD", "test", "-f", "/tmp/seeded"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
     depends_on:
       minio:
         condition: service_healthy
@@ -236,7 +241,7 @@ services:
         mc mb --ignore-existing local/weir-test &&
         mc cp /fixtures/events.ndjson local/weir-test/events.ndjson &&
         mc cp /fixtures/more.ndjson local/weir-test/more.ndjson &&
-        echo "seeded weir-test"
+        echo "seeded weir-test" && touch /tmp/seeded && exec sleep infinity
 
   weir:
     profiles: ["demo"]
