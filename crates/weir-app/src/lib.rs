@@ -2293,7 +2293,6 @@ pub(crate) static MANIFESTS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::n
 #[cfg(test)]
 mod runs_feed_tests {
     use super::*;
-    use diesel::prelude::*;
     use weir_schema::work_units;
 
     fn insert_unit(store: &Store, id: i64, tenant: &str, state: &str) {
@@ -2307,7 +2306,7 @@ mod runs_feed_tests {
                 work_units::source_ref.eq("{}"),
                 work_units::dest_ref.eq("{}"),
                 work_units::state.eq(state),
-                work_units::finished_at.eq((state == "done").then(|| 1i64)),
+                work_units::finished_at.eq((state == "done").then_some(1i64)),
             ))
             .execute(&mut c)
             .unwrap();

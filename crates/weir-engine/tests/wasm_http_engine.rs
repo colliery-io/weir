@@ -116,8 +116,7 @@ fn mock_http_sequence(
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     thread::spawn(move || {
-        let mut i = 0usize;
-        for stream in listener.incoming() {
+        for (i, stream) in listener.incoming().enumerate() {
             let Ok(mut stream) = stream else { break };
             let req = read_full_request(&mut stream);
             requests
@@ -125,7 +124,6 @@ fn mock_http_sequence(
                 .unwrap()
                 .push(req.lines().next().unwrap_or_default().to_string());
             let body = bodies.get(i).copied().unwrap_or("[]");
-            i += 1;
             respond_ok(&mut stream, body);
         }
     });
@@ -1694,10 +1692,7 @@ fn request_body(req: &str) -> String {
     // De-chunk: `<hex-size>\r\n<data>\r\n` … terminated by a zero-size chunk.
     let mut out = String::new();
     let mut rest = raw;
-    loop {
-        let Some((size_line, tail)) = rest.split_once("\r\n") else {
-            break;
-        };
+    while let Some((size_line, tail)) = rest.split_once("\r\n") {
         let Ok(size) = usize::from_str_radix(size_line.trim(), 16) else {
             break;
         };
