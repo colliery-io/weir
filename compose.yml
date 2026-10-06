@@ -198,17 +198,19 @@ services:
 
   # MinIO — an S3-compatible object store for the `s3` connector's integration test
   # ([[WEIR-T-0109]]). Loopback-only; host port overridable to coexist. Test-only.
+  # MinIO stopped publishing community images in 2025: the minio/minio and minio/mc tags
+  # are gone from Docker Hub and quay.io (WEIR-T-0194). Bitnami's frozen legacy build of
+  # the same release is pinned by digest; it bundles `mc`, so minio-seed uses it too.
   minio:
     profiles: ["integration"]
-    image: minio/minio:RELEASE.2024-09-13T20-26-02Z
-    command: ["server", "/data"]
+    image: bitnamilegacy/minio:2024.9.13@sha256:8a92f71856f4b4b5755fa6afe4e7f9d0db7e18c889318f6772cb342d9b13470d
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
     ports:
       - "127.0.0.1:${WEIR_MINIO_HOST_PORT:-9000}:9000"
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/minio/health/live"]
       interval: 3s
       timeout: 3s
       retries: 20
@@ -216,7 +218,11 @@ services:
   # Seed the `weir-test` bucket with the NDJSON fixtures, then exit.
   minio-seed:
     profiles: ["integration"]
-    image: minio/mc:RELEASE.2024-09-16T17-43-14Z
+    image: bitnamilegacy/minio:2024.9.13@sha256:8a92f71856f4b4b5755fa6afe4e7f9d0db7e18c889318f6772cb342d9b13470d
+    environment:
+      MC_CONFIG_DIR: /tmp/.mc  # the image runs as uid 1001 with HOME=/
+    healthcheck:
+      disable: true  # a one-shot job; the image's own server healthcheck does not apply
     depends_on:
       minio:
         condition: service_healthy
