@@ -1,5 +1,5 @@
 //! weir control-plane UI — Leptos (CSR) on the Colliery Aurora design system
-//! ([[WEIR-A-0035]]), light and dark ([[COLLIERY-T-1838]]). Aurora ships the chrome;
+//! ([[WEIR-A-0035]]), light and dark ([[WEIR-T-0191]]). Aurora ships the chrome;
 //! weir supplies the data + vocabulary.
 //! Shell + Operations + Setup ([[WEIR-T-0079]]/[[WEIR-T-0080]]/[[WEIR-T-0081]]).
 
@@ -451,7 +451,7 @@ fn cfg_set(cfg: &str, key: &str, val: &str, kind: &str) -> String {
 
 #[component]
 fn App() -> impl IntoView {
-    // Light / dark / system ([[COLLIERY-T-1838]]); THEME_INIT_SCRIPT in index.html sets the first paint.
+    // Light / dark / system ([[WEIR-T-0191]]); THEME_INIT_SCRIPT in index.html sets the first paint.
     provide_theme();
     let view = RwSignal::new("Operations".to_string());
 
@@ -909,7 +909,7 @@ fn App() -> impl IntoView {
     };
 
 
-    // Confirm-destroy ([[COLLIERY-T-1838]]): delete + revoke go through Aurora's ConfirmDialog.
+    // Confirm-destroy ([[WEIR-T-0191]]): delete + revoke go through Aurora's ConfirmDialog.
     let del_open = RwSignal::new(false);
     let del_name = RwSignal::new(String::new());
     let ask_delete = Callback::new(move |n: String| {
@@ -1126,7 +1126,7 @@ fn App() -> impl IntoView {
                     </Modal>
 
                     // Tenants admin ([[WEIR-T-0096]]) — platform-admin CRUD tenants + their keys.
-                    <Modal open=show_tenants title="Tenants" size="lg" on_close=Callback::new(move |_| minted_key.set(None))>
+                    <Modal open=show_tenants title="Tenants" size="lg" close_on_scrim=false on_close=Callback::new(move |_| minted_key.set(None))>
                         <Stack>
                             <Text size="sm" dimmed=true>"Administer tenants + their keys."</Text>
                             <TextInput label="New tenant id" placeholder="acme" value=new_tenant_id mono=true/>
@@ -1649,7 +1649,7 @@ const LAYOUT_CSS: &str = r#"
 .weir-page { max-width: 1180px; margin: 0 auto; display: grid; gap: var(--space-lg); }
 /* grid items keep the page width: a wide table scrolls in its own box. */
 .weir-page > * { min-width: 0; }
-.weir-alert-slot { position: sticky; top: 60px; z-index: 30; }
+.weir-alert-slot { position: sticky; top: var(--cl-header-h); z-index: 30; }
 .weir-arr { color: var(--ice); font-family: var(--font-mono); font-size: var(--fs-xs); }
 .weir-form { display: grid; gap: var(--space-md); }
 .weir-tenant { width: auto; max-width: 220px; height: var(--h-xs); font-size: var(--fs-xs); }

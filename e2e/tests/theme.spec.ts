@@ -1,6 +1,6 @@
 import { test, expect } from './fixtures';
 
-// [[COLLIERY-T-1838]]: Aurora light/dark. The top bar has the Aurora ThemeToggle; the choice
+// [[WEIR-T-0191]]: Aurora light/dark. The top bar has the Aurora ThemeToggle; the choice
 // sets data-theme on <html>, is stored, and THEME_INIT_SCRIPT applies it on the next load.
 test('theme: the top-bar toggle switches light/dark and survives a reload', async ({ page }) => {
   await page.goto('/');
