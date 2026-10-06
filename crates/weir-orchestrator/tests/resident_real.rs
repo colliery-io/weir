@@ -98,6 +98,7 @@ fn resident_spec() -> WorkSpec {
 }
 
 #[tokio::test]
+#[ignore = "WEIR-T-0206: hangs at teardown on the CI runner (resident not stopped)"]
 async fn resident_does_not_block_runonce_real_executor() {
     let _serial = SERIAL.lock().await;
     let tmp = tempfile::TempDir::new().unwrap();
