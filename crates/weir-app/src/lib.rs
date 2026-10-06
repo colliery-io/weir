@@ -2290,6 +2290,12 @@ fn extract_mapping(config_json: &str) -> (MappingSpec, String) {
 #[cfg(test)]
 pub(crate) static MANIFESTS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Serializes tests that set the process-global `WEIR_CONNECTORS_DIR`, or that read it
+/// across a compile-and-stage, for the same reason as `MANIFESTS_ENV_LOCK`: one test's
+/// temp dir leaked into `compile_isolation_two_tenants_distinct_artifacts` in CI.
+#[cfg(test)]
+pub(crate) static CONNECTORS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod runs_feed_tests {
     use super::*;
@@ -2909,6 +2915,9 @@ streams:
 
     #[test]
     fn contract_gate_refuses_incompatible_then_allows_compatible() {
+        let _env = crate::CONNECTORS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Creation-time existence validation ([[WEIR-T-0166]]) needs real staged packages.
         unsafe {
             std::env::set_var("WEIR_CONNECTORS_DIR", weir_wasm_testkit::connectors_dir());
