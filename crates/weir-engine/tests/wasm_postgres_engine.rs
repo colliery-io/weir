@@ -907,7 +907,7 @@ fn pg_discover_lists_real_tables_with_pks() {
 fn pg_discover_empty_schema_and_error_cases() {
     let tmp = tempfile::TempDir::new().unwrap();
 
-    let empty = pg_at(tmp.path(), &format!("{}", pg_url()), None);
+    let empty = pg_at(tmp.path(), &pg_url(), None);
     // Point discover at a schema with no tables via the constructor config.
     let cfg = Config {
         json: format!("{{\"url\":\"{}\",\"schema\":\"no_such_schema\"}}", pg_url()),

@@ -333,6 +333,9 @@ mod tests {
     /// shared declarative runtime (`rest`) with the manifest baked into config.
     #[test]
     fn manifest_onboards_and_resolves_to_runtime() {
+        let _env = crate::CONNECTORS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::TempDir::new().unwrap();
         let app = App::open(tmp.path().join("weir.db").to_str().unwrap()).unwrap();
 
@@ -420,6 +423,9 @@ streams:
     /// spec() → register, then confirm it's cataloged + loadable (spec round-trips).
     #[test]
     fn import_local_crate_compiles_and_registers() {
+        let _env = crate::CONNECTORS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::TempDir::new().unwrap();
         // Stage into an isolated connectors dir (also where connector_ref resolves).
         unsafe { std::env::set_var("WEIR_CONNECTORS_DIR", tmp.path().join("connectors")) };
@@ -469,7 +475,12 @@ streams:
     /// on-disk artifacts — no cross-tenant reuse.
     #[test]
     fn compile_isolation_two_tenants_distinct_artifacts() {
+        let _env = crate::CONNECTORS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::TempDir::new().unwrap();
+        // Its own connectors dir, so the assertions below read where the imports staged.
+        unsafe { std::env::set_var("WEIR_CONNECTORS_DIR", tmp.path().join("connectors")) };
         let app = App::open(tmp.path().join("weir.db").to_str().unwrap()).unwrap();
         let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../wasm-fixtures/slow");
         app.import(

@@ -114,12 +114,18 @@ services:
         condition: service_healthy
     volumes:
       - ./test-fixtures/mssql:/fixtures:ro
+    # `up --wait` fails when a service exits, even with status 0: stay up, healthy once seeded.
+    healthcheck:
+      test: ["CMD", "test", "-f", "/tmp/seeded"]
+      interval: 2s
+      timeout: 2s
+      retries: 60
     entrypoint:
       - /bin/bash
       - -c
       - >
         /opt/mssql-tools18/bin/sqlcmd -S mssql-tls -U sa -P "weirStrong!Pass1" -N -C -b -i /fixtures/seed.sql &&
-        echo "seeded weir_demo (tls)"
+        echo "seeded weir_demo (tls)" && touch /tmp/seeded && exec sleep infinity
 
   # SQL Server — the source for the `mssql` connector's integration test
   # ([[WEIR-T-0161]]). Loopback-only; host port overridable to coexist. Test-only;
@@ -142,7 +148,7 @@ services:
       timeout: 5s
       retries: 30
 
-  # Seed the demo database + table the integration test reads, then exit.
+  # Seed the demo database + table the integration test reads.
   mssql-seed:
     profiles: ["integration"]
     image: mcr.microsoft.com/mssql/server:2022-latest
@@ -151,12 +157,18 @@ services:
         condition: service_healthy
     volumes:
       - ./test-fixtures/mssql:/fixtures:ro
+    # `up --wait` fails when a service exits, even with status 0: stay up, healthy once seeded.
+    healthcheck:
+      test: ["CMD", "test", "-f", "/tmp/seeded"]
+      interval: 2s
+      timeout: 2s
+      retries: 60
     entrypoint:
       - /bin/bash
       - -c
       - >
         /opt/mssql-tools18/bin/sqlcmd -S mssql -U sa -P "weirStrong!Pass1" -C -b -i /fixtures/seed.sql &&
-        echo "seeded weir_demo"
+        echo "seeded weir_demo" && touch /tmp/seeded && exec sleep infinity
 
   # MySQL — a server-speaks-first wire target for the TCP egress-policy probe
   # ([[WEIR-T-0175]] hostname-carrying egress; `wasm_tcp_probe_engine.rs`). No
@@ -198,25 +210,36 @@ services:
 
   # MinIO — an S3-compatible object store for the `s3` connector's integration test
   # ([[WEIR-T-0109]]). Loopback-only; host port overridable to coexist. Test-only.
+  # MinIO stopped publishing community images in 2025: the minio/minio and minio/mc tags
+  # are gone from Docker Hub and quay.io (WEIR-T-0194). Bitnami's frozen legacy build of
+  # the same release is pinned by digest; it bundles `mc`, so minio-seed uses it too.
   minio:
     profiles: ["integration"]
-    image: minio/minio:RELEASE.2024-09-13T20-26-02Z
-    command: ["server", "/data"]
+    image: bitnamilegacy/minio:2024.9.13@sha256:8a92f71856f4b4b5755fa6afe4e7f9d0db7e18c889318f6772cb342d9b13470d
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
     ports:
       - "127.0.0.1:${WEIR_MINIO_HOST_PORT:-9000}:9000"
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/minio/health/live"]
       interval: 3s
       timeout: 3s
       retries: 20
 
-  # Seed the `weir-test` bucket with the NDJSON fixtures, then exit.
+  # Seed the `weir-test` bucket with the NDJSON fixtures.
   minio-seed:
     profiles: ["integration"]
-    image: minio/mc:RELEASE.2024-09-16T17-43-14Z
+    image: bitnamilegacy/minio:2024.9.13@sha256:8a92f71856f4b4b5755fa6afe4e7f9d0db7e18c889318f6772cb342d9b13470d
+    environment:
+      MC_CONFIG_DIR: /tmp/.mc  # the image runs as uid 1001 with HOME=/
+    # `up --wait` fails when a service exits, even with status 0, so the job stays up after
+    # seeding and reports healthy once the marker file exists.
+    healthcheck:
+      test: ["CMD", "test", "-f", "/tmp/seeded"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
     depends_on:
       minio:
         condition: service_healthy
@@ -230,7 +253,7 @@ services:
         mc mb --ignore-existing local/weir-test &&
         mc cp /fixtures/events.ndjson local/weir-test/events.ndjson &&
         mc cp /fixtures/more.ndjson local/weir-test/more.ndjson &&
-        echo "seeded weir-test"
+        echo "seeded weir-test" && touch /tmp/seeded && exec sleep infinity
 
   weir:
     profiles: ["demo"]

@@ -1548,7 +1548,7 @@ mod google_sa_tests {
 
     /// Read one HTTP request (headers + content-length body) and answer with `body`.
     fn respond_json(s: &mut std::net::TcpStream, body: &str) -> String {
-        use std::io::{Read as _, Write as _};
+        use std::io::Read as _;
         s.set_read_timeout(Some(std::time::Duration::from_millis(500)))
             .ok();
         let mut data = Vec::new();
@@ -1774,7 +1774,7 @@ mod egress_tests {
                 let mut buf = [0u8; 4096];
                 let mut req = Vec::new();
                 // Read until the JSON body's closing brace arrives (canned, tiny).
-                while !req.windows(1).next_back().is_some_and(|w| w == b"}")
+                while req.last() != Some(&b'}')
                     && let Ok(k) = s.read(&mut buf)
                 {
                     if k == 0 {
