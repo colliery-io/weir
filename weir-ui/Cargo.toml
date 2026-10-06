@@ -12,8 +12,8 @@ description = "Leptos web UI for weir (WASM, embedded in the weir binary), built
 leptos = { version = "0.8", features = ["csr"] }
 # Colliery Aurora design system (light + dark), imported as `aurora_leptos`.
 # Exact pin: weir-ui/Cargo.lock is not tracked, so a caret range could pull a later 0.4.x
-# unreviewed. Bump it on purpose (AURORA-T-0007 brings 0.4.1).
-colliery-io-aurora = "=0.4.0"
+# unreviewed. Bump it on purpose.
+colliery-io-aurora = "=0.4.1"
 gloo-net = "0.6"
 gloo-timers = { version = "0.3", features = ["futures"] }
 serde = { version = "1", features = ["derive"] }

@@ -967,26 +967,24 @@ fn App() -> impl IntoView {
                                     runs.get().iter().map(|r| r.rows_written).sum::<i64>())}</Text>
                             </span>
                             // Tenant context ([[WEIR-T-0095]]): a platform-admin gets a switcher; others a chip.
-                            // The switcher stays a raw `cl-select`: an inline top-bar control with no visible
-                            // label, and Aurora's `Select` has no `aria-label` for its <select>.
+                            // An inline top-bar control with no visible label: `aria_label` names it.
                             {move || if is_admin.get() {
+                                let current = RwSignal::new(active_tenant().unwrap_or_default());
+                                let pairs = tenants.get().into_iter()
+                                    .map(|(id, name)| { let label = format!("{name} · {id}"); (id, label) })
+                                    .collect::<Vec<_>>();
                                 view! {
-                                    <select class="cl-input cl-select weir-tenant" data-testid="tenant-switcher"
-                                        aria-label="Tenant" title="view another tenant"
-                                        on:change=move |ev| {
-                                            let v = event_target_value(&ev);
-                                            if let Some(store) = local_storage() {
-                                                if v.is_empty() { let _ = store.remove_item("weir_active_tenant"); }
-                                                else { let _ = store.set_item("weir_active_tenant", &v); }
-                                            }
-                                            if let Some(w) = web_sys::window() { let _ = w.location().reload(); }
-                                        }>
-                                        <option value="" selected=active_tenant().is_none()>"⊙ self (default)"</option>
-                                        {tenants.get().into_iter().map(|(id, name)| {
-                                            let sel = active_tenant().as_deref() == Some(id.as_str());
-                                            view! { <option value=id.clone() selected=sel>{format!("{name} · {id}")}</option> }
-                                        }).collect_view()}
-                                    </select>
+                                    <span class="weir-tenant" title="view another tenant">
+                                        <Select aria_label="Tenant" placeholder="⊙ self (default)"
+                                            option_pairs=pairs value=current
+                                            on_change=Callback::new(move |v: String| {
+                                                if let Some(store) = local_storage() {
+                                                    if v.is_empty() { let _ = store.remove_item("weir_active_tenant"); }
+                                                    else { let _ = store.set_item("weir_active_tenant", &v); }
+                                                }
+                                                if let Some(w) = web_sys::window() { let _ = w.location().reload(); }
+                                            })/>
+                                    </span>
                                 }.into_any()
                             } else {
                                 view! { <Pill color=token::MUTED>{move || format!("⊙ {}", my_tenant.get())}</Pill> }.into_any()
@@ -1183,12 +1181,12 @@ fn App() -> impl IntoView {
                         </Stack>
                     </Modal>
 
-                    <ConfirmDialog open=del_open title="Delete connection?" confirm_label="Delete"
+                    <ConfirmDialog open=del_open title=Signal::derive(move || format!("Delete {}?", del_name.get())) confirm_label="Delete"
                         message="This removes the connection and stops its schedule. Its run history stays."
                         on_confirm=Callback::new(move |_| { del_conn.run(del_name.get_untracked()); del_open.set(false); })>
                         <Text mono=true bold=true>{move || del_name.get()}</Text>
                     </ConfirmDialog>
-                    <ConfirmDialog open=revoke_open title="Revoke key?" confirm_label="Revoke"
+                    <ConfirmDialog open=revoke_open title=Signal::derive(move || format!("Revoke key {}?", revoke_id.get())) confirm_label="Revoke"
                         message="A revoked key stops working at once. This cannot be undone."
                         on_confirm=Callback::new(move |_| { revoke_key(revoke_id.get_untracked()); revoke_open.set(false); })/>
                 </AppShell>
@@ -1652,11 +1650,8 @@ const LAYOUT_CSS: &str = r#"
 .weir-alert-slot { position: sticky; top: var(--cl-header-h); z-index: 30; }
 .weir-arr { color: var(--ice); font-family: var(--font-mono); font-size: var(--fs-xs); }
 .weir-form { display: grid; gap: var(--space-md); }
-.weir-tenant { width: auto; max-width: 220px; height: var(--h-xs); font-size: var(--fs-xs); }
-/* Aurora 0.4.0 declares .cl-mono before .cl-input, so `mono` on a field does not win. */
-.cl-input.cl-mono { font-family: var(--font-mono); }
+.weir-tenant .cl-select { width: auto; max-width: 220px; height: var(--h-xs); font-size: var(--fs-xs); }
 @media (max-width: 768px) {
-  .weir-page .cl-simple-grid { grid-template-columns: minmax(0, 1fr) !important; }
   .cl-appshell__header { flex-wrap: wrap; }
   .cl-appshell__header-content { flex-basis: 100%; }
   .weir-hide-narrow { display: none; }

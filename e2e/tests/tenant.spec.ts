@@ -7,7 +7,7 @@ test('admin: tenant switcher + tenants admin panel + re-scope', async ({ page })
   await expect(page.getByText('Run feed')).toBeVisible(); // authed
 
   // Admin controls are present.
-  const switcher = page.getByTestId('tenant-switcher');
+  const switcher = page.getByRole('combobox', { name: 'Tenant' });
   await expect(switcher).toBeVisible();
   await expect(page.getByTitle('administer tenants')).toBeVisible();
 
