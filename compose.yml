@@ -114,12 +114,18 @@ services:
         condition: service_healthy
     volumes:
       - ./test-fixtures/mssql:/fixtures:ro
+    # `up --wait` fails when a service exits, even with status 0: stay up, healthy once seeded.
+    healthcheck:
+      test: ["CMD", "test", "-f", "/tmp/seeded"]
+      interval: 2s
+      timeout: 2s
+      retries: 60
     entrypoint:
       - /bin/bash
       - -c
       - >
         /opt/mssql-tools18/bin/sqlcmd -S mssql-tls -U sa -P "weirStrong!Pass1" -N -C -b -i /fixtures/seed.sql &&
-        echo "seeded weir_demo (tls)"
+        echo "seeded weir_demo (tls)" && touch /tmp/seeded && exec sleep infinity
 
   # SQL Server — the source for the `mssql` connector's integration test
   # ([[WEIR-T-0161]]). Loopback-only; host port overridable to coexist. Test-only;
@@ -142,7 +148,7 @@ services:
       timeout: 5s
       retries: 30
 
-  # Seed the demo database + table the integration test reads, then exit.
+  # Seed the demo database + table the integration test reads.
   mssql-seed:
     profiles: ["integration"]
     image: mcr.microsoft.com/mssql/server:2022-latest
@@ -151,12 +157,18 @@ services:
         condition: service_healthy
     volumes:
       - ./test-fixtures/mssql:/fixtures:ro
+    # `up --wait` fails when a service exits, even with status 0: stay up, healthy once seeded.
+    healthcheck:
+      test: ["CMD", "test", "-f", "/tmp/seeded"]
+      interval: 2s
+      timeout: 2s
+      retries: 60
     entrypoint:
       - /bin/bash
       - -c
       - >
         /opt/mssql-tools18/bin/sqlcmd -S mssql -U sa -P "weirStrong!Pass1" -C -b -i /fixtures/seed.sql &&
-        echo "seeded weir_demo"
+        echo "seeded weir_demo" && touch /tmp/seeded && exec sleep infinity
 
   # MySQL — a server-speaks-first wire target for the TCP egress-policy probe
   # ([[WEIR-T-0175]] hostname-carrying egress; `wasm_tcp_probe_engine.rs`). No
@@ -215,7 +227,7 @@ services:
       timeout: 3s
       retries: 20
 
-  # Seed the `weir-test` bucket with the NDJSON fixtures, then exit.
+  # Seed the `weir-test` bucket with the NDJSON fixtures.
   minio-seed:
     profiles: ["integration"]
     image: bitnamilegacy/minio:2024.9.13@sha256:8a92f71856f4b4b5755fa6afe4e7f9d0db7e18c889318f6772cb342d9b13470d
