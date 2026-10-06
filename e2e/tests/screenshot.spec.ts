@@ -1,6 +1,6 @@
 import { test } from './fixtures';
 
-// Capture the two views so the Aurora Dark re-skin can be eyeballed.
+// Capture the two views so the Aurora re-skin can be eyeballed.
 test('capture UI screenshots for theme review', async ({ page }) => {
   await page.setViewportSize({ width: 1360, height: 940 });
   await page.goto('/');

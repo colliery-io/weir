@@ -8,7 +8,7 @@ test('destination manifest: discover → onboard → appears in the dest dropdow
   await page.getByRole('button', { name: 'Setup' }).click();
 
   // The "Add a connector" picker offers the HubSpot *destination*, labelled "· destination".
-  const picker = page.locator('label.weir-fld').filter({ hasText: 'pick a connector' }).locator('select');
+  const picker = page.getByLabel('Pick a connector');
   const hubspotOption = picker.locator('option', { hasText: 'hubspot-dest' });
   await expect(hubspotOption).toHaveText(/destination/);
 
