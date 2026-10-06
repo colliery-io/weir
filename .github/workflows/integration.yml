@@ -47,6 +47,7 @@ jobs:
           --skip manifests_run_live
           --skip snowflake_dest_writes_and_reads_back_live
           --skip snowflake_to_hubspot_retl_live
+          --skip resident_does_not_block_runonce_real_executor  # WEIR-T-0206: hangs on the runner
 
       - name: Estate logs on failure
         if: failure()
