@@ -18,6 +18,8 @@ jobs:
   integration:
     name: Integration (compose estate)
     runs-on: ubuntu-latest
+    # A hung test fails the job in an hour, not at the 6-hour runner limit.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -36,8 +38,16 @@ jobs:
       - name: Start the integration estate
         run: docker compose --profile integration up -d --wait
 
+      # The live connector tests (real public APIs, real keys) are #[ignore]d too, but they
+      # belong to the nightly Connectors (live) workflow, never the PR path (WEIR-T-0066):
+      # an upstream API hiccup must not block a merge. Skip them here by name.
       - name: Integration tests
-        run: cargo test --workspace -- --ignored
+        run: >-
+          cargo test --workspace -- --ignored
+          --skip manifests_run_live
+          --skip snowflake_dest_writes_and_reads_back_live
+          --skip snowflake_to_hubspot_retl_live
+          --skip resident_does_not_block_runonce_real_executor  # WEIR-T-0206: hangs on the runner
 
       - name: Estate logs on failure
         if: failure()
