@@ -1,5 +1,7 @@
 //! Shared widgets: the brand mark, the connection card, a config-contract field.
 
+use crate::discovery::Latest;
+use crate::fetch::fetch_props;
 use crate::helpers::{cfg_get, cfg_set, cfg_set_str, run_metrics, state_color, SECRET_SENTINEL};
 use crate::models::{Connection, Prop, RunRow};
 use aurora_leptos::components::*;
@@ -30,6 +32,8 @@ pub(crate) struct SideConfig {
     /// A loaded connection's config ([[WEIR-T-0216]]): the next [`SideConfig::reset`]
     /// (the connector-change effect) takes it in place of an empty form.
     pending: StoredValue<Option<String>>,
+    /// The connector whose contract `props` holds; empty while one is being fetched.
+    pub(crate) loaded: RwSignal<String>,
 }
 
 impl SideConfig {
@@ -40,7 +44,28 @@ impl SideConfig {
             advanced: RwSignal::new(String::new()),
             show_advanced: RwSignal::new(false),
             pending: StoredValue::new(None),
+            loaded: RwSignal::new(String::new()),
         }
+    }
+
+    /// Refetch the contract whenever `connector` changes. An older spec answer that
+    /// arrives after a newer pick is dropped ([[WEIR-T-0218]]). The reset keeps a config
+    /// staged by [`SideConfig::load`], so editing a connection does not wipe it.
+    pub(crate) fn follow(self, connector: RwSignal<String>) {
+        let latest = StoredValue::new(Latest::default());
+        Effect::new(move |_| {
+            let c = connector.get();
+            self.reset();
+            self.loaded.set(String::new());
+            let ticket = latest.try_update_value(Latest::begin).unwrap_or_default();
+            leptos::task::spawn_local(async move {
+                let props = fetch_props(&c).await;
+                if latest.try_with_value(|l| l.is_current(ticket)).unwrap_or(false) {
+                    self.props.set(props);
+                    self.loaded.set(c);
+                }
+            });
+        });
     }
 
     /// A different connector: its contract replaces the old one, and the old values go
