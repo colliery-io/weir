@@ -81,21 +81,28 @@ pub(crate) fn config_field(p: Prop, form: RwSignal<String>) -> AnyView {
 
 /// One side of the connection form: a field per contract property, then a switch
 /// that shows the "Advanced JSON" override.
-pub(crate) fn config_side(side: &'static str, connector: String, cfg: SideConfig) -> impl IntoView {
-    let props = cfg.props.get();
-    let caption = if connector.is_empty() { side.to_lowercase() } else { format!("{} · {connector}", side.to_lowercase()) };
+pub(crate) fn config_side(side: &'static str, connector: RwSignal<String>, cfg: SideConfig) -> impl IntoView {
+    let caption = move || match connector.get().as_str() {
+        "" => format!("config · {}", side.to_lowercase()),
+        c => format!("config · {} · {c}", side.to_lowercase()),
+    };
     let testid = format!("config-{}", side.to_lowercase());
     view! {
         <div class="weir-form" data-testid=testid>
-            <SectionLabel label=format!("config · {caption}") divider=true/>
-            {if props.is_empty() {
-                view! { <Text size="xs" dimmed=true>"No config contract: use Advanced JSON."</Text> }.into_any()
-            } else {
-                view! {
-                    <SimpleGrid cols=2>
-                        {props.into_iter().map(|p| config_field(p, cfg.form)).collect_view()}
-                    </SimpleGrid>
-                }.into_any()
+            {move || view! { <SectionLabel label=caption() divider=true/> }}
+            // Its own reactive scope: a parent component renders its children untracked,
+            // so the fields follow the contract here, not through a re-render of the view.
+            {move || {
+                let props = cfg.props.get();
+                if props.is_empty() {
+                    view! { <Text size="xs" dimmed=true>"No config contract: use Advanced JSON."</Text> }.into_any()
+                } else {
+                    view! {
+                        <SimpleGrid cols=2>
+                            {props.into_iter().map(|p| config_field(p, cfg.form)).collect_view()}
+                        </SimpleGrid>
+                    }.into_any()
+                }
             }}
             <Switch checked=cfg.show_advanced label=format!("{side} advanced JSON")/>
             {move || cfg.show_advanced.get().then(|| view! {

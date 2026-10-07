@@ -117,8 +117,8 @@ pub(crate) fn setup_view(s: SetupState) -> AnyView {
                 </SimpleGrid>
                 <Select label="Execution mode" option_pairs=modes value=exec_mode/>
                 // Per-side config ([[WEIR-T-0214]]): sent as `source_config` / `dest_config`.
-                {config_side("Source", src.get_untracked(), src_cfg)}
-                {config_side("Destination", dst.get_untracked(), dst_cfg)}
+                {config_side("Source", src, src_cfg)}
+                {config_side("Destination", dst, dst_cfg)}
                 <div><Button on_click=save_conn>"Save connection"</Button></div>
             </div>
         </Panel>
