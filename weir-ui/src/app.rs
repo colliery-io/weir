@@ -1,8 +1,9 @@
 //! The app shell: auth gate, shared state + actions, view routing and the modals.
 
 use crate::components::{Brand, ConnActions, SideConfig};
+use crate::discovery::Discovery;
 use crate::fetch::{
-    active_tenant, areq_delete, areq_get, areq_post, check, fetch_props, fetch_streams, get_fetch,
+    active_tenant, areq_delete, areq_get, areq_post, check, get_fetch,
     get_json, Fetched,
 };
 use crate::helpers::{cfg_text, fmt_dur, log_color, side_config};
@@ -228,25 +229,12 @@ pub(crate) fn App() -> impl IntoView {
     let add_path = RwSignal::new(String::new());
     let preview = RwSignal::new(Option::<PreviewReport>::None);
     // Per-side config ([[WEIR-T-0214]]): each side's contract is refetched when its
-    // connector changes; the source's streams are rediscovered too.
+    // connector changes; the source's streams follow the source and its config ([[WEIR-T-0218]]).
     let src_cfg = SideConfig::new();
     let dst_cfg = SideConfig::new();
-    let streams = RwSignal::new(Vec::<String>::new());
-    Effect::new(move |_| {
-        let s = src.get();
-        src_cfg.reset();
-        leptos::task::spawn_local(async move {
-            src_cfg.props.set(fetch_props(&s).await);
-            streams.set(fetch_streams(&s, "{}").await);
-        });
-    });
-    Effect::new(move |_| {
-        let d = dst.get();
-        dst_cfg.reset();
-        leptos::task::spawn_local(async move {
-            dst_cfg.props.set(fetch_props(&d).await);
-        });
-    });
+    src_cfg.follow(src);
+    dst_cfg.follow(dst);
+    let discovery = Discovery::watch(src, src_cfg);
 
     // Per-connection health ([[WEIR-T-0111]]) + the platform rollup ([[WEIR-T-0112]], admin only).
     let health = RwSignal::new(Vec::<ConnHealth>::new());
@@ -648,7 +636,7 @@ pub(crate) fn App() -> impl IntoView {
                         })}
                         {move || match view.get().as_str() {
                             "Setup" => setup_view(SetupState {
-                                catalog, available, src_cfg, dst_cfg, streams, add_pkg, add_manifest, add_path, preview,
+                                catalog, available, src_cfg, dst_cfg, discovery, add_pkg, add_manifest, add_path, preview,
                                 name, src, dst, stream, sync, exec_mode, editing,
                                 cancel_edit: Callback::new(move |_| clear_form()),
                                 onboard_pick: Callback::new(move |_| onboard_pick()),
