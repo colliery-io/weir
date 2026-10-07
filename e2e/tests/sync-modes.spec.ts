@@ -1,4 +1,4 @@
-import { test, expect } from './fixtures';
+import { test, expect, ensurePair } from './fixtures';
 import type { Page } from '@playwright/test';
 
 // [[WEIR-T-0215]]: the connection form sets sync mode, write mode, business keys, the
@@ -27,6 +27,8 @@ test('sync modes: an incremental upsert cron connection is created and read back
   test.setTimeout(120_000);
   // The server's state outlives a spec (and a retry): a fresh name every time.
   const name = `fx-modes-${Date.now().toString(36)}`;
+  // The harness seed ignores errors (a locked-db import has left the arrow sink out on CI).
+  await ensurePair(page.request);
 
   await page.goto('/');
   await page.getByRole('button', { name: 'Setup' }).click();
