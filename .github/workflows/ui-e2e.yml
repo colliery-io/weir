@@ -57,3 +57,13 @@ jobs:
       # (key + OIDC env), seeds, runs the full Playwright suite (both doors), and tears down.
       - name: Auth UI e2e (Dex + both doors)
         run: angreal test e2e
+
+      # The Playwright traces + error contexts of failed specs (trace: retain-on-failure).
+      - name: Upload Playwright results on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-results
+          path: e2e/test-results/
+          retention-days: 7
+          if-no-files-found: ignore
