@@ -1,4 +1,4 @@
-import { test, expect } from './fixtures';
+import { test, expect, api, expectOk } from './fixtures';
 
 // [[WEIR-T-0080]]: clicking a connection card opens the Aurora Modal connection detail
 // (requires a seeded `fx-demo` connection on the running server).
@@ -20,10 +20,10 @@ test('operations: card opens the connection-detail modal', async ({ page }) => {
 // pages back through history (GET /runs?before=…). The seeded `fx-demo` run is enough.
 test('operations: a run-feed row opens the run detail; the feed pages', async ({ page }) => {
   // Queue a run of its own so the feed is sure to list one for fx-demo.
-  const auth = { Authorization: `Bearer ${process.env.WEIR_E2E_KEY ?? ''}` };
-  const queued = await page.request.post('/connections/fx-demo/run', { headers: auth });
-  expect(queued.ok(), `POST /connections/fx-demo/run → ${queued.status()} ${await queued.text()}`).toBeTruthy();
-  const feed = await page.request.get('/runs', { headers: auth });
+  // `api` retries a sqlite-lock answer of the e2e server (see fixtures).
+  const queued = await api(page.request, 'POST', '/connections/fx-demo/run');
+  await expectOk(queued);
+  const feed = await api(page.request, 'GET', '/runs');
   const feedBody = await feed.text();
   expect(feedBody, `GET /runs → ${feed.status()}`).toContain('fx-demo');
 
