@@ -29,7 +29,9 @@ use weir_connector::{
 use weir_engine::{
     Engine, EngineError, StopHandle, Store, SyncOptions, SyncProgress, stop_channel,
 };
-use weir_runtime::{ConnectorHandle, Credential, HostAllowList, resolve_secret_refs};
+use weir_runtime::{
+    ConnectorHandle, Credential, HostAllowList, cache_key_digest, resolve_secret_refs,
+};
 
 mod lineage;
 mod store;
@@ -124,8 +126,11 @@ impl ConnectorRef {
     /// next run loads the freshly-built wasm instead of the stale cached handle.
     pub fn invalidate_cache(search_path: &str, package: &str) {
         if let Some(cache) = HANDLE_CACHE.get() {
-            let prefix = format!("{search_path}\u{0}{package}\u{0}");
-            cache.lock().unwrap().retain(|k, _| !k.starts_with(&prefix));
+            let connector = HandleCacheKey::connector_digest(search_path, package);
+            cache
+                .lock()
+                .unwrap()
+                .retain(|_, slot| slot.connector != connector);
         }
     }
 
@@ -148,20 +153,22 @@ impl ConnectorRef {
                 // reference, never a value.
                 let resolved = resolve_secret_refs(&config.json)
                     .map_err(|e| ExecutorError::Resolve(format!("{package}: {e}")))?;
-                // Key on the full config as stored (incl. any literal secret) so two
-                // connections to the same package with different credentials never share
-                // a handle/token. A config with references adds the SHA-256 fingerprint of
-                // the resolved values — never the values — so a rotation misses the cache
-                // and builds a handle with the new credential.
-                let base_key = format!("{search_path}\u{0}{package}\u{0}{}", config.json);
-                let key = match &resolved.fingerprint {
-                    Some(fp) => format!("{base_key}\u{0}{fp}"),
-                    None => base_key.clone(),
-                };
+                // Key on a digest of the connector and the full config as stored (incl. any
+                // literal secret) so two connections to the same package with different
+                // credentials never share a handle/token, without the config text in the
+                // key ([[WEIR-T-0204]]). A config with references adds the fingerprint of
+                // the resolved values, so a rotation misses the cache and builds a handle
+                // with the new credential.
+                let key = HandleCacheKey::new(
+                    search_path,
+                    package,
+                    &config.json,
+                    resolved.fingerprint.as_deref(),
+                );
                 let cache = HANDLE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-                if let Some((h, last_used)) = cache.lock().unwrap().get_mut(&key) {
-                    *last_used = std::time::Instant::now();
-                    return Ok(Arc::clone(h));
+                if let Some(slot) = cache.lock().unwrap().get_mut(&key.key) {
+                    slot.last_used = std::time::Instant::now();
+                    return Ok(Arc::clone(&slot.value));
                 }
                 // Resolve the host-side credential ([[WEIR-A-0033]]): the secret is
                 // injected by the egress policy and the guest receives only the
@@ -203,21 +210,7 @@ impl ConnectorRef {
                     .map_err(|e| ExecutorError::Resolve(e.to_string()))?,
                 );
                 let mut cache = cache.lock().unwrap();
-                // Bound the cache ([[WEIR-T-0190]]): each entry holds a JIT-compiled
-                // component, and distinct configs/versions accumulate forever
-                // otherwise — evict the least-recently-used entry at the cap.
-                // (Live runs keep their handle via the returned `Arc`.)
-                if !cache.contains_key(&key) {
-                    // A handle built from an older resolution of the same references holds
-                    // the rotated-out credential: drop it ([[WEIR-T-0202]]).
-                    let stale = format!("{base_key}\u{0}");
-                    cache.retain(|k, _| k == &key || !k.starts_with(&stale));
-                    lru_evict(&mut cache, HANDLE_CACHE_CAP);
-                }
-                let (h, _) = cache
-                    .entry(key)
-                    .or_insert((handle, std::time::Instant::now()));
-                Ok(Arc::clone(h))
+                Ok(handle_cache_insert(&mut cache, &key, handle))
             }
         }
     }
@@ -226,13 +219,83 @@ impl ConnectorRef {
 /// Max cached connector handles ([[WEIR-T-0190]]) — LRU-evicted past this.
 const HANDLE_CACHE_CAP: usize = 32;
 
+/// The identity of a [`HANDLE_CACHE`] entry ([[WEIR-T-0204]]). Each field is a salted
+/// SHA-256 digest ([`cache_key_digest`]); none holds config text or a secret value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HandleCacheKey {
+    /// Digest of `(search_path, package)` — the connector (the tenant is in
+    /// `search_path`); [`ConnectorRef::invalidate_cache`] drops every entry with it.
+    connector: String,
+    /// Digest of the connector plus the stored config text — the connection's credential
+    /// config as stored (literal secrets, or `env:`/`file:` reference text).
+    config: String,
+    /// The map key: digest of `config` plus the fingerprint of the resolved reference
+    /// values (when the config holds any).
+    key: String,
+}
+
+impl HandleCacheKey {
+    fn new(search_path: &str, package: &str, config_json: &str, fingerprint: Option<&str>) -> Self {
+        let connector = Self::connector_digest(search_path, package);
+        let config = cache_key_digest(&[&connector, config_json]);
+        let key = match fingerprint {
+            Some(fp) => cache_key_digest(&[&config, "ref", fp]),
+            None => cache_key_digest(&[&config, "literal"]),
+        };
+        Self {
+            connector,
+            config,
+            key,
+        }
+    }
+
+    fn connector_digest(search_path: &str, package: &str) -> String {
+        cache_key_digest(&[search_path, package])
+    }
+}
+
+/// A [`HANDLE_CACHE`] value: the cached handle, its last-use stamp for LRU eviction, and
+/// the digests of its connector and stored config for invalidation.
+struct HandleSlot<T> {
+    value: T,
+    last_used: std::time::Instant,
+    connector: String,
+    config: String,
+}
+
+/// Insert `value` under `key` (or return the entry a concurrent resolve inserted first).
+/// A new key first drops every entry built from the same stored config with an older
+/// resolution of its references — it holds the rotated-out credential ([[WEIR-T-0202]] /
+/// [[WEIR-T-0204]]) — then bounds the cache ([[WEIR-T-0190]]): each entry holds a
+/// JIT-compiled component, so the least-recently-used entry goes at the cap. (Live runs
+/// keep their handle via the returned `Arc`.)
+fn handle_cache_insert<T: Clone>(
+    map: &mut HashMap<String, HandleSlot<T>>,
+    key: &HandleCacheKey,
+    value: T,
+) -> T {
+    if !map.contains_key(&key.key) {
+        map.retain(|k, slot| k == &key.key || slot.config != key.config);
+        lru_evict(map, HANDLE_CACHE_CAP);
+    }
+    map.entry(key.key.clone())
+        .or_insert_with(|| HandleSlot {
+            value,
+            last_used: std::time::Instant::now(),
+            connector: key.connector.clone(),
+            config: key.config.clone(),
+        })
+        .value
+        .clone()
+}
+
 /// Make room for one insert: while `map` is at/over `cap`, evict the entry with
 /// the oldest last-use stamp ([[WEIR-T-0190]]).
-fn lru_evict<T>(map: &mut HashMap<String, (T, std::time::Instant)>, cap: usize) {
+fn lru_evict<T>(map: &mut HashMap<String, HandleSlot<T>>, cap: usize) {
     while map.len() >= cap {
         let Some(lru) = map
             .iter()
-            .min_by_key(|(_, (_, at))| *at)
+            .min_by_key(|(_, slot)| slot.last_used)
             .map(|(k, _)| k.clone())
         else {
             return;
@@ -241,11 +304,12 @@ fn lru_evict<T>(map: &mut HashMap<String, (T, std::time::Instant)>, cap: usize) 
     }
 }
 
-/// Process-wide cache of loaded connector handles, keyed by
-/// `(search_path, package, config)`, valued with a last-use stamp for LRU
-/// eviction — see [`ConnectorRef::resolve`].
-#[allow(clippy::type_complexity)]
-static HANDLE_CACHE: OnceLock<Mutex<HashMap<String, (Arc<ConnectorHandle>, std::time::Instant)>>> =
+/// Process-wide cache of loaded connector handles, keyed by a digest of
+/// `(search_path, package, config, resolved-reference fingerprint)` ([`HandleCacheKey`])
+/// — see [`ConnectorRef::resolve`]. Per-handle credential state (an OAuth2 or session
+/// token the handle's provider minted) lives and dies with its entry, so a config change
+/// or a reference rotation, which gives a new key, also gives a fresh token.
+static HANDLE_CACHE: OnceLock<Mutex<HashMap<String, HandleSlot<Arc<ConnectorHandle>>>>> =
     OnceLock::new();
 
 /// How a connection's source is executed ([[WEIR-I-0035]] F1). **Host-side only** —
@@ -2196,22 +2260,85 @@ mod sharp_edges_tests {
     /// drops the least-recently-used entry.
     #[test]
     fn lru_evict_drops_oldest_at_cap() {
-        let mut m: HashMap<String, (u32, std::time::Instant)> = HashMap::new();
+        let mut m: HashMap<String, HandleSlot<u32>> = HashMap::new();
         let base = std::time::Instant::now();
         for (i, k) in ["a", "b", "c"].iter().enumerate() {
             m.insert(
                 k.to_string(),
-                (i as u32, base + std::time::Duration::from_millis(i as u64)),
+                HandleSlot {
+                    value: i as u32,
+                    last_used: base + std::time::Duration::from_millis(i as u64),
+                    connector: String::new(),
+                    config: k.to_string(),
+                },
             );
         }
         // Touch "a" so "b" becomes the LRU.
-        m.get_mut("a").unwrap().1 = base + std::time::Duration::from_millis(10);
+        m.get_mut("a").unwrap().last_used = base + std::time::Duration::from_millis(10);
         lru_evict(&mut m, 3);
         assert_eq!(m.len(), 2);
         assert!(!m.contains_key("b"), "the least-recently-used entry goes");
         assert!(m.contains_key("a") && m.contains_key("c"));
         // Under the cap: nothing evicted.
         lru_evict(&mut m, 3);
+        assert_eq!(m.len(), 2);
+    }
+
+    /// [[WEIR-T-0204]]: handle-cache keys are digests — the stored config, a literal
+    /// secret in it, and a resolved reference value never appear in any key.
+    #[test]
+    fn handle_cache_keys_hold_no_secret_text() {
+        let secret = "sk-live-T0204-literal-secret";
+        let cfg = format!(r#"{{"auth_scheme":"bearer","api_key":"{secret}"}}"#);
+        let k = HandleCacheKey::new("/conn/tenant-a", "pkg", &cfg, Some("fp-of-resolved"));
+        for d in [&k.connector, &k.config, &k.key] {
+            assert_eq!(d.len(), 64, "a hex SHA-256: {d}");
+            assert!(d.chars().all(|c| c.is_ascii_hexdigit()));
+            for text in [secret, "api_key", "tenant-a", "fp-of-resolved", "pkg"] {
+                assert!(!d.contains(text), "{text} in a cache key");
+            }
+        }
+        // The map holds only digests: insert and check every stored string.
+        let mut m: HashMap<String, HandleSlot<u32>> = HashMap::new();
+        handle_cache_insert(&mut m, &k, 1);
+        for (key, slot) in &m {
+            for text in [key, &slot.connector, &slot.config] {
+                assert!(!text.contains(secret) && !text.contains(&cfg));
+            }
+        }
+    }
+
+    /// [[WEIR-T-0204]]: a config change and a reference rotation each give a new key (so
+    /// the next run builds a new handle, whose credential provider mints a fresh token);
+    /// the rotation also drops the handle built from the rotated-out value; the tenant is
+    /// part of the key.
+    #[test]
+    fn handle_cache_key_changes_with_config_and_rotation() {
+        let cfg_a = r#"{"api_key":"env:KEY_A"}"#;
+        let cfg_b = r#"{"api_key":"env:KEY_B"}"#;
+        let before = HandleCacheKey::new("/c/t1", "pkg", cfg_a, Some("fp-1"));
+        assert_eq!(
+            before,
+            HandleCacheKey::new("/c/t1", "pkg", cfg_a, Some("fp-1")),
+            "stable within the process"
+        );
+        let changed = HandleCacheKey::new("/c/t1", "pkg", cfg_b, Some("fp-1"));
+        let rotated = HandleCacheKey::new("/c/t1", "pkg", cfg_a, Some("fp-2"));
+        let other_tenant = HandleCacheKey::new("/c/t2", "pkg", cfg_a, Some("fp-1"));
+        assert_ne!(before.key, changed.key, "config change → new handle");
+        assert_ne!(before.key, rotated.key, "reference rotation → new handle");
+        assert_eq!(before.config, rotated.config, "same stored config");
+        assert_ne!(before.key, other_tenant.key, "tenants never share a handle");
+
+        let mut m: HashMap<String, HandleSlot<&str>> = HashMap::new();
+        assert_eq!(handle_cache_insert(&mut m, &before, "h-old"), "h-old");
+        assert_eq!(handle_cache_insert(&mut m, &changed, "h-other"), "h-other");
+        assert_eq!(handle_cache_insert(&mut m, &rotated, "h-new"), "h-new");
+        assert!(
+            !m.contains_key(&before.key),
+            "the handle holding the rotated-out credential is dropped"
+        );
+        assert!(m.contains_key(&changed.key), "other configs are kept");
         assert_eq!(m.len(), 2);
     }
 
