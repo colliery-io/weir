@@ -76,7 +76,10 @@ impl SyncForm {
             None => options.set(Vec::new()),
             Some(n) => leptos::task::spawn_local(async move {
                 let schema = get_json::<SchemaView>(format!("/connections/{n}/schema")).await;
-                options.set(schema.fields.into_iter().map(|f| f.name).collect());
+                // The name can change while the request is out: drop a stale answer.
+                if existing.get_untracked().as_deref() == Some(n.as_str()) {
+                    options.set(schema.fields.into_iter().map(|f| f.name).collect());
+                }
             }),
         });
     }
