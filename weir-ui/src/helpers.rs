@@ -490,6 +490,26 @@ mod tests {
         }
     }
 
+    /// `GET /runs/{id}` carries RFC 3339 UTC strings, the feed's shape ([[WEIR-T-0224]]).
+    #[test]
+    fn run_detail_reads_rfc3339_timestamps() {
+        let d: crate::models::RunDetail = serde_json::from_str(
+            r#"{"id":7,"connection":"c","state":"leased",
+                "started_at":"2026-10-07T09:25:01.123Z","finished_at":null}"#,
+        )
+        .unwrap();
+        let started = d.started_at.as_deref().and_then(parse_rfc3339_ms);
+        assert_eq!(started, Some(1_791_365_101_123));
+        assert_eq!(d.finished_at, None);
+        assert!(
+            serde_json::from_str::<crate::models::RunDetail>(
+                r#"{"id":7,"connection":"c","state":"done","started_at":1791365101123}"#
+            )
+            .is_err(),
+            "epoch millis are no longer the shape"
+        );
+    }
+
     #[test]
     fn run_duration_covers_finished_and_in_flight() {
         assert_eq!(run_duration(Some(1_500), "done"), "1.5s");
