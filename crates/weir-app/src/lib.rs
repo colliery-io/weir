@@ -1119,6 +1119,8 @@ impl App {
                 attempt: r.attempt,
                 rows_written: r.rows_written,
                 dead_lettered: r.dead_lettered,
+                started_at: weir_orchestrator::epoch_ms_to_rfc3339(r.started_at),
+                finished_at: weir_orchestrator::epoch_ms_to_rfc3339(r.finished_at),
                 // duration is a view over the two timestamps, computed here (not stored).
                 duration_ms: match (r.started_at, r.finished_at) {
                     (Some(s), Some(f)) => Some((f - s).max(0)),

@@ -338,6 +338,60 @@ pub(crate) fn fmt_ts(ms: i64) -> String {
     )
 }
 
+/// An RFC 3339 time (`2026-10-07T09:25:01.123Z`, or with a `±HH:MM` offset) → epoch
+/// milliseconds; `None` for anything else. Pure, so the feed's start column is testable
+/// off the browser ([[WEIR-T-0224]]).
+pub(crate) fn parse_rfc3339_ms(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    let num = |r: std::ops::Range<usize>| -> Option<i64> {
+        let part = s.get(r)?;
+        part.bytes().all(|c| c.is_ascii_digit()).then(|| part.parse().ok())?
+    };
+    if b.len() < 20 || b[4] != b'-' || b[7] != b'-' || !matches!(b[10], b'T' | b't' | b' ')
+        || b[13] != b':' || b[16] != b':'
+    {
+        return None;
+    }
+    let (y, m, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    let (hh, mm, ss) = (num(11..13)?, num(14..16)?, num(17..19)?);
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || hh > 23 || mm > 59 || ss > 60 {
+        return None;
+    }
+    // Fractional seconds: keep the first three digits (millis).
+    let mut i = 19;
+    let mut frac_ms = 0;
+    if b.get(i) == Some(&b'.') {
+        let start = i + 1;
+        i = start;
+        while b.get(i).is_some_and(u8::is_ascii_digit) {
+            i += 1;
+        }
+        if i == start {
+            return None;
+        }
+        let digits = &s[start..i.min(start + 3)];
+        frac_ms = digits.parse::<i64>().ok()? * 10_i64.pow(3 - digits.len() as u32);
+    }
+    let offset_min = match &s[i..] {
+        "Z" | "z" => 0,
+        o if o.len() == 6 && matches!(&o[..1], "+" | "-") && &o[3..4] == ":" => {
+            let v = num(i + 1..i + 3)? * 60 + num(i + 4..i + 6)?;
+            if &o[..1] == "-" { -v } else { v }
+        }
+        _ => return None,
+    };
+    // Days from civil (the inverse of `fmt_ts`).
+    let y = y - i64::from(m <= 2);
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let secs = days * 86_400 + hh * 3600 + mm * 60 + ss - offset_min * 60;
+    Some(secs * 1000 + frac_ms)
+}
+
 /// A run's duration for the feed: the measured one once finished, else where it is.
 pub(crate) fn run_duration(duration_ms: Option<i64>, state: &str) -> String {
     match (duration_ms, state) {
@@ -392,6 +446,8 @@ mod tests {
             state: state.into(),
             rows_written: 0,
             dead_lettered: 0,
+            started_at: None,
+            finished_at: None,
             duration_ms: None,
             error: None,
         }
@@ -416,6 +472,22 @@ mod tests {
         assert_eq!(fmt_ts(1_791_365_101_000), "2026-10-07 09:25:01 UTC");
         // Leap day; sub-second millis are dropped.
         assert_eq!(fmt_ts(951_782_400_999), "2000-02-29 00:00:00 UTC");
+    }
+
+    #[test]
+    fn parse_rfc3339_reads_the_feed_timestamps() {
+        // The API's shape ([[WEIR-T-0224]]): UTC, millisecond precision.
+        let ms = parse_rfc3339_ms("2026-10-07T09:25:01.123Z").unwrap();
+        assert_eq!(ms, 1_791_365_101_123);
+        assert_eq!(fmt_ts(ms), "2026-10-07 09:25:01 UTC");
+        // Whole seconds, longer fractions, offsets and the leap day.
+        assert_eq!(parse_rfc3339_ms("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(parse_rfc3339_ms("2026-10-07T09:25:01.123456Z"), Some(1_791_365_101_123));
+        assert_eq!(parse_rfc3339_ms("2026-10-07T11:25:01.1+02:00"), Some(1_791_365_101_100));
+        assert_eq!(parse_rfc3339_ms("2000-02-29T00:00:00Z"), Some(951_782_400_000));
+        for bad in ["", "now", "2026-10-07", "2026-13-07T09:25:01Z", "2026-10-07T09:25:01", "2026-10-07T09:25:01.Z"] {
+            assert_eq!(parse_rfc3339_ms(bad), None, "{bad:?}");
+        }
     }
 
     #[test]

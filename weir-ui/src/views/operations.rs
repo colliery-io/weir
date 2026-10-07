@@ -3,11 +3,30 @@
 use crate::components::{ConnActions, ConnectionCard};
 use crate::fetch::{get_fetch, Fetched};
 use crate::helpers::{
-    feed_cursor, latest_run, merge_feed, run_duration, run_metrics, state_color, FEED_PAGE,
+    feed_cursor, fmt_ts, latest_run, merge_feed, parse_rfc3339_ms, run_duration, run_metrics,
+    state_color, FEED_PAGE,
 };
 use crate::models::{Connection, RunRow};
 use aurora_leptos::components::*;
+use aurora_leptos::data::{format_relative, use_now};
 use leptos::prelude::*;
+
+/// The feed's start column ([[WEIR-T-0224]]): "3m ago" (ticking with the shared clock),
+/// with the UTC time as the tooltip; "—" until the run starts.
+fn started_cell(started_at: Option<&str>) -> AnyView {
+    match started_at.and_then(parse_rfc3339_ms) {
+        Some(ms) => {
+            let now = use_now();
+            view! {
+                <td data-testid="run-started" title=fmt_ts(ms)>
+                    {move || format_relative(now.get() - ms as f64)}
+                </td>
+            }
+            .into_any()
+        }
+        None => view! { <td data-testid="run-started">"—"</td> }.into_any(),
+    }
+}
 
 /// The run feed's paging state ([[WEIR-T-0219]]). The live first page is the polled
 /// `runs` signal; `older` holds the pages loaded with `GET /runs?before=…`
@@ -110,9 +129,9 @@ pub(crate) fn operations_view(
                 } else {
                     view! {
                         <Table mono=true fixed=true
-                            widths=vec!["190px".into(), "20%".into(), "110px".into(), "100px".into(), "auto".into()]
-                            label="Run feed" min_width="780px">
-                            <thead><tr><th>"#"</th><th>"connection"</th><th>"state"</th><th>"duration"</th><th>"detail"</th></tr></thead>
+                            widths=vec!["190px".into(), "20%".into(), "110px".into(), "110px".into(), "100px".into(), "auto".into()]
+                            label="Run feed" min_width="890px">
+                            <thead><tr><th>"#"</th><th>"connection"</th><th>"state"</th><th>"started"</th><th>"duration"</th><th>"detail"</th></tr></thead>
                             <tbody>
                                 {rs.into_iter().map(|r| {
                                     let id = r.id;
@@ -124,6 +143,7 @@ pub(crate) fn operations_view(
                                             <td>{r.id}</td>
                                             <td>{r.connection.clone()}</td>
                                             <td><Pill color=state_color(&r.state)>{r.state.clone()}</Pill></td>
+                                            {started_cell(r.started_at.as_deref())}
                                             <td>{duration}</td>
                                             <td title=metrics.clone()>{metrics.clone()}</td>
                                         </TableRow>
