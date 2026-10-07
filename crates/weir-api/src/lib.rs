@@ -452,6 +452,17 @@ fn content_type(path: &str) -> &'static str {
 /// UI add/edit is reconciled live, and triggered runs drain asynchronously — the UI
 /// watches them go pending → done/failed in real time.
 pub async fn serve(app: Arc<App>, port: u16, concurrency: usize) -> std::io::Result<()> {
+    // State the alpha tenancy posture once at start (WEIR-T-0211, COLLIERY-I-0252).
+    let named_tenants = app.list_tenants().map_or(0, |ts| {
+        ts.iter()
+            .filter(|t| t.id != weir_app::DEFAULT_TENANT)
+            .count()
+    });
+    if let Some(line) =
+        tenancy_posture_notice(named_tenants, oidc::OidcConfig::from_env().is_some())
+    {
+        tracing::warn!(target: "weir_api::tenancy", "{line}");
+    }
     let bg = Arc::clone(&app);
     tokio::spawn(async move {
         let _ = bg
@@ -464,6 +475,37 @@ pub async fn serve(app: Arc<App>, port: u16, concurrency: usize) -> std::io::Res
     });
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
     axum::serve(listener, router(app)).await
+}
+
+/// The startup notice of the alpha tenancy posture, or `None` for a single-tenant deploy without OIDC.
+/// `named_tenants` counts tenants other than `default`.
+fn tenancy_posture_notice(named_tenants: usize, oidc_enabled: bool) -> Option<&'static str> {
+    (named_tenants > 0 || oidc_enabled).then_some(
+        "tenancy posture (alpha): tenants are workspaces for trusted operators, not a hardened \
+         isolation boundary; OIDC sign-in gives each IdP-authenticated user a write key on the \
+         `default` tenant; see docs/explanation/tenancy-posture.md",
+    )
+}
+
+#[cfg(test)]
+mod tenancy_posture_tests {
+    use super::tenancy_posture_notice;
+
+    #[test]
+    fn silent_for_single_tenant_without_oidc() {
+        assert_eq!(tenancy_posture_notice(0, false), None);
+    }
+
+    #[test]
+    fn notice_when_named_tenants_or_oidc() {
+        assert!(tenancy_posture_notice(1, false).is_some());
+        assert!(tenancy_posture_notice(0, true).is_some());
+        assert!(
+            tenancy_posture_notice(2, true)
+                .unwrap()
+                .contains("trusted operators")
+        );
+    }
 }
 
 /// The caller's tenant, taken implicitly from their key ([[WEIR-A-0036]] decision 3). A global key
