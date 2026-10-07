@@ -278,6 +278,56 @@ pub(crate) fn mode_fields(m: &ModeInput) -> Result<ModeFields, String> {
     })
 }
 
+/// Page size of one "load older runs" fetch (`GET /runs?limit=…&before=…`).
+pub(crate) const FEED_PAGE: usize = 50;
+
+/// The run feed as shown: the live first page over the older pages already loaded,
+/// one row per id (the live row wins — it has the newest state), newest first.
+pub(crate) fn merge_feed(live: &[RunRow], older: &[RunRow]) -> Vec<RunRow> {
+    let mut by_id: std::collections::BTreeMap<i64, RunRow> =
+        older.iter().map(|r| (r.id, r.clone())).collect();
+    for r in live {
+        by_id.insert(r.id, r.clone());
+    }
+    by_id.into_values().rev().collect()
+}
+
+/// The `before` cursor for the next older page: the smallest id shown.
+pub(crate) fn feed_cursor(rows: &[RunRow]) -> Option<i64> {
+    rows.iter().map(|r| r.id).min()
+}
+
+/// Epoch milliseconds → `YYYY-MM-DD HH:MM:SS UTC` (civil-from-days, no clock or locale).
+pub(crate) fn fmt_ts(ms: i64) -> String {
+    let secs = ms.div_euclid(1000);
+    let (days, sod) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02} UTC",
+        sod / 3600,
+        sod % 3600 / 60,
+        sod % 60
+    )
+}
+
+/// A run's duration for the feed: the measured one once finished, else where it is.
+pub(crate) fn run_duration(duration_ms: Option<i64>, state: &str) -> String {
+    match (duration_ms, state) {
+        (Some(d), _) => fmt_dur(d),
+        (None, "pending") => "queued".to_string(),
+        (None, "leased") => "running…".to_string(),
+        (None, _) => "—".to_string(),
+    }
+}
+
 /// Log level → an Aurora hue token.
 pub(crate) fn log_color(level: &str) -> &'static str {
     match level.to_ascii_lowercase().as_str() {
@@ -301,6 +351,48 @@ mod tests {
             assert!(health_color(s).starts_with("var(--"));
         }
         assert_eq!(log_color("ERROR"), token::BAD);
+    }
+
+    fn run(id: i64, state: &str) -> RunRow {
+        RunRow {
+            id,
+            connection: "c".into(),
+            state: state.into(),
+            rows_written: 0,
+            dead_lettered: 0,
+            duration_ms: None,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn merge_feed_dedupes_prefers_live_and_sorts_newest_first() {
+        let live = vec![run(9, "leased"), run(8, "done"), run(7, "done")];
+        // An older page loaded earlier still holds 7 (now stale) and 6, 5.
+        let older = vec![run(7, "leased"), run(6, "done"), run(5, "failed")];
+        let feed = merge_feed(&live, &older);
+        assert_eq!(feed.iter().map(|r| r.id).collect::<Vec<_>>(), vec![9, 8, 7, 6, 5]);
+        assert_eq!(feed[2].state, "done", "the live row wins over the stale older one");
+        assert_eq!(feed_cursor(&feed), Some(5));
+        assert_eq!(feed_cursor(&[]), None);
+        assert!(merge_feed(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn fmt_ts_renders_utc_civil_time() {
+        assert_eq!(fmt_ts(0), "1970-01-01 00:00:00 UTC");
+        assert_eq!(fmt_ts(1_791_365_101_000), "2026-10-07 09:25:01 UTC");
+        // Leap day; sub-second millis are dropped.
+        assert_eq!(fmt_ts(951_782_400_999), "2000-02-29 00:00:00 UTC");
+    }
+
+    #[test]
+    fn run_duration_covers_finished_and_in_flight() {
+        assert_eq!(run_duration(Some(1_500), "done"), "1.5s");
+        assert_eq!(run_duration(Some(20), "failed"), "20ms");
+        assert_eq!(run_duration(None, "pending"), "queued");
+        assert_eq!(run_duration(None, "leased"), "running…");
+        assert_eq!(run_duration(None, "failed"), "—");
     }
 
     #[test]
