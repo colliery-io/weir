@@ -227,11 +227,39 @@ mod tests {
     use crate::App;
     use tempfile::TempDir;
 
-    fn app() -> (App, TempDir) {
+    /// A fresh app plus the guard of `CONNECTORS_ENV_LOCK`, with `WEIR_CONNECTORS_DIR` set to a
+    /// dir of this test only. `delete_tenant` removes `<connectors_dir>/<tenant>/`, so without the
+    /// lock a delete of `acme` here removed the staged artifact of a parallel test that uses the
+    /// same tenant id (`compile_isolation_two_tenants_distinct_artifacts`).
+    struct TestApp {
+        app: App,
+        _dir: TempDir,
+        _env: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl std::ops::Deref for TestApp {
+        type Target = App;
+        fn deref(&self) -> &App {
+            &self.app
+        }
+    }
+
+    fn app() -> (TestApp, ()) {
+        let env = crate::CONNECTORS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = TempDir::new().unwrap();
+        unsafe { std::env::set_var("WEIR_CONNECTORS_DIR", dir.path().join("connectors")) };
         let db = dir.path().join("t.db");
         let app = App::open(db.to_str().unwrap()).unwrap();
-        (app, dir)
+        (
+            TestApp {
+                app,
+                _dir: dir,
+                _env: env,
+            },
+            (),
+        )
     }
 
     #[test]

@@ -1404,6 +1404,8 @@ async fn write_keeps_replaces_and_clears_secrets() {
 async fn tenant_delete_cascades_and_its_key_401s_at_once() {
     // WEIR-T-0210: DELETE /tenants/{id} cascades, the tenant's key is refused on the next request
     // (the key cache is cleared, no TTL wait), and another tenant's same-named connection stays.
+    // A tenant id of this test only: the delete removes <connectors_dir>/<tenant>/, which is the
+    // shared testkit dir here.
     use_wasm_connectors();
     let tmp = tempfile::TempDir::new().unwrap();
     let app = Arc::new(App::open(tmp.path().join("weir.db").to_str().unwrap()).unwrap());
@@ -1411,7 +1413,7 @@ async fn tenant_delete_cascades_and_its_key_401s_at_once() {
     let admin = format!("Bearer {}", app.bootstrap_admin_key().unwrap().unwrap());
     let acme = format!(
         "Bearer {}",
-        app.create_api_key("acme", "write", Some("acme"), false)
+        app.create_api_key("t0210-doomed", "write", Some("t0210-doomed"), false)
             .unwrap()
     );
     let globex = format!(
@@ -1445,15 +1447,17 @@ async fn tenant_delete_cascades_and_its_key_401s_at_once() {
     let resp = call("GET", "/connections", &acme, None).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
-    let resp = call("DELETE", "/tenants/acme", &admin, None).await.unwrap();
+    let resp = call("DELETE", "/tenants/t0210-doomed", &admin, None)
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
     // The cached acme key is refused at once.
     let resp = call("GET", "/connections", &acme, None).await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     // acme's rows are gone; globex's same-named connection is untouched.
-    assert!(app.list_connections("acme").unwrap().is_empty());
-    assert!(!app.tenant_exists("acme").unwrap());
+    assert!(app.list_connections("t0210-doomed").unwrap().is_empty());
+    assert!(!app.tenant_exists("t0210-doomed").unwrap());
     let resp = call("GET", "/connections", &globex, None).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let list = json(resp).await;
