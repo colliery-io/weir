@@ -11,6 +11,12 @@
 //! A read returns [`SECRET_SENTINEL`] in place of each secret value. A write that sends the
 //! sentinel, or omits a secret key, keeps the stored value; a new value replaces it; an empty
 //! string clears it. The sentinel on a key with no stored value is an error (nothing to keep).
+//!
+//! A secret key can hold a reference, `env:NAME` or `file:/path` ([[WEIR-T-0202]]), in place
+//! of the value. The host resolves it on each run (`weir_runtime::resolve_secret_refs`); the
+//! API never does. A read returns the reference text as stored (it names where the secret is,
+//! not the secret). A reference in a key that is not secret is refused at create
+//! ([`check_references`]).
 
 use std::collections::BTreeSet;
 
@@ -107,7 +113,8 @@ impl SecretFields {
 }
 
 /// `config` with the value of each secret key that holds a value replaced by [`SECRET_SENTINEL`].
-/// A null or empty-string value is left as it is (there is nothing to hide).
+/// A null or empty-string value is left as it is (there is nothing to hide), and so is a
+/// secret reference (`env:` / `file:`, [[WEIR-T-0202]]): the API never resolves it.
 pub fn redact(config: &Value, secrets: &SecretFields) -> Value {
     let Some(obj) = config.as_object() else {
         return config.clone();
@@ -115,7 +122,10 @@ pub fn redact(config: &Value, secrets: &SecretFields) -> Value {
     let out = obj
         .iter()
         .map(|(k, v)| {
-            let hidden = secrets.is_secret(k) && !v.is_null() && v.as_str() != Some("");
+            let hidden = secrets.is_secret(k)
+                && !v.is_null()
+                && v.as_str() != Some("")
+                && !weir_runtime::is_secret_ref(v);
             let v = if hidden {
                 Value::String(SECRET_SENTINEL.to_string())
             } else {
@@ -125,6 +135,25 @@ pub fn redact(config: &Value, secrets: &SecretFields) -> Value {
         })
         .collect();
     Value::Object(out)
+}
+
+/// Refuse a secret reference (`env:NAME` / `file:/path`, [[WEIR-T-0202]]) in a key that is not
+/// secret: the host resolves references in secret fields only. `side` names the block in the
+/// error message. The message names the key and the reference text (never a value).
+pub fn check_references(config: &Value, secrets: &SecretFields, side: &str) -> Result<(), String> {
+    let Some(obj) = config.as_object() else {
+        return Ok(());
+    };
+    for (k, v) in obj {
+        if weir_runtime::is_secret_ref(v) && !secrets.is_secret(k) {
+            return Err(format!(
+                "{side} config field `{k}` holds the secret reference `{}`, but `{k}` is not a \
+                 secret field — use `env:` / `file:` references in secret fields only",
+                v.as_str().unwrap_or_default()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Does `config` send the sentinel as the value of any top-level key?
@@ -258,6 +287,32 @@ mod tests {
             out,
             json!({"host":"h","password":SECRET_SENTINEL,"api_key":"","sa":SECRET_SENTINEL,"n":null})
         );
+    }
+
+    #[test]
+    fn redact_returns_references_as_stored() {
+        let cfg = json!({"password":"env:DB_PW","api_key":"file:/run/secrets/k","token":"lit"});
+        let out = redact(&cfg, &secrets(&["password", "api_key", "token"]));
+        assert_eq!(
+            out,
+            json!({"password":"env:DB_PW","api_key":"file:/run/secrets/k","token":SECRET_SENTINEL})
+        );
+    }
+
+    #[test]
+    fn references_are_refused_outside_secret_fields() {
+        let s = secrets(&["password"]);
+        assert!(
+            check_references(&json!({"password":"env:DB_PW","host":"h"}), &s, "source").is_ok()
+        );
+        let err = check_references(&json!({"host":"env:DB_HOST"}), &s, "source").unwrap_err();
+        assert!(err.contains("source config field `host`"), "{err}");
+        assert!(err.contains("`env:DB_HOST`"), "{err}");
+        let err = check_references(&json!({"path":"file:/etc/x"}), &s, "dest").unwrap_err();
+        assert!(err.contains("dest config field `path`"), "{err}");
+        // A value that only looks close is not a reference.
+        assert!(check_references(&json!({"host":"env:"}), &s, "source").is_ok());
+        assert!(check_references(&json!({"url":"file:relative"}), &s, "source").is_ok());
     }
 
     #[test]
