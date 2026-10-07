@@ -55,3 +55,4 @@ literal values.
 - The environment and the files are those of the runner process, not of the API process.
 - An OAuth2 or Google service-account token that the host minted with the old secret can stay in use until it
   expires.
+- For what weir protects and what it does not, refer to [Secrets posture](../explanation/secrets-posture.md).
