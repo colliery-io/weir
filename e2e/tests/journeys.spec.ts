@@ -1,4 +1,4 @@
-import { test, expect, admin, scoped, ensurePair } from './fixtures';
+import { test, expect, admin, scoped, ensurePair, fillStable } from './fixtures';
 import type { Page, Response } from '@playwright/test';
 
 // [[WEIR-T-0220]]: the user journeys of COLLIERY-I-0251, end to end against the real e2e
@@ -50,7 +50,7 @@ async function act(page: Page, method: string, path: string, click: () => Promis
 
 /** Fill the Setup form: frankfurter `latest` → the arrow sink. `tenant` scopes the discover. */
 async function fillPair(page: Page, name: string, tenant: string | null) {
-  await page.getByPlaceholder('my-sync').fill(name);
+  await fillStable(page.getByPlaceholder('my-sync'), name);
   // Picking the source rediscovers its streams (a guest call); let it settle first. Its
   // status is not checked here: on main, discovery of a manifest source answers 500 and the
   // form falls back to a text stream field (the discovery fix is PR #21's own work).
@@ -64,7 +64,7 @@ async function fillPair(page: Page, name: string, tenant: string | null) {
   // The stream is a select when discovery returned streams, else a text input.
   const stream = page.getByLabel('Stream', { exact: true });
   if ((await stream.evaluate((e) => e.tagName)) === 'SELECT') await stream.selectOption('latest');
-  else await stream.fill('latest');
+  else await fillStable(stream, 'latest');
 }
 
 /** Save the form and wait for the real create; fail with the server's reason. */

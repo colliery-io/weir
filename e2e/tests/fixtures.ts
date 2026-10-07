@@ -1,5 +1,5 @@
 import { test as base, expect } from '@playwright/test';
-import type { APIRequestContext } from '@playwright/test';
+import type { APIRequestContext, Locator } from '@playwright/test';
 
 // Seed the API key into localStorage before each test so the WEIR-T-0087 auth gate
 // passes (the UI sends it as `Authorization: Bearer`). The server-start harness mints
@@ -15,6 +15,19 @@ export const test = base.extend({
 });
 
 export { expect } from '@playwright/test';
+
+/**
+ * Fill a form field and make sure the value stuck. The Setup view is rebuilt when its data
+ * lands (e.g. `/catalog/available`); a rebuild in the middle of a fill drops the typed text
+ * with no error (seen on CI: `edit-connection` saved `every_secs: null` after a fill of 300).
+ * So fill again until the field holds the value.
+ */
+export async function fillStable(field: Locator, value: string) {
+  await expect(async () => {
+    await field.fill(value);
+    await expect(field).toHaveValue(value, { timeout: 1_000 });
+  }).toPass({ timeout: 15_000 });
+}
 
 /** The admin key's bearer header for direct API calls. */
 export const admin = () => {

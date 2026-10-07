@@ -1,4 +1,4 @@
-import { test, expect } from './fixtures';
+import { test, expect, ensurePair, fillStable } from './fixtures';
 
 // [[WEIR-T-0216]]: Edit on a connection card loads it into the Setup form. Secrets come
 // back from the server as the sentinel ([[WEIR-T-0201]]); the form shows them as
@@ -12,11 +12,14 @@ const auth = () => {
 };
 
 test('edit connection: a non-secret edit keeps the stored secret (real server)', async ({ page }) => {
-  const name = 'fx-edit';
-  await page.request.delete(`/connections/${name}`, { headers: auth() });
+  test.setTimeout(120_000);
+  // A fresh name every time: the server's state outlives a spec (and a retry).
+  const name = `fx-edit-${Date.now().toString(36)}`;
+  await ensurePair(page.request);
   // `api_key` is always a secret key (the baked auth metadata rule).
   const created = await page.request.post('/connections', {
     headers: auth(),
+    timeout: 90_000,
     data: {
       name,
       source: 'frankfurter',
@@ -26,7 +29,7 @@ test('edit connection: a non-secret edit keeps the stored secret (real server)',
       dest_config: {},
     },
   });
-  expect(created.ok()).toBeTruthy();
+  expect(created.ok(), `create ${name}: ${created.status()} ${await created.text()}`).toBeTruthy();
 
   await page.goto('/');
   const card = page.getByTestId('connection-card').filter({ hasText: name });
@@ -39,8 +42,17 @@ test('edit connection: a non-secret edit keeps the stored secret (real server)',
   await expect(page.getByText(`Editing ${name}`)).toBeVisible();
 
   // Edit a non-secret field only.
-  await page.getByLabel('Every (secs)').fill('300');
+  await fillStable(page.getByLabel('Every (secs)'), '300');
+  // Wait on the save itself (a create is slow on the e2e server), and check what it sent.
+  const saved = page.waitForResponse(
+    (r) => r.request().method() === 'POST' && new URL(r.url()).pathname === '/connections',
+    { timeout: 90_000 },
+  );
   await page.getByRole('button', { name: 'Save connection' }).click();
+  const res = await saved;
+  const why = res.ok() ? '' : await res.text().catch(() => '');
+  expect(res.ok(), `POST /connections ${res.status()}: ${why}`).toBeTruthy();
+  expect(res.request().postDataJSON()).toMatchObject({ name, every_secs: 300 });
   await expect(page.getByText(`Saved connection ${name}`)).toBeVisible();
   // Edit mode ends with the save.
   await expect(page.getByPlaceholder('my-sync')).toBeEnabled();

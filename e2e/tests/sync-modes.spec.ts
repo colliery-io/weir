@@ -1,4 +1,4 @@
-import { test, expect, ensurePair } from './fixtures';
+import { test, expect, ensurePair, fillStable } from './fixtures';
 import type { Page } from '@playwright/test';
 
 // [[WEIR-T-0215]]: the connection form sets sync mode, write mode, business keys, the
@@ -13,7 +13,7 @@ const auth = () => {
 async function pickStream(page: Page, stream: string) {
   const field = page.getByLabel('Stream', { exact: true });
   if ((await field.evaluate((e) => e.tagName)) === 'SELECT') await field.selectOption(stream);
-  else await field.fill(stream);
+  else await fillStable(field, stream);
 }
 
 test('sync modes: an incremental upsert cron connection is created and read back', async ({
@@ -32,7 +32,7 @@ test('sync modes: an incremental upsert cron connection is created and read back
 
   await page.goto('/');
   await page.getByRole('button', { name: 'Setup' }).click();
-  await page.getByPlaceholder('my-sync').fill(name);
+  await fillStable(page.getByPlaceholder('my-sync'), name);
   // Picking the source rediscovers its streams (a guest call on the server); wait for that
   // answer, so the stream field is settled (text input or select) before it is picked.
   const discovered = page.waitForResponse(
@@ -52,17 +52,17 @@ test('sync modes: an incremental upsert cron connection is created and read back
   await expect(page.getByLabel('Business keys *')).toHaveCount(0);
   await page.getByLabel('Sync mode').selectOption('incremental');
   await page.getByLabel('Write mode').selectOption('upsert');
-  await page.getByLabel('Cursor field *').fill('date');
+  await fillStable(page.getByLabel('Cursor field *'), 'date');
 
   // Upsert without keys is stopped in the form, before any request.
   await page.getByRole('button', { name: 'Save connection' }).click();
   await expect(page.getByRole('alert').filter({ hasText: 'Upsert needs at least one business key' })).toBeVisible();
-  await page.getByLabel('Business keys *').fill('base, date');
+  await fillStable(page.getByLabel('Business keys *'), 'base, date');
 
   // An interval typed first, then the toggle moved to cron: only the cron is sent.
-  await page.getByLabel('Every (secs)').fill('60');
+  await fillStable(page.getByLabel('Every (secs)'), '60');
   await page.getByRole('button', { name: 'Cron', exact: true }).click();
-  await page.getByLabel(/^Cron ·/).fill('0 0 3 * * *');
+  await fillStable(page.getByLabel(/^Cron ·/), '0 0 3 * * *');
 
   // Wait on the create itself, not on its toast with the default 10s: the toast shows
   // only once the (slow, see above) create answers, and a refused create fails here
