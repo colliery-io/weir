@@ -93,6 +93,56 @@ fn sync_reports_progress_per_checkpoint() {
     assert_eq!(events[2].chunks, 3);
 }
 
+/// WEIR-T-0208: the checkpoint's pooled connection is released BEFORE `on_progress`
+/// runs. The orchestrator's `on_progress` checks out its own connection; holding the
+/// checkpoint's across it is hold-and-wait, and with as many concurrent runs as pool
+/// slots every run blocked on a second checkout until the pool timed out
+/// ("timed out waiting for connection" in `concurrent_run_throughput`).
+#[test]
+fn checkpoint_connection_released_before_on_progress() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path().join("weir.db").to_str().unwrap()).expect("open store");
+    let engine = Engine::new(&store);
+    let cfg = Config {
+        json: "{\"sleep_ms\":0,\"rows\":3}".to_string(),
+    };
+    let source = weir_wasm_testkit::load("Slow", &cfg).expect("slow source");
+    let dest = weir_wasm_testkit::load("ArrowSink", &cfg).expect("arrow sink");
+    let stream = ConfiguredStream {
+        stream: "slow".to_string(),
+        sync_mode: SyncMode::FullRefresh,
+        cursor_field: None,
+        primary_key: None,
+        write_mode: WriteMode::Append,
+        mapping: MappingSpec::default(),
+    };
+
+    let mut checked_out_during_progress: Vec<u32> = Vec::new();
+    engine
+        .sync_with(
+            "release",
+            &stream,
+            &source,
+            &dest,
+            &SyncOptions::default(),
+            &mut |_| {
+                let st = store.pool().inner().state();
+                checked_out_during_progress.push(st.connections - st.idle_connections);
+            },
+        )
+        .expect("sync");
+
+    assert_eq!(
+        checked_out_during_progress.len(),
+        3,
+        "one event per checkpoint"
+    );
+    assert!(
+        checked_out_during_progress.iter().all(|&n| n == 0),
+        "no pooled connection may be held across on_progress, got {checked_out_during_progress:?}"
+    );
+}
+
 #[test]
 fn schema_enforcement_dead_letters_violations() {
     // [[WEIR-T-0119]]: with a stored schema, records that don't coerce to it dead-letter (not written).
