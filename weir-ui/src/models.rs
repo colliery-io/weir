@@ -1,0 +1,160 @@
+//! API DTOs: what the control plane sends and receives.
+
+#[derive(serde::Deserialize, Clone, PartialEq)]
+pub(crate) struct Connection {
+    pub(crate) name: String,
+    pub(crate) source: String,
+    pub(crate) dest: String,
+    pub(crate) stream: String,
+    // F1 ([[WEIR-I-0035]]): "run_once" (default) | "resident". Drives the Start/Stop
+    // controls + the resident live badge. `#[serde(default)]` keeps older payloads valid.
+    #[serde(default)]
+    pub(crate) execution_mode: String,
+}
+
+#[derive(serde::Deserialize, Clone, PartialEq)]
+pub(crate) struct RunRow {
+    pub(crate) id: i64,
+    pub(crate) connection: String,
+    pub(crate) state: String,
+    #[serde(default)]
+    pub(crate) rows_written: i64,
+    #[serde(default)]
+    pub(crate) dead_lettered: i64,
+    #[serde(default)]
+    pub(crate) duration_ms: Option<i64>,
+    #[serde(default)]
+    pub(crate) error: Option<String>,
+}
+
+/// Per-connection health ([[WEIR-T-0110]]) from `GET /overview`.
+#[derive(serde::Deserialize, Clone, PartialEq, Default)]
+pub(crate) struct ConnHealth {
+    pub(crate) connection: String,
+    pub(crate) status: String, // green | amber | red | unknown
+    #[serde(default)]
+    pub(crate) lag_ms: Option<i64>,
+    #[serde(default)]
+    pub(crate) error_rate: f64,
+    #[serde(default)]
+    pub(crate) dead_letters: u64,
+    #[serde(default)]
+    pub(crate) rows_recent: i64,
+    #[serde(default)]
+    pub(crate) throughput: Vec<i64>,
+}
+
+/// One tenant's rolled-up health for the super-operator view ([[WEIR-T-0112]]).
+#[derive(serde::Deserialize, Clone, PartialEq, Default)]
+pub(crate) struct TenantHealth {
+    pub(crate) tenant: String,
+    pub(crate) status: String,
+    #[serde(default)]
+    pub(crate) connections: u32,
+    #[serde(default)]
+    pub(crate) needs_attention: u32,
+    #[serde(default)]
+    pub(crate) dead_letters: u64,
+    #[serde(default)]
+    pub(crate) queue_depth: i64,
+}
+
+#[derive(serde::Deserialize, Clone, PartialEq, Default)]
+pub(crate) struct AttentionItem {
+    pub(crate) tenant: String,
+    pub(crate) connection: String,
+    pub(crate) status: String,
+}
+
+/// The platform-wide rollup from `GET /platform/health` (admin only).
+#[derive(serde::Deserialize, Clone, PartialEq, Default)]
+pub(crate) struct PlatformHealth {
+    #[serde(default)]
+    pub(crate) tenants: Vec<TenantHealth>,
+    #[serde(default)]
+    pub(crate) needs_attention: Vec<AttentionItem>,
+    #[serde(default)]
+    pub(crate) active_tenants: u32,
+    #[serde(default)]
+    pub(crate) total_queue_depth: i64,
+}
+
+#[derive(serde::Deserialize, Clone, PartialEq)]
+pub(crate) struct LogRow {
+    pub(crate) level: String,
+    pub(crate) message: String,
+}
+
+#[derive(serde::Deserialize, Clone, PartialEq)]
+pub(crate) struct DeadLetterRow {
+    pub(crate) record: String,
+    pub(crate) reason: String,
+}
+
+/// A registered connector — drives the role-filtered source/dest selects.
+#[derive(serde::Deserialize, Clone, PartialEq)]
+pub(crate) struct CatalogItem {
+    pub(crate) name: String,
+    pub(crate) version: String,
+    #[serde(default)]
+    pub(crate) roles: Vec<String>,
+}
+
+/// An onboardable connector for "discover & select" — a crate package, a source
+/// `manifest`, or a `dest-manifest`.
+#[derive(serde::Deserialize, Clone, PartialEq, Default)]
+pub(crate) struct AvailableItem {
+    pub(crate) name: String,
+    #[serde(default)]
+    pub(crate) kind: String,
+    #[serde(default)]
+    pub(crate) summary: String,
+}
+
+/// A manifest preview report — tier / confidence / gaps before onboarding.
+#[derive(serde::Deserialize, Clone, PartialEq, Default)]
+pub(crate) struct PreviewReport {
+    pub(crate) tier: String,
+    pub(crate) confidence: f32,
+    #[serde(default)]
+    pub(crate) streams: Vec<String>,
+    #[serde(default)]
+    pub(crate) unsupported: Vec<String>,
+}
+
+/// One field of a connector's config contract (from its JSON-Schema `config_schema`).
+#[derive(Clone, PartialEq)]
+pub(crate) struct Prop {
+    pub(crate) key: String,
+    pub(crate) kind: String,
+    pub(crate) secret: bool,
+}
+
+#[derive(serde::Serialize)]
+pub(crate) struct NewConnection {
+    pub(crate) name: String,
+    pub(crate) source: String,
+    pub(crate) dest: String,
+    pub(crate) stream: String,
+    pub(crate) config: serde_json::Value,
+    pub(crate) every_secs: Option<f64>,
+    pub(crate) cron: Option<String>,
+    // F1: "run_once" | "resident"; for resident, `every_secs` is the emit cadence.
+    pub(crate) execution_mode: String,
+}
+
+/// One typed field of a stream schema ([[WEIR-T-0121]]).
+#[derive(Clone, serde::Deserialize, Default)]
+pub(crate) struct SchemaField {
+    pub(crate) name: String,
+    #[serde(rename = "type")]
+    pub(crate) ty: String,
+    pub(crate) nullable: bool,
+}
+
+/// A connection's captured schema + any breaking-drift flag.
+#[derive(Clone, serde::Deserialize, Default)]
+pub(crate) struct SchemaView {
+    pub(crate) fields: Vec<SchemaField>,
+    pub(crate) broken: Option<String>,
+}
