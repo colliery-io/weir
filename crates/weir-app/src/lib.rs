@@ -269,6 +269,13 @@ impl App {
         // Reverse-ETL ([[WEIR-I-0015]]): a dest-manifest bakes onto `rest-dest` in the **dest** config.
         let (dest, dest_config) =
             self.resolve_manifest_dest(tenant, &c.dest, &c.stream, &c.dest_config)?;
+        // An unknown `auth_scheme` is refused NOW ([[WEIR-T-0203]]): at run time its
+        // config could carry secrets under any key into the guest. Checked on the
+        // resolved configs, so a scheme from the manifest or the user is covered.
+        for (side, cfg) in [("source", &source_config), ("dest", &dest_config)] {
+            weir_runtime::check_auth_scheme(cfg)
+                .map_err(|e| AppError::Config(format!("{side} config: {e}")))?;
+        }
         // Creation-time validation ([[WEIR-T-0166]]): a typo'd connector or config missing the
         // connector's declared requireds fails NOW with a reason — never 201-then-fail-at-run.
         self.validate_connector_resolves(tenant, &source, "source")?;
@@ -3053,5 +3060,88 @@ streams:
         )
         .unwrap();
         assert!(app.plan_run(DEFAULT_TENANT, "c").is_ok());
+    }
+}
+
+#[cfg(test)]
+mod auth_scheme_tests {
+    //! [[WEIR-T-0203]]: an unknown `auth_scheme` is refused at create, and an old row
+    //! that carries one fails its run instead of passing the config to the guest.
+    use super::*;
+
+    fn echo_conn(source_config: &str) -> Connection {
+        Connection {
+            name: "c".into(),
+            source: connector_ref("Echo"),
+            dest: connector_ref("ArrowSink"),
+            stream: "echo".into(),
+            source_config: source_config.into(),
+            dest_config: "{}".into(),
+            every_secs: None,
+            cron: None,
+            sync_mode: "full_refresh".into(),
+            write_mode: "append".into(),
+            business_keys: vec![],
+            cursor_field: None,
+            execution_mode: "run_once".into(),
+        }
+    }
+
+    const MISSPELLED: &str = r#"{"auth_scheme":"beare","api_key":"shh"}"#;
+
+    #[test]
+    fn create_refuses_misspelled_auth_scheme() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let app = App::open(tmp.path().join("weir.db").to_str().unwrap()).unwrap();
+        let err = app
+            .add_connection(DEFAULT_TENANT, &echo_conn(MISSPELLED))
+            .unwrap_err();
+        let AppError::Config(msg) = &err else {
+            panic!("expected Config (400), got {err:?}");
+        };
+        let want = weir_runtime::UnknownAuthScheme("beare".into()).to_string();
+        assert_eq!(msg, &format!("source config: {want}"));
+        assert!(msg.contains("`beare`") && msg.contains("bearer"), "{msg}");
+        assert!(app.list_connections(DEFAULT_TENANT).unwrap().is_empty());
+    }
+
+    // A sync test that blocks on the run: the env lock is held for the whole test,
+    // and holding a std mutex across an `.await` is refused by clippy.
+    #[test]
+    fn run_of_old_row_with_unknown_auth_scheme_fails_with_same_message() {
+        let _env = crate::CONNECTORS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("WEIR_CONNECTORS_DIR", weir_wasm_testkit::connectors_dir());
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        let app = App::open(tmp.path().join("weir.db").to_str().unwrap()).unwrap();
+        app.add_connection(DEFAULT_TENANT, &echo_conn("{}"))
+            .expect("valid connection");
+        // An old row: written before create-time validation existed.
+        let mut conn = app.store.pool().get().unwrap();
+        diesel::update(
+            connections::table.filter(
+                connections::tenant_id
+                    .eq(DEFAULT_TENANT)
+                    .and(connections::name.eq("c")),
+            ),
+        )
+        .set(connections::source_config.eq(MISSPELLED))
+        .execute(&mut conn)
+        .unwrap();
+        drop(conn);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let report = rt.block_on(app.run("c")).expect("run planned + drained");
+        assert_eq!(report.state, "failed");
+        let history = app.history(DEFAULT_TENANT, "c").unwrap();
+        let error = history
+            .last()
+            .and_then(|u| u.error.clone())
+            .expect("failed run records its error");
+        let want = weir_runtime::UnknownAuthScheme("beare".into()).to_string();
+        assert!(error.contains(&want), "{error}");
     }
 }

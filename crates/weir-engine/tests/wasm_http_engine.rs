@@ -339,7 +339,8 @@ fn posts_stream() -> ConfiguredStream {
 /// sanitized config, so the credential is injected host-side and never enters the sandbox.
 /// `allowed_hosts` is pinned to loopback (the mock servers).
 fn host_auth_source(pkg_root: &Path, cfg_json: &str) -> ConnectorHandle {
-    let (credential, guest_json) = Credential::from_auth_config(cfg_json);
+    let (credential, guest_json) =
+        Credential::from_auth_config(cfg_json).expect("known auth scheme");
     let policy = HostAllowList {
         allowed_hosts: vec!["127.0.0.1".to_string()],
         inject_headers: vec![],
@@ -2042,7 +2043,7 @@ fn wasm_http_source_google_sa_host_mints_and_injects_bearer() {
     })
     .to_string();
     // The credential split must leave no key material in what reaches the guest.
-    let (_, guest_json) = Credential::from_auth_config(&cfg_json);
+    let (_, guest_json) = Credential::from_auth_config(&cfg_json).expect("known auth scheme");
     assert!(
         !guest_json.contains("PRIVATE KEY") && !guest_json.contains("client_email"),
         "SA key material must never reach the guest config; got: {guest_json}"
@@ -2108,7 +2109,7 @@ fn wasm_http_source_snowflake_keypair_host_signs_and_injects() {
     })
     .to_string();
     // The split strips ONLY the private key — account/user remain for URL templating.
-    let (_, guest_json) = Credential::from_auth_config(&cfg_json);
+    let (_, guest_json) = Credential::from_auth_config(&cfg_json).expect("known auth scheme");
     assert!(
         !guest_json.contains("PRIVATE KEY"),
         "key material must never reach the guest config; got: {guest_json}"

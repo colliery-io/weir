@@ -327,20 +327,82 @@ pub enum Credential {
     SnowflakeKeypairJwt(SnowflakeKeypairProvider),
 }
 
+/// The `auth_scheme` values that [`Credential::from_auth_config`] knows
+/// ([[WEIR-T-0203]]). This is the one definition: connection create
+/// (`weir-app`) validates against it, and the run-time split refuses any other
+/// value, so an unknown scheme can never pass its secrets through to the guest.
+pub const KNOWN_AUTH_SCHEMES: &[&str] = &[
+    "bearer",
+    "header",
+    "query",
+    "oauth2",
+    "session",
+    "basic",
+    "google_service_account",
+    "snowflake_keypair_jwt",
+    "aws_sigv4",
+];
+
+/// A connection config names an `auth_scheme` that weir does not know
+/// ([[WEIR-T-0203]]). The value is the scheme as given (a non-string value is
+/// shown as its JSON text). The message is the same at create and at run time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownAuthScheme(pub String);
+
+impl std::fmt::Display for UnknownAuthScheme {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "unknown auth_scheme `{}`; known schemes: {}",
+            self.0,
+            KNOWN_AUTH_SCHEMES.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for UnknownAuthScheme {}
+
+/// Check the `auth_scheme` of a parsed connection config against
+/// [`KNOWN_AUTH_SCHEMES`]. No `auth_scheme` (or `null`) is valid: the
+/// connection has no host-side credential.
+fn check_auth_scheme_value(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), UnknownAuthScheme> {
+    match obj.get("auth_scheme") {
+        None | Some(serde_json::Value::Null) => Ok(()),
+        Some(serde_json::Value::String(s)) if KNOWN_AUTH_SCHEMES.contains(&s.as_str()) => Ok(()),
+        Some(serde_json::Value::String(s)) => Err(UnknownAuthScheme(s.clone())),
+        Some(other) => Err(UnknownAuthScheme(other.to_string())),
+    }
+}
+
+/// Validate the `auth_scheme` of a connection config JSON ([[WEIR-T-0203]]).
+/// A config that is not a JSON object has no scheme to check and passes.
+pub fn check_auth_scheme(config_json: &str) -> Result<(), UnknownAuthScheme> {
+    match serde_json::from_str::<serde_json::Value>(config_json) {
+        Ok(serde_json::Value::Object(obj)) => check_auth_scheme_value(&obj),
+        _ => Ok(()),
+    }
+}
+
 impl Credential {
     /// Build a host-side credential from the resolved connection config — the
     /// `auth_*` metadata weir-app layered in plus the secret values the connection
     /// supplied — and return it alongside a **sanitized** config JSON with every
     /// secret + auth key removed. That sanitized JSON is what reaches the guest, so
     /// no credential ever crosses into the sandbox ([[WEIR-A-0033]]). A config with
-    /// no recognized auth scheme yields `(None, <json unchanged>)`.
-    pub fn from_auth_config(json: &str) -> (Option<Credential>, String) {
+    /// no `auth_scheme` yields `(None, <json with auth metadata stripped>)`. A config
+    /// whose `auth_scheme` is not in [`KNOWN_AUTH_SCHEMES`] is refused
+    /// ([[WEIR-T-0203]]): its secrets could sit under any key, so it is never
+    /// passed through to the guest.
+    pub fn from_auth_config(json: &str) -> Result<(Option<Credential>, String), UnknownAuthScheme> {
         let Ok(mut v) = serde_json::from_str::<serde_json::Value>(json) else {
-            return (None, json.to_string());
+            return Ok((None, json.to_string()));
         };
         let Some(obj) = v.as_object_mut() else {
-            return (None, json.to_string());
+            return Ok((None, json.to_string()));
         };
+        check_auth_scheme_value(obj)?;
         let get = |o: &serde_json::Map<String, serde_json::Value>, k: &str| {
             o.get(k).and_then(|x| x.as_str()).map(str::to_string)
         };
@@ -561,16 +623,20 @@ impl Credential {
                     service: get(obj, "aws_service").unwrap_or_else(|| "s3".into()),
                 })
             }
-            _ => None,
+            None => None,
+            // `check_auth_scheme_value` already refused every value outside
+            // KNOWN_AUTH_SCHEMES; a known scheme with no arm here is a bug, and
+            // is refused rather than passed through.
+            Some(other) => return Err(UnknownAuthScheme(other.to_string())),
         };
 
         for k in &strip {
             obj.remove(k);
         }
-        (
+        Ok((
             cred,
             serde_json::to_string(&v).unwrap_or_else(|_| json.to_string()),
-        )
+        ))
     }
 
     /// Resolve the credential and apply it to one outbound request.
@@ -1446,12 +1512,51 @@ mod sigv4_credential_tests {
         assert_eq!(canonical_query("a=x/y"), "a=x%2Fy");
     }
 
+    /// [[WEIR-T-0203]]: an unknown `auth_scheme` is refused, never passed through
+    /// to the guest with its secrets.
+    #[test]
+    fn unknown_auth_scheme_is_refused_not_passed_through() {
+        let cfg = r#"{"auth_scheme":"beare","api_key":"shh","token":"also-secret"}"#;
+        let Err(err) = Credential::from_auth_config(cfg) else {
+            panic!("unknown scheme must be refused");
+        };
+        assert_eq!(err, UnknownAuthScheme("beare".into()));
+        let msg = err.to_string();
+        assert!(msg.contains("`beare`"), "names the value: {msg}");
+        for s in KNOWN_AUTH_SCHEMES {
+            assert!(msg.contains(s), "names known scheme {s}: {msg}");
+        }
+        assert_eq!(check_auth_scheme(cfg), Err(err));
+        // A non-string scheme is unknown too.
+        assert_eq!(
+            check_auth_scheme(r#"{"auth_scheme":7}"#),
+            Err(UnknownAuthScheme("7".into()))
+        );
+    }
+
+    /// [[WEIR-T-0203]]: every scheme in the one list is accepted by both the
+    /// validation and the run-time split; no scheme (or null) is valid.
+    #[test]
+    fn known_auth_schemes_and_no_scheme_are_accepted() {
+        for s in KNOWN_AUTH_SCHEMES {
+            let cfg = serde_json::json!({ "auth_scheme": s }).to_string();
+            assert_eq!(check_auth_scheme(&cfg), Ok(()), "{s}");
+            assert!(Credential::from_auth_config(&cfg).is_ok(), "{s}");
+        }
+        for cfg in [r#"{"table":"t"}"#, r#"{"auth_scheme":null}"#, "", "[1]"] {
+            assert_eq!(check_auth_scheme(cfg), Ok(()), "{cfg}");
+            let (cred, _) = Credential::from_auth_config(cfg).expect(cfg);
+            assert!(cred.is_none(), "{cfg}");
+        }
+    }
+
     #[test]
     fn aws_sigv4_credential_parses_and_strips_secrets() {
         let (cred, sanitized) = Credential::from_auth_config(
             r#"{"auth_scheme":"aws_sigv4","access_key_id":"AKIA","secret_access_key":"shh",
                 "aws_region":"eu-west-1","bucket":"data"}"#,
-        );
+        )
+        .unwrap();
         match cred {
             Some(Credential::AwsSigV4 {
                 access_key,
@@ -1524,7 +1629,7 @@ mod google_sa_tests {
             "property_id": "123",
         })
         .to_string();
-        let (cred, sanitized) = Credential::from_auth_config(&cfg);
+        let (cred, sanitized) = Credential::from_auth_config(&cfg).unwrap();
         assert!(matches!(cred, Some(Credential::GoogleServiceAccount(_))));
         // Key material + every auth key is gone; the harmless config field survives.
         assert!(!sanitized.contains("PRIVATE KEY"));
@@ -1541,7 +1646,7 @@ mod google_sa_tests {
                 r#"{"client_email":"sa@x.iam.gserviceaccount.com","private_key":"k"}"#,
         })
         .to_string();
-        let (cred2, sanitized2) = Credential::from_auth_config(&cfg2);
+        let (cred2, sanitized2) = Credential::from_auth_config(&cfg2).unwrap();
         assert!(matches!(cred2, Some(Credential::GoogleServiceAccount(_))));
         assert!(!sanitized2.contains("client_email"));
     }
@@ -1829,7 +1934,8 @@ mod egress_tests {
                 "session_token_path":"token","session_ttl_secs":300,
                 "session_login_body":{"username":"{{admin_user}}","password":"{{admin_pass}}","remember":true},
                 "admin_user":"root","admin_pass":"shh","table":"t"}"#,
-        );
+        )
+        .unwrap();
         assert!(matches!(cred, Some(Credential::Session(_))));
         assert!(!sanitized.contains("shh"), "{sanitized}");
         assert!(!sanitized.contains("root"), "{sanitized}");
@@ -1931,7 +2037,7 @@ mod snowflake_keypair_tests {
             "warehouse": "COMPUTE_XS",
         })
         .to_string();
-        let (cred, sanitized) = Credential::from_auth_config(&cfg);
+        let (cred, sanitized) = Credential::from_auth_config(&cfg).unwrap();
         assert!(matches!(cred, Some(Credential::SnowflakeKeypairJwt(_))));
         // The secret + metadata are gone…
         assert!(!sanitized.contains("PRIVATE KEY"));
@@ -1957,7 +2063,8 @@ mod snowflake_keypair_tests {
                 "private_key": TEST_KEY_PEM,
             })
             .to_string(),
-        );
+        )
+        .unwrap();
         let policy = HostAllowList::allow_all().with_credential(cred.expect("credential"));
         let req = weir_connector::fidius::http_types::Request::builder()
             .uri("https://myorg-acct1.snowflakecomputing.com/api/v2/statements")

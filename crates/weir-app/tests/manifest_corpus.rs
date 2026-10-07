@@ -474,7 +474,7 @@ async fn snowflake_dest_writes_and_reads_back_live() {
 
     // ── Write, then replay (MERGE keyed on email → idempotent). ─────────────────
     let dest_json = auth_cfg(serde_json::json!({ "table": TABLE }));
-    let (cred, guest_json) = Credential::from_auth_config(&dest_json);
+    let (cred, guest_json) = Credential::from_auth_config(&dest_json).expect("known auth scheme");
     assert!(
         !guest_json.contains("PRIVATE KEY"),
         "key material must never reach the guest config"
@@ -538,7 +538,7 @@ async fn snowflake_dest_writes_and_reads_back_live() {
         "request_body": statement.to_string(),
         "record_path": "data",
     }));
-    let (cred, guest_json) = Credential::from_auth_config(&src_json);
+    let (cred, guest_json) = Credential::from_auth_config(&src_json).expect("known auth scheme");
     let policy = HostAllowList {
         allowed_hosts: Vec::new(),
         inject_headers: Vec::new(),
@@ -657,7 +657,7 @@ async fn snowflake_to_hubspot_retl_live() {
         cfg.to_string()
     };
     let sf_handle = |json: &str| {
-        let (cred, guest_json) = Credential::from_auth_config(json);
+        let (cred, guest_json) = Credential::from_auth_config(json).expect("known auth scheme");
         let policy = HostAllowList {
             allowed_hosts: Vec::new(),
             inject_headers: Vec::new(),
@@ -709,7 +709,8 @@ async fn snowflake_to_hubspot_retl_live() {
     .expect("parse hubspot dest manifest");
     let mut dest_cfg = weir_app::dest_object_to_config(&m, "contacts");
     dest_cfg["api_key"] = serde_json::Value::String(hs_token);
-    let (cred, guest_json) = Credential::from_auth_config(&dest_cfg.to_string());
+    let (cred, guest_json) =
+        Credential::from_auth_config(&dest_cfg.to_string()).expect("known auth scheme");
     assert!(
         !guest_json.contains("pat-") && !guest_json.contains("api_key"),
         "the HubSpot token must be stripped from the guest config"
