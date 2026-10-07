@@ -104,6 +104,26 @@ pub(crate) fn cfg_get(cfg: &str, key: &str) -> String {
         .unwrap_or_default()
 }
 
+/// The value a read gives in place of a stored secret, and a write sends to keep it
+/// ([[WEIR-T-0201]]). An empty string clears the secret; an omitted key keeps it.
+pub(crate) const SECRET_SENTINEL: &str = "__weir_secret_unchanged__";
+
+/// Set a key in a config-JSON string to a string, verbatim: an empty string stays (it
+/// clears a stored secret), where [`cfg_set`] drops the key.
+pub(crate) fn cfg_set_str(cfg: &str, key: &str, val: &str) -> String {
+    let mut obj = serde_json::from_str::<serde_json::Value>(cfg)
+        .ok()
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    obj.insert(key.to_string(), serde_json::Value::from(val));
+    serde_json::Value::Object(obj).to_string()
+}
+
+/// A config as a connection read gives it, as the form's JSON-object string.
+pub(crate) fn cfg_text(cfg: &serde_json::Value) -> String {
+    if cfg.is_object() { cfg.to_string() } else { "{}".to_string() }
+}
+
 /// Set a key in a config-JSON string, coercing by the field kind; empty clears it.
 pub(crate) fn cfg_set(cfg: &str, key: &str, val: &str, kind: &str) -> String {
     let mut obj = serde_json::from_str::<serde_json::Value>(cfg)
@@ -291,6 +311,18 @@ pub(crate) fn log_color(level: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secret_writes_keep_the_sentinel_and_an_explicit_clear() {
+        let cfg = cfg_text(&serde_json::json!({ "host": "db", "token": SECRET_SENTINEL }));
+        // An edit that does not touch the secret sends the sentinel back as read.
+        assert_eq!(cfg_get(&cfg, "token"), SECRET_SENTINEL);
+        // A clear sends "" (cfg_set would drop the key, which keeps the stored value).
+        let cleared = cfg_set_str(&cfg, "token", "");
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&cleared).unwrap()["token"], "");
+        assert!(!cfg_set(&cfg, "token", "", "string").contains("token"));
+        assert_eq!(cfg_text(&serde_json::Value::Null), "{}");
+    }
 
     #[test]
     fn status_colours_are_theme_tokens() {

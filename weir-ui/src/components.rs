@@ -1,6 +1,6 @@
 //! Shared widgets: the brand mark, the connection card, a config-contract field.
 
-use crate::helpers::{cfg_get, cfg_set, run_metrics, state_color};
+use crate::helpers::{cfg_get, cfg_set, cfg_set_str, run_metrics, state_color, SECRET_SENTINEL};
 use crate::models::{Connection, Prop, RunRow};
 use aurora_leptos::components::*;
 use aurora_leptos::tokens::token;
@@ -27,6 +27,9 @@ pub(crate) struct SideConfig {
     pub(crate) form: RwSignal<String>,
     pub(crate) advanced: RwSignal<String>,
     pub(crate) show_advanced: RwSignal<bool>,
+    /// A loaded connection's config ([[WEIR-T-0216]]): the next [`SideConfig::reset`]
+    /// (the connector-change effect) takes it in place of an empty form.
+    pending: StoredValue<Option<String>>,
 }
 
 impl SideConfig {
@@ -36,12 +39,24 @@ impl SideConfig {
             form: RwSignal::new("{}".to_string()),
             advanced: RwSignal::new(String::new()),
             show_advanced: RwSignal::new(false),
+            pending: StoredValue::new(None),
         }
     }
 
-    /// A different connector: its contract replaces the old one, and the old values go.
+    /// A different connector: its contract replaces the old one, and the old values go
+    /// (or a loaded connection's values come in).
     pub(crate) fn reset(&self) {
-        self.form.set("{}".to_string());
+        let loaded = self.pending.get_value();
+        self.pending.set_value(None);
+        self.form.set(loaded.unwrap_or_else(|| "{}".to_string()));
+        self.advanced.set(String::new());
+    }
+
+    /// Load a stored connection's config for edit. Called before the connector is set,
+    /// so the reset that the connector change triggers keeps it.
+    pub(crate) fn load(&self, cfg: String) {
+        self.pending.set_value(Some(cfg.clone()));
+        self.form.set(cfg);
         self.advanced.set(String::new());
     }
 }
@@ -67,6 +82,9 @@ pub(crate) fn config_field(p: Prop, form: RwSignal<String>) -> AnyView {
         }
         .into_any();
     }
+    if p.secret && field.get_untracked() == SECRET_SENTINEL {
+        return stored_secret_field(p, form, label);
+    }
     if p.secret {
         return view! {
             <PasswordInput label=label value=field required=p.required on_input=on_input autocomplete="new-password"/>
@@ -75,6 +93,48 @@ pub(crate) fn config_field(p: Prop, form: RwSignal<String>) -> AnyView {
     }
     view! {
         <TextInput label=label placeholder=p.kind value=field required=p.required on_input=on_input mono=true/>
+    }
+    .into_any()
+}
+
+/// A secret field that holds a stored value ([[WEIR-T-0216]]). The value never reaches
+/// the browser, so the input is empty and reads "unchanged". The form keeps the sentinel,
+/// which keeps the stored value on save, until the user types a new value; "Clear" sends
+/// an empty string, which clears it. Emptying the input goes back to the sentinel.
+fn stored_secret_field(p: Prop, form: RwSignal<String>, label: String) -> AnyView {
+    let key = p.key.clone();
+    let typed = RwSignal::new(String::new());
+    let cleared = RwSignal::new(false);
+    let put = move |v: &str| form.set(cfg_set_str(&form.get_untracked(), &key, v));
+    let put2 = put.clone();
+    let on_input = Callback::new(move |v: String| {
+        cleared.set(false);
+        put(if v.is_empty() { SECRET_SENTINEL } else { &v });
+    });
+    let toggle = Callback::new(move |_| {
+        let clear = !cleared.get_untracked();
+        cleared.set(clear);
+        typed.set(String::new());
+        put2(if clear { "" } else { SECRET_SENTINEL });
+    });
+    let testid = format!("secret-{}", p.key);
+    view! {
+        <div class="weir-form" data-testid=testid>
+            <PasswordInput label=label value=typed on_input=on_input autocomplete="new-password"
+                placeholder="•••••• unchanged · type to replace"/>
+            <Group gap="sm">
+                <Text size="xs" dimmed=true>{move || if cleared.get() {
+                    "will be cleared on save"
+                } else if typed.get().is_empty() {
+                    "unchanged · the stored value is kept"
+                } else {
+                    "replaced on save"
+                }}</Text>
+                <Button variant="subtle" size="xs" on_click=toggle>
+                    {move || if cleared.get() { "Keep stored" } else { "Clear" }}
+                </Button>
+            </Group>
+        </div>
     }
     .into_any()
 }
@@ -121,6 +181,8 @@ pub(crate) struct ConnActions {
     pub(crate) on_delete: Callback<String>,
     pub(crate) on_start: Callback<String>,
     pub(crate) on_stop: Callback<String>,
+    /// Load the connection into the Setup form ([[WEIR-T-0216]]).
+    pub(crate) on_edit: Callback<String>,
 }
 
 #[component]
@@ -135,8 +197,9 @@ pub(crate) fn ConnectionCard(conn: Connection, last: Option<RunRow>, actions: Co
     // "live" = it holds an active (leased/pending) run; otherwise it's stopped.
     let resident = conn.execution_mode == "resident";
     let live = matches!(state.as_str(), "leased" | "pending");
-    let (n_open, n_run, n_del, n_start, n_stop) = (
+    let (n_open, n_run, n_del, n_start, n_stop, n_edit) = (
         conn.name.clone(), conn.name.clone(), conn.name.clone(), conn.name.clone(), conn.name.clone(),
+        conn.name.clone(),
     );
     let (pill_color, pill_label) = if resident {
         if live { (token::OK, "resident • live".to_string()) } else { (token::MUTED, "resident • stopped".to_string()) }
@@ -162,6 +225,8 @@ pub(crate) fn ConnectionCard(conn: Connection, last: Option<RunRow>, actions: Co
                     <Group gap="xs">
                         <Button variant="default" size="xs" bad=true stop_propagation=true
                             on_click=Callback::new(move |_| actions.on_delete.run(n_del.clone()))>"Delete"</Button>
+                        <Button variant="default" size="xs" stop_propagation=true
+                            on_click=Callback::new(move |_| actions.on_edit.run(n_edit.clone()))>"Edit"</Button>
                         {if resident {
                             view! {
                                 <Button variant="default" size="xs" stop_propagation=true

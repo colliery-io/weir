@@ -3,7 +3,7 @@
 use crate::components::{config_side, SideConfig};
 use crate::fetch::get_json;
 use crate::helpers::{friendly, is_onboarded, mode_fields, ModeFields, ModeInput};
-use crate::models::{AvailableItem, CatalogItem, Connection, PreviewReport, SchemaView};
+use crate::models::{AvailableItem, CatalogItem, Connection, ConnectionDetail, PreviewReport, SchemaView};
 use aurora_leptos::components::*;
 use aurora_leptos::tokens::token;
 use leptos::prelude::*;
@@ -43,6 +43,18 @@ impl SyncForm {
             cron: RwSignal::new(String::new()),
             cursor_options: RwSignal::new(Vec::new()),
         }
+    }
+
+    /// Fill the form from a stored connection ([[WEIR-T-0216]]).
+    pub(crate) fn load(&self, c: &ConnectionDetail) {
+        let or = |v: &str, d: &str| if v.is_empty() { d.to_string() } else { v.to_string() };
+        self.sync_mode.set(or(&c.sync_mode, "full_refresh"));
+        self.write_mode.set(or(&c.write_mode, "append"));
+        self.business_keys.set(c.business_keys.join(", "));
+        self.cursor_field.set(c.cursor_field.clone().unwrap_or_default());
+        self.schedule.set(if c.cron.is_some() { CRON } else { EVERY }.to_string());
+        self.every.set(c.every_secs.map(|s| s.to_string()).unwrap_or_default());
+        self.cron.set(c.cron.clone().unwrap_or_default());
     }
 
     /// The fields to send, checked like the server checks them.
@@ -152,6 +164,9 @@ pub(crate) struct SetupState {
     pub(crate) stream: RwSignal<String>,
     pub(crate) sync: SyncForm,
     pub(crate) exec_mode: RwSignal<String>,
+    /// The connection being edited ([[WEIR-T-0216]]): its name is read-only.
+    pub(crate) editing: RwSignal<Option<String>>,
+    pub(crate) cancel_edit: Callback<()>,
     pub(crate) onboard_pick: Callback<()>,
     pub(crate) do_preview: Callback<()>,
     pub(crate) onboard_byo: Callback<()>,
@@ -161,7 +176,7 @@ pub(crate) struct SetupState {
 pub(crate) fn setup_view(s: SetupState) -> AnyView {
     let SetupState {
         catalog, available, src_cfg, dst_cfg, streams, add_pkg, add_manifest, add_path, preview,
-        name, src, dst, stream, sync, exec_mode,
+        name, src, dst, stream, sync, exec_mode, editing, cancel_edit,
         onboard_pick, do_preview, onboard_byo, save_conn,
     } = s;
     // Picker options (raw_name, friendly), onboarded dropped.
@@ -226,7 +241,15 @@ pub(crate) fn setup_view(s: SetupState) -> AnyView {
 
         <Panel title="New / edit connection" caption="wire a source to a destination">
             <div class="weir-form">
-                <TextInput label="Name" placeholder="my-sync" value=name mono=true/>
+                {move || editing.get().map(|n| view! {
+                    <Alert title=format!("Editing {n}") color=token::ICE>
+                        <Text size="xs" dimmed=true>
+                            "Saving updates this connection. Secrets stay as stored unless you replace or clear them."
+                        </Text>
+                    </Alert>
+                })}
+                <TextInput label="Name" placeholder="my-sync" value=name mono=true
+                    disabled=Signal::derive(move || editing.get().is_some())/>
                 <SimpleGrid cols=2>
                     <Select label="Source" placeholder="— source —" option_pairs=sources value=src/>
                     <Select label="Destination" placeholder="— destination —" option_pairs=dests value=dst/>
@@ -243,7 +266,12 @@ pub(crate) fn setup_view(s: SetupState) -> AnyView {
                 // Per-side config ([[WEIR-T-0214]]): sent as `source_config` / `dest_config`.
                 {config_side("Source", src, src_cfg)}
                 {config_side("Destination", dst, dst_cfg)}
-                <div><Button on_click=save_conn>"Save connection"</Button></div>
+                <Group gap="sm">
+                    <Button on_click=save_conn>"Save connection"</Button>
+                    {move || editing.get().is_some().then(|| view! {
+                        <Button variant="default" on_click=cancel_edit>"Cancel edit"</Button>
+                    })}
+                </Group>
             </div>
         </Panel>
     }
