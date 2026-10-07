@@ -220,6 +220,24 @@ fn build_authz_table() -> AuthzTable {
         "/tenants/{id}/catalog",
         Access::platform(Admin),
     );
+    // The switched-admin Setup surface ([[WEIR-T-0217]]) — same platform-admin gate.
+    for (m, p) in [
+        (Method::POST, "/tenants/{id}/connections"),
+        (Method::DELETE, "/tenants/{id}/connections/{name}"),
+        (Method::GET, "/tenants/{id}/connections/{name}/schema"),
+        (
+            Method::POST,
+            "/tenants/{id}/connections/{name}/schema/accept",
+        ),
+        (Method::GET, "/tenants/{id}/connectors/{plugin}/spec"),
+        (Method::POST, "/tenants/{id}/connectors/{plugin}/discover"),
+        (Method::GET, "/tenants/{id}/catalog/available"),
+        (Method::POST, "/tenants/{id}/catalog/import"),
+        (Method::POST, "/tenants/{id}/catalog/preview"),
+        (Method::DELETE, "/tenants/{id}/catalog/{name}/{version}"),
+    ] {
+        add(m, p, Access::platform(Admin));
+    }
     add(Method::GET, "/tenants/{id}/runs", Access::platform(Admin));
     add(
         Method::GET,
