@@ -7,6 +7,10 @@ everything lives under the implicit `default` tenant. To host several, create te
 Tenant administration is a **platform** (cross-tenant) capability, so it runs over the HTTP API with an **admin**
 key.
 
+!!! warning "Alpha posture"
+    In the alpha, tenants are workspaces for trusted operators, not a hardened security boundary. Read
+    [Tenancy posture in the alpha](../explanation/tenancy-posture.md) before you give a tenant key to a person.
+
 **Goal:** create a tenant and give it its own scoped key.
 
 ## 1. Create the tenant
@@ -65,6 +69,8 @@ You cannot delete the `default` tenant.
 checkpoint before it stops.
 
 ## Notes
+
+- What tenants do and do not protect in the alpha: [Tenancy posture in the alpha](../explanation/tenancy-posture.md).
 
 - Isolation is enforced at execution too: the orchestrator runs a **separate worker per active tenant**, and in
   Kubernetes you can run a **runner pod per tenant** (see [Deploy to Kubernetes](deploy-kubernetes.md)).
