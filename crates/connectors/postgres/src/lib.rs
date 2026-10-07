@@ -36,8 +36,8 @@ impl Connector for Postgres {
             connector_version: "0.1.0".to_string(),
             contract_version: 1,
             config_schema: "{\"type\":\"object\",\"properties\":{\
-                \"url\":{\"type\":\"string\"},\"host\":{\"type\":\"string\"},\"port\":{\"type\":\"integer\"},\
-                \"user\":{\"type\":\"string\"},\"password\":{\"type\":\"string\",\"format\":\"password\"},\
+                \"url\":{\"type\":\"string\",\"airbyte_secret\":true,\"description\":\"Connection URL (may embed the password)\"},\"host\":{\"type\":\"string\"},\"port\":{\"type\":\"integer\"},\
+                \"user\":{\"type\":\"string\"},\"password\":{\"type\":\"string\",\"format\":\"password\",\"airbyte_secret\":true},\
                 \"dbname\":{\"type\":\"string\"},\"table\":{\"type\":\"string\"},\
                 \"sslmode\":{\"type\":\"string\",\"enum\":[\"disable\",\"require\",\"verify-full\"],\"default\":\"require\",\
                 \"description\":\"TLS: require (encrypt, default) | verify-full (encrypt + verify chain/hostname) | disable\"},\

@@ -102,7 +102,7 @@ impl Connector for Mssql {
                 \"port\":{\"type\":\"integer\",\"title\":\"Port (default 1433)\"},\
                 \"database\":{\"type\":\"string\",\"title\":\"Database\"},\
                 \"user\":{\"type\":\"string\",\"title\":\"Login\"},\
-                \"password\":{\"type\":\"string\",\"title\":\"Password\"},\
+                \"password\":{\"type\":\"string\",\"title\":\"Password\",\"format\":\"password\",\"airbyte_secret\":true},\
                 \"table\":{\"type\":\"string\",\"title\":\"Table (blank = stream name)\"},\
                 \"tls_mode\":{\"type\":\"string\",\"enum\":[\"disable\",\"prefer\",\"require\"],\"default\":\"require\",\
                 \"title\":\"TLS: require (default) | prefer | disable\"},\
