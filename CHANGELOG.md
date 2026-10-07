@@ -16,6 +16,15 @@ between releases and are called out here.
   letters on the scheduler tick — age cap `WEIR_RETENTION_DAYS` (default 30)
   and per-tenant row cap `WEIR_RETENTION_MAX_ROWS` (default 10000); `0`
   disables. In-flight runs are never touched.
+- Secret references: a secret field can hold `env:NAME` or `file:/abs/path` in
+  place of the value. The runner host reads it on each run; the API never
+  resolves it, and a read gives the reference text. A reference in a field that
+  is not secret gets `400` (WEIR-T-0202).
+- Web UI: each connection has an Edit action. A stored secret shows as
+  "unchanged" and is kept unless you type a new value or clear it (WEIR-T-0216).
+- Docs: a "Secrets posture" explanation page tells what redaction protects, what
+  it does not (the database and its backups hold literal secrets in plaintext),
+  and when to use references (WEIR-T-0205).
 
 ### Changed
 - **Breaking (v0-unstable, WEIR-A-0006):** the connection API no longer returns
@@ -62,6 +71,13 @@ between releases and are called out here.
   `weir-tiberius` fork (TDS 7.x in-PRELOGIN handshake).
 
 ### Fixed
+- **Security:** a connection with an unknown `auth_scheme` is refused at
+  create (`400`) and fails at run time. Before, its config, secrets included,
+  went into the guest (WEIR-T-0203).
+- **Security:** the first-party connectors mark their credential fields secret
+  in `config_schema` (`mssql.password`, `postgres.password` and `postgres.url`),
+  so the API redacts them. A test fails when a credential field is not marked
+  (WEIR-T-0222).
 - **Security:** the host-side credential caches no longer hold secret text in
   their keys, and a changed credential no longer reuses a cached token. The
   connector-handle cache is keyed by a salted SHA-256 digest of the connector,
