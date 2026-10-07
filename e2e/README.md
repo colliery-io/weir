@@ -46,5 +46,9 @@ cd e2e && WEIR_E2E_KEY="$KEY" npx playwright test
 - `oidc.spec.ts` (the human door) drives the real Dex login and is **skipped** unless
   `WEIR_OIDC_ISSUER` is set. Dex user: `admin@weir.test` / `password`.
 - `gate.spec.ts` needs no credential — it asserts the unauthenticated sign-in card renders.
+- `journeys.spec.ts` ([[WEIR-T-0220]]) drives whole user journeys against the real server:
+  create → run → rows, resident Start/Stop, the non-admin view (it mints its own non-admin
+  key), and Setup in a switched tenant. It reaches the live frankfurter API. Specs that need
+  frankfurter + the arrow sink call `ensurePair` (fixtures) rather than trust the seed.
 
 Point at a different server with `WEIR_UI_URL`.

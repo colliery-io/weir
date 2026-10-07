@@ -182,9 +182,14 @@ impl App {
                 return Ok(None);
             }
         }
-        diesel::update(api_keys::table.filter(api_keys::key_hash.eq(&hash)))
+        // Bookkeeping only: a valid key is not refused because this write lost a lock
+        // (sqlite "database is locked" under the worker's writes, WEIR-T-0220).
+        if let Err(e) = diesel::update(api_keys::table.filter(api_keys::key_hash.eq(&hash)))
             .set(api_keys::last_used_at.eq(Some(now)))
-            .execute(&mut conn)?;
+            .execute(&mut conn)
+        {
+            tracing::warn!(target: "weir_app::auth", error = %e, "api key last_used_at not updated");
+        }
         Ok(Some(AuthenticatedKey {
             key_id: id.0.to_string(),
             name,

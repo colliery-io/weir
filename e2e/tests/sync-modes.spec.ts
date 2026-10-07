@@ -1,19 +1,14 @@
-import { test, expect } from './fixtures';
+import { test, expect, act, api, ensurePair, expectOk, fillStable } from './fixtures';
 import type { Page } from '@playwright/test';
 
 // [[WEIR-T-0215]]: the connection form sets sync mode, write mode, business keys, the
 // cursor field and a schedule (every N seconds OR a cron expression — exactly one is sent).
 
-const auth = () => {
-  const key = process.env.WEIR_E2E_KEY;
-  return key ? { Authorization: `Bearer ${key}` } : undefined;
-};
-
 // The stream is a select when discovery returns streams, else a text input.
 async function pickStream(page: Page, stream: string) {
   const field = page.getByLabel('Stream', { exact: true });
   if ((await field.evaluate((e) => e.tagName)) === 'SELECT') await field.selectOption(stream);
-  else await field.fill(stream);
+  else await fillStable(field, stream);
 }
 
 test('sync modes: an incremental upsert cron connection is created and read back', async ({
@@ -27,10 +22,12 @@ test('sync modes: an incremental upsert cron connection is created and read back
   test.setTimeout(120_000);
   // The server's state outlives a spec (and a retry): a fresh name every time.
   const name = `fx-modes-${Date.now().toString(36)}`;
+  // The harness seed ignores errors (a locked-db import has left the arrow sink out on CI).
+  await ensurePair(page.request);
 
   await page.goto('/');
   await page.getByRole('button', { name: 'Setup' }).click();
-  await page.getByPlaceholder('my-sync').fill(name);
+  await fillStable(page.getByPlaceholder('my-sync'), name);
   // Picking the source rediscovers its streams (a guest call on the server); wait for that
   // answer, so the stream field is settled (text input or select) before it is picked.
   const discovered = page.waitForResponse(
@@ -50,35 +47,29 @@ test('sync modes: an incremental upsert cron connection is created and read back
   await expect(page.getByLabel('Business keys *')).toHaveCount(0);
   await page.getByLabel('Sync mode').selectOption('incremental');
   await page.getByLabel('Write mode').selectOption('upsert');
-  await page.getByLabel('Cursor field *').fill('date');
+  await fillStable(page.getByLabel('Cursor field *'), 'date');
 
   // Upsert without keys is stopped in the form, before any request.
   await page.getByRole('button', { name: 'Save connection' }).click();
   await expect(page.getByRole('alert').filter({ hasText: 'Upsert needs at least one business key' })).toBeVisible();
-  await page.getByLabel('Business keys *').fill('base, date');
+  await fillStable(page.getByLabel('Business keys *'), 'base, date');
 
   // An interval typed first, then the toggle moved to cron: only the cron is sent.
-  await page.getByLabel('Every (secs)').fill('60');
+  await fillStable(page.getByLabel('Every (secs)'), '60');
   await page.getByRole('button', { name: 'Cron', exact: true }).click();
-  await page.getByLabel(/^Cron ·/).fill('0 0 3 * * *');
+  await fillStable(page.getByLabel(/^Cron ·/), '0 0 3 * * *');
 
   // Wait on the create itself, not on its toast with the default 10s: the toast shows
   // only once the (slow, see above) create answers, and a refused create fails here
-  // with the server's reason.
-  const created = page.waitForResponse(
-    (r) => r.request().method() === 'POST' && new URL(r.url()).pathname === '/connections',
-    { timeout: 90_000 },
+  // with the server's reason (a sqlite-lock answer is saved again, see `act`).
+  const res = await act(page, 'POST', '/connections', () =>
+    page.getByRole('button', { name: 'Save connection' }).click(),
   );
-  await page.getByRole('button', { name: 'Save connection' }).click();
-  const res = await created;
-  // A 201 has no body (and Chromium keeps none to read): the reason is read on failure only.
-  const why = res.ok() ? '' : await res.text().catch(() => '');
-  expect(res.ok(), `POST /connections ${res.status()}: ${why}`).toBeTruthy();
   expect(res.request().postDataJSON()).toMatchObject({ name, cron: '0 0 3 * * *', every_secs: null });
   await expect(page.getByText(`Saved connection ${name}`)).toBeVisible();
 
-  const got = await page.request.get(`/connections/${name}`, { headers: auth() });
-  expect(got.ok()).toBeTruthy();
+  const got = await api(page.request, 'GET', `/connections/${name}`);
+  await expectOk(got);
   const c = await got.json();
   expect(c.sync_mode).toBe('incremental');
   expect(c.write_mode).toBe('upsert');
@@ -87,7 +78,7 @@ test('sync modes: an incremental upsert cron connection is created and read back
   expect(c.cron).toBe('0 0 3 * * *');
   expect(c.every_secs).toBeNull();
 
-  await page.request.delete(`/connections/${name}`, { headers: auth() });
+  await api(page.request, 'DELETE', `/connections/${name}`);
 });
 
 test('sync modes: the cursor field is a select from the captured schema', async ({ page }) => {

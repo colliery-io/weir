@@ -34,3 +34,5 @@ tempfile = "3"
 # Parses the run feed's RFC 3339 timestamps in the API test ([[WEIR-T-0224]]).
 chrono = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
+# Raw SQL on the test store, to break the key table (the auth store-error test, WEIR-T-0220).
+diesel = "2.3"

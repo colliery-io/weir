@@ -262,16 +262,30 @@ def _wait_health(port):
 def _seed(port, key):
     """Seed an fx-demo connection (authed) for operations.spec."""
     import json
+    import time
+    import urllib.error
     import urllib.request
     def post(path, body):
+        # A few tries: the server's background worker can hold the sqlite lock ("database is
+        # locked"), which once left the arrow sink out of the seed (WEIR-T-0220). Still
+        # best-effort: the specs that need a connector make sure of it themselves.
         data = json.dumps(body).encode() if body is not None else b""
-        req = urllib.request.Request(
-            f"http://localhost:{port}{path}", data=data, method="POST",
-            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
-        try:
-            urllib.request.urlopen(req, timeout=15)
-        except Exception:
-            pass
+        for attempt in range(5):
+            req = urllib.request.Request(
+                f"http://localhost:{port}{path}", data=data, method="POST",
+                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
+            try:
+                urllib.request.urlopen(req, timeout=60)
+                return
+            except urllib.error.HTTPError as e:
+                if e.code < 500:
+                    print(f"  seed POST {path}: {e.code} {e.read()[:200]!r}")
+                    return
+                print(f"  seed POST {path} failed (try {attempt + 1}/5): {e.code} {e.read()[:200]!r}")
+                time.sleep(1)
+            except Exception as e:
+                print(f"  seed POST {path} failed (try {attempt + 1}/5): {e}")
+                time.sleep(1)
     post("/catalog/import", {"manifest_name": "frankfurter"})
     post("/catalog/import", {"package": "weir-arrow-sink-pkg"})
     post("/connections", {"name": "fx-demo", "source": "frankfurter",
