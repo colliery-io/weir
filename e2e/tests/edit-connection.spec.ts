@@ -1,4 +1,4 @@
-import { test, expect } from './fixtures';
+import { test, expect, act, api, ensurePair, expectOk, fillStable } from './fixtures';
 
 // [[WEIR-T-0216]]: Edit on a connection card loads it into the Setup form. Secrets come
 // back from the server as the sentinel ([[WEIR-T-0201]]); the form shows them as
@@ -6,17 +6,13 @@ import { test, expect } from './fixtures';
 
 const SENTINEL = '__weir_secret_unchanged__';
 
-const auth = () => {
-  const key = process.env.WEIR_E2E_KEY;
-  return key ? { Authorization: `Bearer ${key}` } : undefined;
-};
-
 test('edit connection: a non-secret edit keeps the stored secret (real server)', async ({ page }) => {
-  const name = 'fx-edit';
-  await page.request.delete(`/connections/${name}`, { headers: auth() });
+  test.setTimeout(120_000);
+  // A fresh name every time: the server's state outlives a spec (and a retry).
+  const name = `fx-edit-${Date.now().toString(36)}`;
+  await ensurePair(page.request);
   // `api_key` is always a secret key (the baked auth metadata rule).
-  const created = await page.request.post('/connections', {
-    headers: auth(),
+  const created = await api(page.request, 'POST', '/connections', {
     data: {
       name,
       source: 'frankfurter',
@@ -26,7 +22,7 @@ test('edit connection: a non-secret edit keeps the stored secret (real server)',
       dest_config: {},
     },
   });
-  expect(created.ok()).toBeTruthy();
+  await expectOk(created, `create ${name}`);
 
   await page.goto('/');
   const card = page.getByTestId('connection-card').filter({ hasText: name });
@@ -39,14 +35,18 @@ test('edit connection: a non-secret edit keeps the stored secret (real server)',
   await expect(page.getByText(`Editing ${name}`)).toBeVisible();
 
   // Edit a non-secret field only.
-  await page.getByLabel('Every (secs)').fill('300');
-  await page.getByRole('button', { name: 'Save connection' }).click();
+  await fillStable(page.getByLabel('Every (secs)'), '300');
+  // Wait on the save itself (a create is slow on the e2e server), and check what it sent.
+  const res = await act(page, 'POST', '/connections', () =>
+    page.getByRole('button', { name: 'Save connection' }).click(),
+  );
+  expect(res.request().postDataJSON()).toMatchObject({ name, every_secs: 300 });
   await expect(page.getByText(`Saved connection ${name}`)).toBeVisible();
   // Edit mode ends with the save.
   await expect(page.getByPlaceholder('my-sync')).toBeEnabled();
 
-  const got = await page.request.get(`/connections/${name}`, { headers: auth() });
-  expect(got.ok()).toBeTruthy();
+  const got = await api(page.request, 'GET', `/connections/${name}`);
+  await expectOk(got);
   const c = await got.json();
   expect(c.every_secs).toBe(300);
   expect(c.stream).toBe('latest');
@@ -54,7 +54,7 @@ test('edit connection: a non-secret edit keeps the stored secret (real server)',
   // (a cleared or lost secret would read back as "" or be absent).
   expect(c.source_config.api_key).toBe(SENTINEL);
 
-  await page.request.delete(`/connections/${name}`, { headers: auth() });
+  await api(page.request, 'DELETE', `/connections/${name}`);
 });
 
 const srcSchema = {

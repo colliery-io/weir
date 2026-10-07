@@ -1,6 +1,7 @@
 //! Setup: onboard connectors and wire a connection.
 
 use crate::components::{config_side, SideConfig};
+use crate::discovery::Discovery;
 use crate::fetch::get_json;
 use crate::helpers::{friendly, is_onboarded, mode_fields, ModeFields, ModeInput};
 use crate::models::{AvailableItem, CatalogItem, Connection, ConnectionDetail, PreviewReport, SchemaView};
@@ -147,13 +148,43 @@ fn sync_fields(f: SyncForm, exec_mode: RwSignal<String>) -> AnyView {
     .into_any()
 }
 
+/// The stream field: a select of the discovered streams, else a text input; under it
+/// what discovery is doing (its error included) and a manual re-run ([[WEIR-T-0218]]).
+/// Its own reactive scopes, so a discovery answer does not re-render the form.
+fn stream_field(d: Discovery, stream: RwSignal<String>) -> AnyView {
+    view! {
+        <div>
+            {move || {
+                let list = d.streams.get();
+                if list.is_empty() {
+                    view! { <TextInput label="Stream" value=stream mono=true/> }.into_any()
+                } else {
+                    view! { <Select label="Stream" placeholder="— stream —" options=list value=stream/> }.into_any()
+                }
+            }}
+            <Group gap="sm">
+                {move || d.state.get().message().map(|(msg, bad)| {
+                    let style = if bad { format!("color: {}", token::BAD) } else { String::new() };
+                    view! {
+                        <span data-testid="stream-discovery" data-error=bad.to_string() style=style>
+                            <Text size="xs" dimmed=!bad>{msg}</Text>
+                        </span>
+                    }
+                })}
+                <Button variant="subtle" size="xs" on_click=d.refresh>"Refresh streams"</Button>
+            </Group>
+        </div>
+    }
+    .into_any()
+}
+
 /// The Setup view's signals + actions.
 pub(crate) struct SetupState {
     pub(crate) catalog: RwSignal<Vec<CatalogItem>>,
     pub(crate) available: RwSignal<Vec<AvailableItem>>,
     pub(crate) src_cfg: SideConfig,
     pub(crate) dst_cfg: SideConfig,
-    pub(crate) streams: RwSignal<Vec<String>>,
+    pub(crate) discovery: Discovery,
     pub(crate) add_pkg: RwSignal<String>,
     pub(crate) add_manifest: RwSignal<String>,
     pub(crate) add_path: RwSignal<String>,
@@ -175,7 +206,7 @@ pub(crate) struct SetupState {
 
 pub(crate) fn setup_view(s: SetupState) -> AnyView {
     let SetupState {
-        catalog, available, src_cfg, dst_cfg, streams, add_pkg, add_manifest, add_path, preview,
+        catalog, available, src_cfg, dst_cfg, discovery, add_pkg, add_manifest, add_path, preview,
         name, src, dst, stream, sync, exec_mode, editing, cancel_edit,
         onboard_pick, do_preview, onboard_byo, save_conn,
     } = s;
@@ -200,7 +231,6 @@ pub(crate) fn setup_view(s: SetupState) -> AnyView {
         .filter(|c| c.roles.iter().any(|r| r == "Destination" || r == "ReverseEtl"))
         .map(versioned)
         .collect();
-    let stream_list = streams.get();
     let modes = vec![
         ("run_once".to_string(), "run once · scheduled / batch".to_string()),
         ("resident".to_string(), "resident · long-lived (Start/Stop; every = cadence)".to_string()),
@@ -255,11 +285,7 @@ pub(crate) fn setup_view(s: SetupState) -> AnyView {
                     <Select label="Destination" placeholder="— destination —" option_pairs=dests value=dst/>
                 </SimpleGrid>
                 <SimpleGrid cols=2>
-                    {if stream_list.is_empty() {
-                        view! { <TextInput label="Stream" value=stream mono=true/> }.into_any()
-                    } else {
-                        view! { <Select label="Stream" placeholder="— stream —" options=stream_list value=stream/> }.into_any()
-                    }}
+                    {stream_field(discovery, stream)}
                     <Select label="Execution mode" option_pairs=modes value=exec_mode/>
                 </SimpleGrid>
                 {sync_fields(sync, exec_mode)}
