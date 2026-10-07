@@ -19,9 +19,17 @@ test('operations: card opens the connection-detail modal', async ({ page }) => {
 // [[WEIR-T-0219]]: a run-feed row opens that run's detail (GET /runs/{id}), and the feed
 // pages back through history (GET /runs?before=…). The seeded `fx-demo` run is enough.
 test('operations: a run-feed row opens the run detail; the feed pages', async ({ page }) => {
+  // Queue a run of its own so the feed is sure to list one for fx-demo.
+  const auth = { Authorization: `Bearer ${process.env.WEIR_E2E_KEY ?? ''}` };
+  const queued = await page.request.post('/connections/fx-demo/run', { headers: auth });
+  expect(queued.ok(), `POST /connections/fx-demo/run → ${queued.status()} ${await queued.text()}`).toBeTruthy();
+  const feed = await page.request.get('/runs', { headers: auth });
+  const feedBody = await feed.text();
+  expect(feedBody, `GET /runs → ${feed.status()}`).toContain('fx-demo');
+
   await page.goto('/');
   const row = page.getByRole('row', { name: /^run \d+ · fx-demo$/ }).first();
-  await expect(row).toBeVisible();
+  await expect(row, `feed rows in the page; GET /runs gave: ${feedBody.slice(0, 400)}`).toBeVisible();
   await row.click();
 
   const dialog = page.getByRole('dialog', { name: /^Run #\d+$/ });
