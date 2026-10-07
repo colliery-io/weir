@@ -1471,3 +1471,120 @@ async fn tenant_delete_cascades_and_its_key_401s_at_once() {
     assert_ne!(resp.status(), StatusCode::NO_CONTENT);
     assert!(app.tenant_exists("default").unwrap());
 }
+
+fn post(uri: &str, auth: &str, body: Option<String>) -> Request<Body> {
+    let mut r = Request::post(uri).header("authorization", auth);
+    if body.is_some() {
+        r = r.header("content-type", "application/json");
+    }
+    r.body(body.map(Body::from).unwrap_or_else(Body::empty))
+        .unwrap()
+}
+
+/// [[WEIR-T-0209]]: a Write key of tenant A stopping a connection named like one of tenant B
+/// stops only A's own; B's run keeps going. A's key is denied B's tenant-scoped stop route.
+#[tokio::test]
+async fn cross_tenant_stop_is_scoped_by_tenant_and_name() {
+    use_wasm_connectors();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let app = Arc::new(App::open(tmp.path().join("weir.db").to_str().unwrap()).unwrap());
+    let router = weir_api::router(Arc::clone(&app));
+    let key = |t: &str| {
+        format!(
+            "Bearer {}",
+            app.create_api_key(t, "write", Some(t), false).unwrap()
+        )
+    };
+    let (acme, globex) = (key("acme"), key("globex"));
+
+    // Both tenants create and start a resident connection with the same name.
+    for k in [&acme, &globex] {
+        let body = serde_json::json!({
+            "name": "live", "source": "slow", "dest": "rest-dest", "stream": "s",
+            "config": {}, "execution_mode": "resident",
+        })
+        .to_string();
+        let resp = router
+            .clone()
+            .oneshot(post("/connections", k, Some(body)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let resp = router
+            .clone()
+            .oneshot(post("/connections/live/start", k, None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(json(resp).await["started"], true);
+    }
+    assert!(app.relay().has_active("acme", "live").unwrap());
+    assert!(app.relay().has_active("globex", "live").unwrap());
+
+    // acme stops `live`: only acme's unit is cancelled; globex's run keeps going.
+    let resp = router
+        .clone()
+        .oneshot(post("/connections/live/stop", &acme, None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(json(resp).await["cancelled"], 1);
+    assert!(!app.relay().has_active("acme", "live").unwrap());
+    assert!(
+        app.relay().has_active("globex", "live").unwrap(),
+        "acme's stop must not touch globex's same-named run"
+    );
+
+    // A second stop by acme is a no-op — it never reaches globex's unit.
+    let resp = router
+        .clone()
+        .oneshot(post("/connections/live/stop", &acme, None))
+        .await
+        .unwrap();
+    assert_eq!(json(resp).await["cancelled"], 0);
+    assert!(app.relay().has_active("globex", "live").unwrap());
+
+    // acme's (non-admin) key is denied globex's tenant-scoped stop route.
+    let resp = router
+        .clone()
+        .oneshot(post("/tenants/globex/connections/live/stop", &acme, None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert!(app.relay().has_active("globex", "live").unwrap());
+}
+
+/// [[WEIR-T-0209]]: tenant ids are safe slugs (`^[a-z0-9][a-z0-9-]{0,62}$`); `../x` and other bad
+/// ids are refused at creation with a 400 and a clear message.
+#[tokio::test]
+async fn create_tenant_refuses_bad_ids() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let app = Arc::new(App::open(tmp.path().join("weir.db").to_str().unwrap()).unwrap());
+    let router = weir_api::router(Arc::clone(&app));
+    let token = format!("Bearer {}", app.bootstrap_admin_key().unwrap().unwrap());
+    let create = |id: &str| {
+        post(
+            "/tenants",
+            &token,
+            Some(serde_json::json!({ "id": id }).to_string()),
+        )
+    };
+    let too_long = "a".repeat(64);
+    for bad in [
+        "../x", "..", "a/b", "/etc", "Acme", "-x", "a_b", "a.b", "", &too_long,
+    ] {
+        let resp = router.clone().oneshot(create(bad)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "id `{bad}`");
+        let err = json(resp).await["error"].as_str().unwrap().to_string();
+        assert!(err.contains("invalid tenant id"), "id `{bad}`: {err}");
+    }
+    assert!(
+        app.list_tenants()
+            .unwrap()
+            .iter()
+            .all(|t| t.id == "default"),
+        "no bad tenant was stored"
+    );
+    let resp = router.clone().oneshot(create("acme-2")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+}

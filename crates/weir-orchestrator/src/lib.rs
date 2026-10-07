@@ -1267,15 +1267,24 @@ impl Relay {
             .collect())
     }
 
-    /// Work-unit history for a connection (id/state/attempt), oldest first.
-    pub fn history(&self, connection: &str) -> Result<Vec<WorkUnitStatus>, ExecutorError> {
+    /// Work-unit history for the connection `(tenant, connection)` (id/state/attempt), oldest
+    /// first. Scoped by the [[WEIR-A-0036]] composite identity ([[WEIR-T-0209]]).
+    pub fn history(
+        &self,
+        tenant: &str,
+        connection: &str,
+    ) -> Result<Vec<WorkUnitStatus>, ExecutorError> {
         let mut conn = self
             .store
             .pool()
             .get()
             .map_err(|e| ExecutorError::Store(e.to_string()))?;
         let rows: Vec<(i64, String, i64, Option<String>)> = work_units::table
-            .filter(work_units::connection.eq(connection))
+            .filter(
+                work_units::tenant_id
+                    .eq(tenant)
+                    .and(work_units::connection.eq(connection)),
+            )
             .order(work_units::id.asc())
             .select((
                 work_units::id,
@@ -1295,30 +1304,11 @@ impl Relay {
             .collect())
     }
 
-    /// Whether the connection has an in-flight (`pending`/`leased`) unit — the
-    /// scheduler's no-double-start guard. NOTE: name-only — same-named connections in
-    /// different tenants alias each other here; prefer [`has_active_in`](Self::has_active_in)
-    /// wherever the tenant is known ([[WEIR-T-0171]]).
-    pub fn has_active(&self, connection: &str) -> Result<bool, ExecutorError> {
-        let mut conn = self
-            .store
-            .pool()
-            .get()
-            .map_err(|e| ExecutorError::Store(e.to_string()))?;
-        let n: i64 = work_units::table
-            .filter(
-                work_units::connection
-                    .eq(connection)
-                    .and(work_units::state.eq_any(["pending", "leased"])),
-            )
-            .count()
-            .get_result(&mut conn)?;
-        Ok(n > 0)
-    }
-
-    /// Tenant-scoped no-double-start guard ([[WEIR-T-0171]] / [[WEIR-A-0036]] composite
-    /// identity): same-named connections in different tenants schedule independently.
-    pub fn has_active_in(&self, tenant: &str, connection: &str) -> Result<bool, ExecutorError> {
+    /// Whether the connection `(tenant, connection)` has an in-flight (`pending`/`leased`)
+    /// unit — the scheduler's no-double-start guard. Scoped by the [[WEIR-A-0036]] composite
+    /// identity ([[WEIR-T-0171]] / [[WEIR-T-0209]]): same-named connections in different
+    /// tenants schedule independently. There is no name-only form.
+    pub fn has_active(&self, tenant: &str, connection: &str) -> Result<bool, ExecutorError> {
         let mut conn = self
             .store
             .pool()
@@ -1337,14 +1327,17 @@ impl Relay {
     }
 
     /// Durable **stop** for a resident source ([[WEIR-I-0035]] F1.5): mark every active
-    /// (`pending`/`leased`) unit of `connection` as `done` so the supervised restart loop
+    /// (`pending`/`leased`) unit of `(tenant, connection)` as `done` so the supervised restart loop
     /// ([[WEIR-T-0139]]) stops re-claiming/requeuing it. Returns the number of units stopped.
     ///
     /// NOTE: this ends the *restart* loop and prevents re-claim. Interrupting a resident run that
     /// is *actively* draining in a separate runner process (firing the in-process `StopHandle`
     /// mid-stream) is same-process only today via [`InProcessExecutor::stop`]; cross-process
     /// mid-stream cancellation is a follow-on (the run stops at its next lease expiry / checkpoint).
-    pub fn cancel(&self, connection: &str) -> Result<u64, ExecutorError> {
+    ///
+    /// Scoped by the [[WEIR-A-0036]] composite identity ([[WEIR-T-0209]]): a same-named
+    /// connection of another tenant is never touched.
+    pub fn cancel(&self, tenant: &str, connection: &str) -> Result<u64, ExecutorError> {
         let mut conn = self
             .store
             .pool()
@@ -1352,8 +1345,9 @@ impl Relay {
             .map_err(|e| ExecutorError::Store(e.to_string()))?;
         let n = diesel::update(
             work_units::table.filter(
-                work_units::connection
-                    .eq(connection)
+                work_units::tenant_id
+                    .eq(tenant)
+                    .and(work_units::connection.eq(connection))
                     .and(work_units::state.eq_any(["pending", "leased"])),
             ),
         )
@@ -2081,7 +2075,7 @@ impl<C: Clock> Scheduler<C> {
                 // The guard uses the SPEC's (tenant, connection) — not the registry key, which
                 // may be tenant-scoped (`{tenant}/{name}`, [[WEIR-T-0171]]).
                 let fire = !spec.execution_mode.is_resident()
-                    && !self.relay.has_active_in(&spec.tenant, &spec.connection)?;
+                    && !self.relay.has_active(&spec.tenant, &spec.connection)?;
                 if fire {
                     self.relay.plan(&spec)?;
                 }

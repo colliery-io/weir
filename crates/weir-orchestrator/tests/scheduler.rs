@@ -87,7 +87,7 @@ async fn fires_due_schedule_then_drains() {
     assert_eq!(scheduler.tick().unwrap(), 1, "due on first tick");
     drain(&relay, &store).await;
     // A drained connection has no in-flight unit.
-    assert!(!relay.has_active("sched-conn").unwrap());
+    assert!(!relay.has_active("default", "sched-conn").unwrap());
 }
 
 /// WEIR-I-0035 F1.3: the scheduler does not interval/cron-fire a **resident** spec —
@@ -113,7 +113,7 @@ async fn skips_resident_specs() {
         0,
         "resident specs are not interval-fired"
     );
-    assert!(!relay.has_active("resident-conn").unwrap());
+    assert!(!relay.has_active("default", "resident-conn").unwrap());
 }
 
 #[tokio::test]
@@ -213,7 +213,7 @@ async fn resident_release_returns_unit_to_pending_deferred() {
         "released unit is deferred, not instantly re-claimable"
     );
     assert!(
-        relay.has_active("resident-gate").unwrap(),
+        relay.has_active("default", "resident-gate").unwrap(),
         "released resident unit is still pending (not lost)"
     );
 }
@@ -276,7 +276,7 @@ async fn worker_tick_gates_new_resident_when_over_high_water() {
         "the executor is NOT invoked for a gated resident unit"
     );
     assert!(
-        relay.has_active("resident-hot").unwrap(),
+        relay.has_active("default", "resident-hot").unwrap(),
         "the gated resident unit remains pending (released, not lost)"
     );
 }
@@ -357,7 +357,7 @@ async fn resident_cancel_stops_the_running_task_cross_process() {
     assert!(!stopped.load(Ordering::SeqCst), "not stopped before cancel");
 
     // Durable cancel — no direct StopHandle, as a control-plane `stop` on another process would do.
-    relay.cancel("resident").unwrap();
+    relay.cancel("default", "resident").unwrap();
 
     // The heartbeat observes the lost lease and fires stop → the run ends on its own.
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -440,13 +440,13 @@ async fn resident_does_not_wedge_run_until_idle() {
     // Run-once units drained to done...
     for i in 0..3 {
         assert!(
-            !relay.has_active(&format!("once-{i}")).unwrap(),
+            !relay.has_active("default", &format!("once-{i}")).unwrap(),
             "once-{i} should have drained while the resident keeps running"
         );
     }
     // ...and the resident is still active (leased, running in its detached task).
     assert!(
-        relay.has_active("resident").unwrap(),
+        relay.has_active("default", "resident").unwrap(),
         "the resident stays active/leased (detached, still running)"
     );
 }
@@ -571,7 +571,7 @@ async fn two_runners_share_one_store_no_double_run() {
     }
     // ...and the resident is still alive on whichever runner claimed it.
     assert!(
-        relay.has_active("resident").unwrap(),
+        relay.has_active("default", "resident").unwrap(),
         "resident should still be running under one of the runners"
     );
 }

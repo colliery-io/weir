@@ -97,7 +97,10 @@ async fn resident_start_is_enqueue_once_and_stop_cancels() {
     // First start enqueues exactly one unit.
     let first = app.start(DEFAULT_TENANT, "live").expect("start");
     assert!(first.is_some(), "first start enqueues a unit");
-    assert!(app.relay().has_active("live").unwrap(), "unit is active");
+    assert!(
+        app.relay().has_active("default", "live").unwrap(),
+        "unit is active"
+    );
 
     // Enqueue-once: a second start is a no-op while one is active.
     let second = app.start(DEFAULT_TENANT, "live").expect("start again");
@@ -110,7 +113,7 @@ async fn resident_start_is_enqueue_once_and_stop_cancels() {
     let stopped = app.stop(DEFAULT_TENANT, "live").expect("stop");
     assert!(stopped >= 1, "stop cancelled the active unit");
     assert!(
-        !app.relay().has_active("live").unwrap(),
+        !app.relay().has_active("default", "live").unwrap(),
         "no active unit after stop"
     );
 
