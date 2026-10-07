@@ -133,10 +133,13 @@ enum TokenAction {
     },
     /// List stored keys (metadata only — never the secret).
     List,
-    /// Revoke keys matching a prefix or name.
+    /// Revoke a key by its id or its name, in one tenant or in the global scope.
     Revoke {
-        /// The key's prefix (last 8 chars) or its name.
+        /// The id or the name of the key (`token list` shows both).
         ident: String,
+        /// The tenant of the key. Omit to revoke a global key. Keys of other tenants are not changed.
+        #[arg(long)]
+        tenant: Option<String>,
     },
 }
 
@@ -291,14 +294,15 @@ async fn main() -> anyhow::Result<()> {
                             let scope = k.tenant_id.as_deref().unwrap_or("global");
                             let god = if k.is_admin { " admin" } else { "" };
                             println!(
-                                "  {}  {}/{}{}  {state}  ({last})",
-                                k.name, k.permissions, scope, god
+                                "  {}  {}  {}/{}{}  {state}  ({last})",
+                                k.id, k.name, k.permissions, scope, god
                             );
                         }
                     }
-                    TokenAction::Revoke { ident } => {
-                        let n = app.revoke_api_key(&ident)?;
-                        println!("revoked {n} key(s) matching `{ident}`");
+                    TokenAction::Revoke { ident, tenant } => {
+                        let n = app.revoke_api_key(tenant.as_deref(), &ident)?.len();
+                        let scope = tenant.as_deref().unwrap_or("global");
+                        println!("revoked {n} key(s) matching `{ident}` in scope `{scope}`");
                     }
                 },
             }

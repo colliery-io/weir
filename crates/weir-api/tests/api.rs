@@ -1953,3 +1953,69 @@ streams:
     let (_, cat) = send(&router, &acme, "GET", "/catalog", None).await;
     assert!(!cat.to_string().contains("coins-src"), "{cat}");
 }
+
+#[tokio::test]
+async fn tenant_key_revoke_is_tenant_scoped_and_purges_the_cache() {
+    // WEIR-T-0221: DELETE /tenants/{id}/keys/{kid} revokes only the path tenant's key (by name or
+    // id), and the revoked key is refused on the next request (cache purged, no TTL wait).
+    let tmp = tempfile::TempDir::new().unwrap();
+    let app = Arc::new(App::open(tmp.path().join("weir.db").to_str().unwrap()).unwrap());
+    let router = weir_api::router(Arc::clone(&app));
+    let admin = format!("Bearer {}", app.bootstrap_admin_key().unwrap().unwrap());
+    let a = app
+        .create_api_key("ci", "write", Some("acme"), false)
+        .unwrap();
+    let b = app
+        .create_api_key("ci", "write", Some("globex"), false)
+        .unwrap();
+    let (acme, globex) = (format!("Bearer {a}"), format!("Bearer {b}"));
+
+    // Both keys work, and are now cached.
+    for key in [&acme, &globex] {
+        let (s, _) = send(&router, key, "GET", "/connections", None).await;
+        assert_eq!(s, StatusCode::OK);
+    }
+
+    // Revoke acme's `ci` by name.
+    let (s, _) = send(&router, &admin, "DELETE", "/tenants/acme/keys/ci", None).await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, _) = send(&router, &acme, "GET", "/connections", None).await;
+    assert_eq!(
+        s,
+        StatusCode::UNAUTHORIZED,
+        "revoked key is refused at once"
+    );
+    let (s, _) = send(&router, &globex, "GET", "/connections", None).await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "same-named key of another tenant stays valid"
+    );
+
+    // globex's key id under the acme path matches nothing.
+    let gid = app.validate_api_key(&b).unwrap().unwrap().key_id;
+    let (s, _) = send(
+        &router,
+        &admin,
+        "DELETE",
+        &format!("/tenants/acme/keys/{gid}"),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    let (s, _) = send(&router, &globex, "GET", "/connections", None).await;
+    assert_eq!(s, StatusCode::OK);
+
+    // Revoke by id under its own tenant.
+    let (s, _) = send(
+        &router,
+        &admin,
+        "DELETE",
+        &format!("/tenants/globex/keys/{gid}"),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, _) = send(&router, &globex, "GET", "/connections", None).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+}

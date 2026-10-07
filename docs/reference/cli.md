@@ -30,7 +30,7 @@ The `weir` binary is the single-node control plane and operator tool. A global `
 | --- | --- |
 | `weir auth token create --name <n> [--role admin] [--tenant <id>] [--admin]` | Mint an API key, scoped by role/tenant. `--admin` grants full access. |
 | `weir auth token list` | List issued keys. |
-| `weir auth token revoke <ident>` | Revoke a key. |
+| `weir auth token revoke <ident> [--tenant <id>]` | Revoke a key by its id or name. Without `--tenant`, only global keys match. |
 
 ## Misc
 

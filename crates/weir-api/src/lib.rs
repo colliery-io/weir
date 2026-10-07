@@ -205,7 +205,10 @@ pub fn router(app: Arc<App>) -> Router {
             delete(tenants_delete).layer(axum::Extension(Arc::clone(&key_cache))),
         )
         .route("/tenants/{id}/keys", get(tenant_keys_list).post(tenant_keys_create))
-        .route("/tenants/{id}/keys/{kid}", delete(tenant_keys_revoke))
+        .route(
+            "/tenants/{id}/keys/{kid}",
+            delete(tenant_keys_revoke).layer(axum::Extension(Arc::clone(&key_cache))),
+        )
         // Admin cross-tenant data browse ([[WEIR-T-0094]]) — the switcher's target.
         .route("/tenants/{id}/connections", get(t_connections).post(t_create))
         .route("/tenants/{id}/connections/{name}", get(t_connection).delete(t_remove))
@@ -271,7 +274,7 @@ async fn log_request(req: Request, next: Next) -> Response {
 
 /// How long a validated key is served from the cache before the store is asked again. A key
 /// revoked (or a key row removed) out of band stays valid for at most this long; tenant delete
-/// clears the cache, so it does not wait for the TTL.
+/// clears the cache and key revoke purges the revoked key, so neither waits for the TTL.
 const KEY_CACHE_TTL: Duration = Duration::from_secs(30);
 
 /// A validated key cached with a TTL (cloacina's `KeyCache`, `routes/auth.rs`).
@@ -305,6 +308,11 @@ impl KeyCache {
             c.pop(hash);
         }
         None
+    }
+
+    /// Drop one cached key (key revoke).
+    async fn remove(&self, hash: &str) {
+        self.cache.lock().await.pop(hash);
     }
 
     /// Drop every cached key (tenant delete).
@@ -987,11 +995,21 @@ async fn tenant_keys_create(
     Ok(Json(serde_json::json!({ "key": key })))
 }
 
+/// Revoke a key of this tenant by id or name (WEIR-T-0221). Only keys of the path tenant match;
+/// the revoked keys are purged from the key cache, so they return 401 on the next request.
+/// `404` when no live key of the tenant matches.
 async fn tenant_keys_revoke(
     State(app): State<Arc<App>>,
-    Path((_id, kid)): Path<(String, String)>,
+    axum::Extension(cache): axum::Extension<Arc<KeyCache>>,
+    Path((id, kid)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
-    app.revoke_api_key(&kid)?;
+    let revoked = app.revoke_api_key(Some(&id), &kid)?;
+    for hash in &revoked {
+        cache.remove(hash).await;
+    }
+    if revoked.is_empty() {
+        return Err(AppError::NotFound(format!("key `{kid}` in tenant `{id}`")).into());
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
