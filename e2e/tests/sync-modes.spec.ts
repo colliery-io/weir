@@ -19,7 +19,7 @@ async function pickStream(page: Page, stream: string) {
 test('sync modes: an incremental upsert cron connection is created and read back', async ({
   page,
 }) => {
-  // Real create + GET against the e2e server (frankfurter + ArrowSink are seeded).
+  // Real create + GET against the e2e server (frankfurter + the arrow sink are seeded).
   const name = 'fx-modes';
   await page.request.delete(`/connections/${name}`, { headers: auth() });
 
@@ -27,7 +27,11 @@ test('sync modes: an incremental upsert cron connection is created and read back
   await page.getByRole('button', { name: 'Setup' }).click();
   await page.getByPlaceholder('my-sync').fill(name);
   await page.getByLabel('Source', { exact: true }).selectOption('frankfurter');
-  await page.getByLabel('Destination', { exact: true }).selectOption('ArrowSink');
+  // The seeded arrow sink's catalog name is the package's, not the `ArrowSink` alias.
+  const dest = page.getByLabel('Destination', { exact: true });
+  const arrow = dest.locator('option').filter({ hasText: /arrow/i }).first();
+  await expect(arrow).toBeAttached();
+  await dest.selectOption((await arrow.getAttribute('value'))!);
   await pickStream(page, 'latest');
 
   // Progressive disclosure: no cursor or keys until the mode needs them.
