@@ -1399,3 +1399,71 @@ async fn write_keeps_replaces_and_clears_secrets() {
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "{body}");
 }
+
+#[tokio::test]
+async fn tenant_delete_cascades_and_its_key_401s_at_once() {
+    // WEIR-T-0210: DELETE /tenants/{id} cascades, the tenant's key is refused on the next request
+    // (the key cache is cleared, no TTL wait), and another tenant's same-named connection stays.
+    use_wasm_connectors();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let app = Arc::new(App::open(tmp.path().join("weir.db").to_str().unwrap()).unwrap());
+    let router = weir_api::router(Arc::clone(&app));
+    let admin = format!("Bearer {}", app.bootstrap_admin_key().unwrap().unwrap());
+    let acme = format!(
+        "Bearer {}",
+        app.create_api_key("acme", "write", Some("acme"), false)
+            .unwrap()
+    );
+    let globex = format!(
+        "Bearer {}",
+        app.create_api_key("globex", "write", Some("globex"), false)
+            .unwrap()
+    );
+    let call = |method: &str, uri: &str, key: &str, body: Option<String>| {
+        let mut b = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", key);
+        if body.is_some() {
+            b = b.header("content-type", "application/json");
+        }
+        let req = b
+            .body(body.map(Body::from).unwrap_or_else(Body::empty))
+            .unwrap();
+        router.clone().oneshot(req)
+    };
+
+    // Both tenants create a connection with the SAME name.
+    let body = serde_json::json!({"name":"c1","source":"Echo","dest":"ArrowSink","stream":"echo","config":{}}).to_string();
+    for key in [&acme, &globex] {
+        let resp = call("POST", "/connections", key, Some(body.clone()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+    // The acme key is now validated (and cached).
+    let resp = call("GET", "/connections", &acme, None).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = call("DELETE", "/tenants/acme", &admin, None).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // The cached acme key is refused at once.
+    let resp = call("GET", "/connections", &acme, None).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    // acme's rows are gone; globex's same-named connection is untouched.
+    assert!(app.list_connections("acme").unwrap().is_empty());
+    assert!(!app.tenant_exists("acme").unwrap());
+    let resp = call("GET", "/connections", &globex, None).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let list = json(resp).await;
+    assert_eq!(list.as_array().unwrap().len(), 1);
+    assert_eq!(list[0]["name"], "c1");
+
+    // The default tenant cannot be deleted.
+    let resp = call("DELETE", "/tenants/default", &admin, None)
+        .await
+        .unwrap();
+    assert_ne!(resp.status(), StatusCode::NO_CONTENT);
+    assert!(app.tenant_exists("default").unwrap());
+}

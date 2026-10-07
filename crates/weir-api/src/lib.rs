@@ -165,9 +165,12 @@ pub struct RunDto {
 pub fn router(app: Arc<App>) -> Router {
     // Install the Prometheus recorder before the worker emits ([[WEIR-T-0099]]).
     let _ = metrics_handle();
+    // The key cache is shared with the tenant-delete route, which clears it so a deleted
+    // tenant's keys stop validating at once (WEIR-T-0210), not after the TTL.
+    let key_cache = Arc::new(KeyCache::new(256, KEY_CACHE_TTL));
     let auth = AuthState {
         app: Arc::clone(&app),
-        cache: Arc::new(KeyCache::new(256, Duration::from_secs(30))),
+        cache: Arc::clone(&key_cache),
     };
     let api = Router::new()
         .route("/connections", get(list).post(create))
@@ -197,7 +200,10 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/overview", get(overview))
         // Tenant administration (platform-admin only — [[WEIR-T-0090]]).
         .route("/tenants", get(tenants_list).post(tenants_create))
-        .route("/tenants/{id}", delete(tenants_delete))
+        .route(
+            "/tenants/{id}",
+            delete(tenants_delete).layer(axum::Extension(Arc::clone(&key_cache))),
+        )
         .route("/tenants/{id}/keys", get(tenant_keys_list).post(tenant_keys_create))
         .route("/tenants/{id}/keys/{kid}", delete(tenant_keys_revoke))
         // Admin cross-tenant data browse ([[WEIR-T-0094]]) — the switcher's target.
@@ -253,6 +259,11 @@ async fn log_request(req: Request, next: Next) -> Response {
     resp
 }
 
+/// How long a validated key is served from the cache before the store is asked again. A key
+/// revoked (or a key row removed) out of band stays valid for at most this long; tenant delete
+/// clears the cache, so it does not wait for the TTL.
+const KEY_CACHE_TTL: Duration = Duration::from_secs(30);
+
 /// A validated key cached with a TTL (cloacina's `KeyCache`, `routes/auth.rs`).
 struct CachedKey {
     key: AuthenticatedKey,
@@ -284,6 +295,11 @@ impl KeyCache {
             c.pop(hash);
         }
         None
+    }
+
+    /// Drop every cached key (tenant delete).
+    async fn clear(&self) {
+        self.cache.lock().await.clear();
     }
 
     async fn insert(&self, hash: String, key: AuthenticatedKey) {
@@ -840,11 +856,18 @@ async fn tenants_create(
     Ok(StatusCode::CREATED)
 }
 
+/// Delete a tenant and cascade to everything it owns (see [`App::delete_tenant`]), then clear
+/// the key cache so the tenant's keys return 401 on the next request.
 async fn tenants_delete(
     State(app): State<Arc<App>>,
+    axum::Extension(cache): axum::Extension<Arc<KeyCache>>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    app.delete_tenant(&id)?;
+    let result = app.delete_tenant(&id);
+    // Clear even on error: part of the cascade may have run (the staging-dir removal is
+    // outside the transaction).
+    cache.clear().await;
+    result?;
     Ok(StatusCode::NO_CONTENT)
 }
 

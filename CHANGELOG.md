@@ -30,6 +30,18 @@ between releases and are called out here.
   `POST /connections`, the sentinel or an omitted secret field keeps the stored
   value, a new value replaces it, and an empty string clears it. A new
   connection that sends the sentinel gets `400`.
+- **Breaking (v0-unstable):** `DELETE /tenants/{id}` now **cascades** (WEIR-T-0210).
+  It stops the runs of the tenant, then deletes its connections, schedules, runs,
+  run logs, dead letters, stream state and schemas, catalog entries, API keys and
+  staged connector files (the rows in one transaction). Before, it deleted only
+  the tenant row and left the data and the keys of the tenant in place. The
+  `default` tenant still cannot be deleted. Audit events are kept.
+- The keys of a deleted tenant are refused (`401`) at once: the delete clears the
+  API key cache, and key validation refuses a tenant key whose tenant does not
+  exist. Minting a key for a tenant that does not exist (for example
+  `weir auth token create --tenant acme`) now creates the tenant, and at open
+  weir creates the missing tenant rows of keys stored before this change, so
+  those keys keep working.
 - The declarative `rest` runtime now **streams checkpoints per page** instead of
   buffering the whole paginated read: a run that dies at page N keeps pages
   1..N-1 committed and the next run resumes from the saved position (carried in
