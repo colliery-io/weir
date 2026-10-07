@@ -1,0 +1,23 @@
+# Every API call that the UI makes and that `apath` rewrites to `/tenants/{id}/...`
+# when a platform admin switches tenant (WEIR-T-0217).
+# Format: METHOD PATH. A `{...}` segment is a path parameter.
+# A test in weir-ui (fetch.rs) checks that this list matches the calls in the UI source.
+# A test in weir-api (tests/api.rs) checks that the server serves each line under /tenants/{id}.
+GET /connections
+POST /connections
+DELETE /connections/{name}
+POST /connections/{name}/run
+POST /connections/{name}/start
+POST /connections/{name}/stop
+GET /connections/{name}/logs
+GET /connections/{name}/dead-letters
+GET /connections/{name}/schema
+POST /connections/{name}/schema/accept
+GET /connectors/{plugin}/spec
+POST /connectors/{plugin}/discover
+GET /catalog
+GET /catalog/available
+POST /catalog/import
+POST /catalog/preview
+GET /runs
+GET /overview

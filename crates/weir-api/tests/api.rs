@@ -1588,3 +1588,272 @@ async fn create_tenant_refuses_bad_ids() {
     let resp = router.clone().oneshot(create("acme-2")).await.unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
 }
+
+// ---- [[WEIR-T-0217]]: the server mirrors every route the UI re-scopes to `/tenants/{id}/…` ----
+
+/// The UI's list of re-scoped calls (`METHOD /path`), shared with the UI's own drift test.
+const UI_TENANT_ROUTES: &str = include_str!("../../../weir-ui/src/tenant_routes.txt");
+
+fn ui_tenant_routes() -> Vec<(String, String)> {
+    UI_TENANT_ROUTES
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| {
+            let (m, p) = l.split_once(' ').expect("METHOD PATH");
+            (m.to_string(), p.trim().to_string())
+        })
+        .collect()
+}
+
+/// Fill each `{param}` segment with `nope`.
+fn concrete(path: &str) -> String {
+    path.split('/')
+        .map(|seg| if seg.starts_with('{') { "nope" } else { seg })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+#[tokio::test]
+async fn every_ui_tenant_route_is_served_and_gated() {
+    use_wasm_connectors();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let app = Arc::new(App::open(tmp.path().join("weir.db").to_str().unwrap()).unwrap());
+    let router = weir_api::router(Arc::clone(&app));
+    let admin = format!("Bearer {}", app.bootstrap_admin_key().unwrap().unwrap());
+    let acme = format!(
+        "Bearer {}",
+        app.create_api_key("acme", "admin", Some("acme"), false)
+            .unwrap()
+    );
+    let routes = ui_tenant_routes();
+    assert!(routes.len() > 5, "the shared list is too short: {routes:?}");
+    for (method, path) in routes {
+        let uri = format!("/tenants/globex{}", concrete(&path));
+        let req = |token: &str| {
+            Request::builder()
+                .method(method.as_str())
+                .uri(uri.as_str())
+                .header("authorization", token)
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap()
+        };
+        // Platform admin acting on tenant globex: the route matches (no 405, no SPA fallback)
+        // and authz lets it through (no 403).
+        let resp = router.clone().oneshot(req(&admin)).await.unwrap();
+        let status = resp.status();
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert_ne!(status, StatusCode::METHOD_NOT_ALLOWED, "{method} {uri}");
+        assert_ne!(status, StatusCode::FORBIDDEN, "{method} {uri}");
+        assert!(
+            !ct.contains("text/html"),
+            "{method} {uri} fell through to the SPA fallback (status {status})"
+        );
+        // A key of tenant acme is denied tenant globex.
+        let resp = router.clone().oneshot(req(&acme)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "acme key: {method} {uri}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn switched_admin_sets_up_another_tenant() {
+    use_wasm_connectors();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let app = Arc::new(App::open(tmp.path().join("weir.db").to_str().unwrap()).unwrap());
+    let router = weir_api::router(Arc::clone(&app));
+    let admin = format!("Bearer {}", app.bootstrap_admin_key().unwrap().unwrap());
+    let acme = format!(
+        "Bearer {}",
+        app.create_api_key("acme", "write", Some("acme"), false)
+            .unwrap()
+    );
+    let globex = format!(
+        "Bearer {}",
+        app.create_api_key("globex", "admin", Some("globex"), false)
+            .unwrap()
+    );
+
+    // Connector spec + discover + catalog availability + preview answer under the tenant.
+    let (s, spec) = send(
+        &router,
+        &admin,
+        "GET",
+        "/tenants/acme/connectors/Echo/spec",
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{spec}");
+    let (s, _) = send(
+        &router,
+        &admin,
+        "GET",
+        "/tenants/acme/catalog/available",
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, streams) = send(
+        &router,
+        &admin,
+        "POST",
+        "/tenants/acme/connectors/Echo/discover",
+        Some(serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{streams}");
+    let manifest = r#"
+type: DeclarativeSource
+streams:
+  - type: DeclarativeStream
+    name: coins
+    retriever:
+      type: SimpleRetriever
+      requester:
+        type: HttpRequester
+        url_base: "https://example.invalid"
+        path: "/coins"
+      record_selector:
+        type: RecordSelector
+        extractor:
+          type: DpathExtractor
+          field_path: []
+    schema_loader:
+      type: InlineSchemaLoader
+      schema:
+        type: object
+        properties:
+          id: { type: string }
+"#;
+    let (s, report) = send(
+        &router,
+        &admin,
+        "POST",
+        "/tenants/acme/catalog/preview",
+        Some(serde_json::json!({ "manifest": manifest })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{report}");
+
+    // Import lands in tenant acme's catalog, not the admin's own (default) one.
+    let (s, entry) = send(
+        &router,
+        &admin,
+        "POST",
+        "/tenants/acme/catalog/import",
+        Some(serde_json::json!({ "manifest": manifest, "name": "coins-src" })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{entry}");
+    let (_, cat) = send(&router, &acme, "GET", "/catalog", None).await;
+    assert!(cat.to_string().contains("coins-src"), "{cat}");
+    let (_, cat) = send(&router, &admin, "GET", "/catalog", None).await;
+    assert!(!cat.to_string().contains("coins-src"), "{cat}");
+
+    // Create in tenant acme: acme sees it, redacted; the store keeps the secret.
+    let conn = |key: &str| {
+        serde_json::json!({
+            "name":"c1","source":"Echo","dest":"ArrowSink","stream":"echo",
+            "config":{"api_key":key,"note":"v1"}
+        })
+    };
+    let (s, body) = send(
+        &router,
+        &admin,
+        "POST",
+        "/tenants/acme/connections",
+        Some(conn("s3cret")),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{body}");
+    let (_, list) = send(&router, &acme, "GET", "/connections", None).await;
+    assert_eq!(list[0]["name"], "c1");
+    assert_eq!(list[0]["source_config"]["api_key"], SENTINEL);
+    assert!(!list.to_string().contains("s3cret"));
+    let (_, own) = send(&router, &admin, "GET", "/connections", None).await;
+    assert_eq!(
+        own.as_array().unwrap().len(),
+        0,
+        "nothing leaks into default"
+    );
+
+    // An edit through the tenant route that sends the sentinel keeps the stored secret.
+    let mut edit = conn(SENTINEL);
+    edit["config"]["note"] = "v2".into();
+    let (s, body) = send(
+        &router,
+        &admin,
+        "POST",
+        "/tenants/acme/connections",
+        Some(edit),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{body}");
+    let stored = app.get_connection("acme", "c1").unwrap();
+    assert!(stored.source_config.contains("s3cret"));
+    assert!(stored.source_config.contains("v2"));
+
+    // Schema view + accept answer for the tenant's connection.
+    let (s, sv) = send(
+        &router,
+        &admin,
+        "GET",
+        "/tenants/acme/connections/c1/schema",
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{sv}");
+    let (s, body) = send(
+        &router,
+        &admin,
+        "POST",
+        "/tenants/acme/connections/c1/schema/accept",
+        None,
+    )
+    .await;
+    assert!(s.is_success(), "{s} {body}");
+
+    // A key of another tenant is denied each write.
+    for (m, uri) in [
+        ("POST", "/tenants/acme/connections"),
+        ("DELETE", "/tenants/acme/connections/c1"),
+        ("POST", "/tenants/acme/catalog/import"),
+    ] {
+        let (s, _) = send(&router, &globex, m, uri, Some(conn("x"))).await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "{m} {uri}");
+    }
+
+    // Delete in tenant acme, and unregister its connector.
+    let (s, _) = send(
+        &router,
+        &admin,
+        "DELETE",
+        "/tenants/acme/connections/c1",
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (_, list) = send(&router, &acme, "GET", "/connections", None).await;
+    assert_eq!(list.as_array().unwrap().len(), 0);
+    let version = entry["version"].as_str().unwrap().to_string();
+    let (s, _) = send(
+        &router,
+        &admin,
+        "DELETE",
+        &format!("/tenants/acme/catalog/coins-src/{version}"),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (_, cat) = send(&router, &acme, "GET", "/catalog", None).await;
+    assert!(!cat.to_string().contains("coins-src"), "{cat}");
+}

@@ -207,8 +207,8 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/tenants/{id}/keys", get(tenant_keys_list).post(tenant_keys_create))
         .route("/tenants/{id}/keys/{kid}", delete(tenant_keys_revoke))
         // Admin cross-tenant data browse ([[WEIR-T-0094]]) — the switcher's target.
-        .route("/tenants/{id}/connections", get(t_connections))
-        .route("/tenants/{id}/connections/{name}", get(t_connection))
+        .route("/tenants/{id}/connections", get(t_connections).post(t_create))
+        .route("/tenants/{id}/connections/{name}", get(t_connection).delete(t_remove))
         .route("/tenants/{id}/connections/{name}/run", post(t_run))
         .route("/tenants/{id}/connections/{name}/start", post(t_start))
         .route("/tenants/{id}/connections/{name}/stop", post(t_stop))
@@ -216,7 +216,17 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/tenants/{id}/connections/{name}/dead-letters", get(t_dead_letters))
         .route("/tenants/{id}/connections/{name}/logs", get(t_logs))
         .route("/tenants/{id}/connections/{name}/state", get(t_state))
+        // The Setup surface for a switched admin ([[WEIR-T-0217]]): the UI rewrites every data call
+        // to `/tenants/{id}/…` (`weir-ui/src/tenant_routes.txt` lists them; a test guards drift).
+        .route("/tenants/{id}/connections/{name}/schema", get(t_schema_view))
+        .route("/tenants/{id}/connections/{name}/schema/accept", post(t_schema_accept))
+        .route("/tenants/{id}/connectors/{plugin}/spec", get(t_connector_spec))
+        .route("/tenants/{id}/connectors/{plugin}/discover", post(t_connector_discover))
         .route("/tenants/{id}/catalog", get(t_catalog))
+        .route("/tenants/{id}/catalog/available", get(t_catalog_available))
+        .route("/tenants/{id}/catalog/import", post(t_catalog_import))
+        .route("/tenants/{id}/catalog/preview", post(t_catalog_preview))
+        .route("/tenants/{id}/catalog/{name}/{version}", delete(t_catalog_unregister))
         .route("/tenants/{id}/runs", get(t_recent))
         .route("/tenants/{id}/runs/{run_id}", get(t_run_detail))
         // Explicit-tenant health (admin cross-tenant) + the platform-wide rollup ([[WEIR-T-0110]]).
@@ -487,7 +497,11 @@ async fn create(
     axum::Extension(key): axum::Extension<AuthenticatedKey>,
     Json(dto): Json<ConnectionDto>,
 ) -> Result<StatusCode, ApiError> {
-    let tenant = tenant_of(&key);
+    create_in(&app, tenant_of(&key), dto)
+}
+
+/// Create (or update) a connection in `tenant` — shared by the implicit and the path-tenant route.
+fn create_in(app: &App, tenant: &str, dto: ConnectionDto) -> Result<StatusCode, ApiError> {
     // The sentinel / an omitted secret keeps the stored value ([[WEIR-T-0201]]).
     let conn = app.merge_secret_writes(tenant, dto.into_connection())?;
     app.add_connection(tenant, &conn)?;
@@ -675,7 +689,15 @@ async fn catalog_import(
     axum::Extension(key): axum::Extension<AuthenticatedKey>,
     Json(dto): Json<ImportDto>,
 ) -> Result<Json<CatalogEntry>, ApiError> {
-    let tenant = tenant_of(&key);
+    catalog_import_in(&app, tenant_of(&key), dto)
+}
+
+/// Import into `tenant` — shared by the implicit and the path-tenant route.
+fn catalog_import_in(
+    app: &App,
+    tenant: &str,
+    dto: ImportDto,
+) -> Result<Json<CatalogEntry>, ApiError> {
     // A vendored manifest picked by name (discover & select) → read + onboard.
     if let Some(mname) = dto.manifest_name {
         return Ok(Json(app.import_vendored_manifest(
@@ -774,9 +796,12 @@ async fn schema_accept(
     axum::Extension(key): axum::Extension<AuthenticatedKey>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    let tenant = tenant_of(&key);
-    let conn = app.get_connection(tenant, &name)?;
-    app.accept_schema(tenant, &name, &conn.stream)?;
+    accept_schema_in(&app, tenant_of(&key), &name)
+}
+
+fn accept_schema_in(app: &App, tenant: &str, name: &str) -> Result<StatusCode, ApiError> {
+    let conn = app.get_connection(tenant, name)?;
+    app.accept_schema(tenant, name, &conn.stream)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1017,6 +1042,85 @@ async fn t_state(
     Path((tid, name)): Path<(String, String)>,
 ) -> Result<Json<ConnectionState>, ApiError> {
     Ok(Json(app.connection_state(&tid, &name)?))
+}
+
+/// Create (or update) a connection in the path tenant ([[WEIR-T-0217]]) — the same secret
+/// merge as `create` ([[WEIR-T-0201]]).
+async fn t_create(
+    State(app): State<Arc<App>>,
+    Path(tid): Path<String>,
+    Json(dto): Json<ConnectionDto>,
+) -> Result<StatusCode, ApiError> {
+    create_in(&app, &tid, dto)
+}
+
+async fn t_remove(
+    State(app): State<Arc<App>>,
+    Path((tid, name)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    app.delete_connection(&tid, &name)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn t_schema_view(
+    State(app): State<Arc<App>>,
+    Path((tid, name)): Path<(String, String)>,
+) -> Result<Json<SchemaView>, ApiError> {
+    Ok(Json(schema_of(&app, &tid, &name)?))
+}
+
+async fn t_schema_accept(
+    State(app): State<Arc<App>>,
+    Path((tid, name)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    accept_schema_in(&app, &tid, &name)
+}
+
+/// Connector spec + discover are not tenant data; the path tenant only gates access.
+async fn t_connector_spec(
+    State(app): State<Arc<App>>,
+    Path((_tid, plugin)): Path<(String, String)>,
+) -> Result<Json<ConnectorSpec>, ApiError> {
+    connector_spec(State(app), Path(plugin)).await
+}
+
+async fn t_connector_discover(
+    State(app): State<Arc<App>>,
+    Path((_tid, plugin)): Path<(String, String)>,
+    body: String,
+) -> Result<Json<Vec<String>>, ApiError> {
+    connector_discover(State(app), Path(plugin), body).await
+}
+
+async fn t_catalog_available(
+    State(app): State<Arc<App>>,
+    Path(_tid): Path<String>,
+) -> Json<Vec<weir_app::AvailablePackage>> {
+    catalog_available(State(app)).await
+}
+
+async fn t_catalog_import(
+    State(app): State<Arc<App>>,
+    Path(tid): Path<String>,
+    Json(dto): Json<ImportDto>,
+) -> Result<Json<CatalogEntry>, ApiError> {
+    catalog_import_in(&app, &tid, dto)
+}
+
+async fn t_catalog_preview(
+    State(app): State<Arc<App>>,
+    Path(_tid): Path<String>,
+    Json(dto): Json<PreviewDto>,
+) -> Json<weir_app::ImportReport> {
+    catalog_preview(State(app), Json(dto)).await
+}
+
+async fn t_catalog_unregister(
+    State(app): State<Arc<App>>,
+    Path((tid, name, version)): Path<(String, String, String)>,
+) -> Result<StatusCode, ApiError> {
+    app.unregister_connector(&tid, &name, &version)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn t_catalog(
