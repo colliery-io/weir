@@ -31,4 +31,6 @@ weir-wasm-testkit = { path = "../weir-wasm-testkit" }
 # Fails / dead-letters on demand — for the run-legibility test (WEIR-T-0035).
 # Emits a connector log — for the log-capture test (WEIR-T-0036).
 tempfile = "3"
+# Parses the run feed's RFC 3339 timestamps in the API test ([[WEIR-T-0224]]).
+chrono = { workspace = true }
 tower = { version = "0.5", features = ["util"] }

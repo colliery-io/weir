@@ -7,6 +7,12 @@ between releases and are called out here.
 ## [Unreleased]
 
 ### Added
+- Runs API: each `GET /runs` row (and the admin mirror `/tenants/{id}/runs`) now
+  carries `started_at` and `finished_at` — RFC 3339 UTC with millisecond
+  precision (`2026-10-07T09:25:01.123Z`), `null` until the run starts / while it
+  is in flight (WEIR-T-0224). Additive under WEIR-A-0006: existing fields are
+  unchanged. `GET /runs/{id}` keeps its epoch-millisecond timestamps. The UI run
+  feed shows a "started" column (relative time, UTC on hover).
 - Runs API: `GET /runs` takes `?limit=` (default 50, max 500) and `?before=<id>`
   for cursor pagination (pass the smallest `id` of the previous page to walk
   history), and `GET /runs/{id}` returns one run in full — stream, timestamps,
