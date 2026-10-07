@@ -1,5 +1,5 @@
 import { test as base, expect } from '@playwright/test';
-import type { APIRequestContext, Locator } from '@playwright/test';
+import type { APIRequestContext, APIResponse, Locator, Page, Response } from '@playwright/test';
 
 // Seed the API key into localStorage before each test so the WEIR-T-0087 auth gate
 // passes (the UI sends it as `Authorization: Bearer`). The server-start harness mints
@@ -29,6 +29,66 @@ export async function fillStable(field: Locator, value: string) {
   }).toPass({ timeout: 15_000 });
 }
 
+// The e2e server is one sqlite file. Its API handlers do not retry a write that meets the
+// background worker's lock (the worker's own writes do), so any call can answer
+// 5xx "database is locked". That is the test bed, not the journey under test: such an answer
+// is retried a few times (and noted on the test); any other refusal fails with its reason.
+const LOCKED = 'database is locked';
+const note = (what: string) => test.info().annotations.push({ type: 'sqlite-lock', description: what });
+
+/** A direct API call, retried on a sqlite lock. The caller checks the final answer. */
+export async function api(
+  request: APIRequestContext,
+  method: 'GET' | 'POST' | 'DELETE',
+  url: string,
+  options: { headers?: Record<string, string>; data?: unknown; timeout?: number } = {},
+): Promise<APIResponse> {
+  const opts = { headers: admin(), timeout: 90_000, ...options };
+  for (let attempt = 1; ; attempt++) {
+    const res = await request.fetch(url, { method, ...opts });
+    if (res.ok() || attempt === 5) return res;
+    const why = await res.text().catch(() => '');
+    if (!why.includes(LOCKED)) return res;
+    note(`${method} ${url} try ${attempt}: ${why}`);
+    await new Promise((r) => setTimeout(r, 500 * attempt));
+  }
+}
+
+/** Fail with the server's reason when a request was refused (no silent failure). */
+export async function expectOk(res: Response | APIResponse, what?: string) {
+  const why = res.ok() ? '' : await res.text().catch(() => '');
+  const label = what ?? ('request' in res ? `${res.request().method()} ${new URL(res.url()).pathname}` : res.url());
+  expect(res.ok(), `${label} → ${res.status()}: ${why}`).toBeTruthy();
+}
+
+/** The next response to `METHOD path` (exact pathname), with the slow-create budget. */
+export function nextResponse(page: Page, method: string, path: string, timeout = 90_000): Promise<Response> {
+  return page.waitForResponse(
+    (r) => r.request().method() === method && new URL(r.url()).pathname === path,
+    { timeout },
+  );
+}
+
+/**
+ * Do a UI action and wait for the request it sends; the request must succeed. A sqlite-lock
+ * answer is retried as the user would, by doing the action again.
+ */
+export async function act(page: Page, method: string, path: string, click: () => Promise<void>): Promise<Response> {
+  for (let attempt = 1; ; attempt++) {
+    const answered = nextResponse(page, method, path);
+    await click();
+    const res = await answered;
+    if (res.ok() || attempt === 5) {
+      await expectOk(res);
+      return res;
+    }
+    const why = await res.text().catch(() => '');
+    if (!why.includes(LOCKED)) await expectOk(res);
+    note(`${method} ${path} try ${attempt}: ${why}`);
+    await page.waitForTimeout(500 * attempt);
+  }
+}
+
 /** The admin key's bearer header for direct API calls. */
 export const admin = () => {
   const key = process.env.WEIR_E2E_KEY;
@@ -46,7 +106,7 @@ export const scoped = (tenant: string | null, path: string) => (tenant ? `/tenan
  */
 export async function ensurePair(request: APIRequestContext, tenant: string | null = null): Promise<string> {
   const names = async () =>
-    ((await (await request.get(scoped(tenant, '/catalog'), { headers: admin() })).json()) as { name: string }[]).map(
+    ((await (await api(request, 'GET', scoped(tenant, '/catalog'))).json()) as { name: string }[]).map(
       (c) => c.name,
     );
   const isArrow = (n: string) => /arrow/i.test(n);
@@ -59,7 +119,7 @@ export async function ensurePair(request: APIRequestContext, tenant: string | nu
     const missing = want.filter(([is]) => !have.some(is));
     if (missing.length === 0) return have.find(isArrow)!;
     for (const [, body] of missing) {
-      await request.post(scoped(tenant, '/catalog/import'), { headers: admin(), data: body, timeout: 90_000 });
+      await api(request, 'POST', scoped(tenant, '/catalog/import'), { data: body });
     }
   }
   const have = await names();

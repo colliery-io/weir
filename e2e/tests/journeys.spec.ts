@@ -1,5 +1,15 @@
-import { test, expect, admin, scoped, ensurePair, fillStable } from './fixtures';
-import type { Page, Response } from '@playwright/test';
+import {
+  test,
+  expect,
+  act,
+  api,
+  ensurePair,
+  expectOk,
+  fillStable,
+  nextResponse,
+  scoped,
+} from './fixtures';
+import type { Page } from '@playwright/test';
 
 // [[WEIR-T-0220]]: the user journeys of COLLIERY-I-0251, end to end against the real e2e
 // server (no routing): create a connection in the form, run it and see rows arrive; start and
@@ -8,45 +18,11 @@ import type { Page, Response } from '@playwright/test';
 // The server's state outlives a spec (and a retry), and its seed step ignores errors: each
 // journey makes the names, tenants, keys and catalog entries it needs. A create on this server
 // is slow (it loads each side's wasm guest, synchronously, in a debug build), so the journeys
-// wait on the real responses and poll the API, never on fixed sleeps or the 10s toast.
+// wait on the real responses and poll the API, never on fixed sleeps or the 10s toast. A
+// sqlite-lock answer is retried (see `api` / `act` in fixtures); any other refusal fails.
 
 const uniq = (prefix: string) => `${prefix}-${Date.now().toString(36)}`;
-
-/** The next response to `METHOD path` (exact pathname), with the slow-create budget. */
-function nextResponse(page: Page, method: string, path: string, timeout = 90_000): Promise<Response> {
-  return page.waitForResponse(
-    (r) => r.request().method() === method && new URL(r.url()).pathname === path,
-    { timeout },
-  );
-}
-
-/** Fail with the server's reason when a UI request was refused (no silent failure). */
-async function expectOk(res: Response) {
-  const why = res.ok() ? '' : await res.text().catch(() => '');
-  expect(res.ok(), `${res.request().method()} ${new URL(res.url()).pathname} → ${res.status()}: ${why}`).toBeTruthy();
-}
-
-/**
- * Do a UI action and wait for the request it sends; the request must succeed. The e2e server
- * is one sqlite file, and its API handlers do not retry a write that meets the background
- * worker's lock (the worker's own writes do): such a 500 "database is locked" is retried, as
- * the user would, a few times and noted on the test. Any other refusal fails with its reason.
- */
-async function act(page: Page, method: string, path: string, click: () => Promise<void>): Promise<Response> {
-  for (let attempt = 1; ; attempt++) {
-    const answered = nextResponse(page, method, path);
-    await click();
-    const res = await answered;
-    if (res.ok() || attempt === 3) {
-      await expectOk(res);
-      return res;
-    }
-    const why = await res.text().catch(() => '');
-    if (!why.includes('database is locked')) await expectOk(res);
-    test.info().annotations.push({ type: 'sqlite-lock', description: `${method} ${path} try ${attempt}: ${why}` });
-    await page.waitForTimeout(1_000);
-  }
-}
+const names = async (res: { json(): Promise<unknown> }) => ((await res.json()) as { name: string }[]).map((c) => c.name);
 
 /** Fill the Setup form: frankfurter `latest` → the arrow sink. `tenant` scopes the discover. */
 async function fillPair(page: Page, name: string, tenant: string | null) {
@@ -102,7 +78,7 @@ test('journey: create in the form → run → rows arrive', async ({ page }) => 
   await expect
     .poll(
       async () => {
-        const r = await page.request.get(`/runs/${id}`, { headers: admin() });
+        const r = await api(page.request, 'GET', `/runs/${id}`);
         run = r.ok() ? await r.json() : { state: `HTTP ${r.status()}` };
         return run.state;
       },
@@ -121,31 +97,32 @@ test('journey: create in the form → run → rows arrive', async ({ page }) => 
   const rows = dialog.locator('.cl-kv', { has: page.locator('dt', { hasText: /^rows written$/ }) }).locator('dd');
   await expect(rows).toHaveText(String(run.rows_written));
 
-  await page.request.delete(`/connections/${name}`, { headers: admin() });
+  await api(page.request, 'DELETE', `/connections/${name}`);
 });
 
 test('journey: a resident source starts and stops from its card', async ({ page }) => {
   test.setTimeout(180_000);
   const name = uniq('fx-resident');
   const dest = await ensurePair(page.request);
-  const body = {
-    name,
-    source: 'frankfurter',
-    dest,
-    stream: 'latest',
-    source_config: {},
-    dest_config: {},
-    every_secs: 30,
-    execution_mode: 'resident',
+  const created = await api(page.request, 'POST', '/connections', {
+    data: {
+      name,
+      source: 'frankfurter',
+      dest,
+      stream: 'latest',
+      source_config: {},
+      dest_config: {},
+      every_secs: 30,
+      execution_mode: 'resident',
+    },
+  });
+  await expectOk(created, `create ${name}`);
+  const active = async () => {
+    const r = await api(page.request, 'GET', `/connections/${name}/runs`);
+    await expectOk(r);
+    return ((await r.json()) as { state: string }[]).filter((u) => u.state === 'pending' || u.state === 'leased')
+      .length;
   };
-  let created = await page.request.post('/connections', { headers: admin(), timeout: 90_000, data: body });
-  for (let i = 0; i < 2 && (await created.text()).includes('database is locked'); i++) {
-    created = await page.request.post('/connections', { headers: admin(), timeout: 90_000, data: body });
-  }
-  expect(created.ok(), `create ${name}: ${created.status()} ${await created.text()}`).toBeTruthy();
-  const active = async () =>
-    ((await (await page.request.get(`/connections/${name}/runs`, { headers: admin() })).json()) as { state: string }[])
-      .filter((u) => u.state === 'pending' || u.state === 'leased').length;
 
   await page.goto('/');
   const c = card(page, name);
@@ -172,26 +149,31 @@ test('journey: a resident source starts and stops from its card', async ({ page 
   expect(await active(), 'no unit came back after the stop').toBe(0);
   await expect(c.getByText('resident • stopped')).toBeVisible();
 
-  await page.request.delete(`/connections/${name}`, { headers: admin() });
+  await api(page.request, 'DELETE', `/connections/${name}`);
 });
 
 test('journey: a non-admin key gets a tenant chip, no switcher, no Platform', async ({ page }) => {
+  test.setTimeout(90_000);
   const tenant = uniq('na');
-  const made = await page.request.post('/tenants', { headers: admin(), data: { id: tenant } });
-  expect(made.ok(), `create tenant ${tenant}: ${made.status()} ${await made.text()}`).toBeTruthy();
-  const minted = await page.request.post(`/tenants/${tenant}/keys`, {
-    headers: admin(),
+  await expectOk(await api(page.request, 'POST', '/tenants', { data: { id: tenant } }), `create tenant ${tenant}`);
+  const minted = await api(page.request, 'POST', `/tenants/${tenant}/keys`, {
     data: { name: 'e2e-writer', role: 'write' },
   });
-  expect(minted.ok(), `mint key: ${minted.status()} ${await minted.text()}`).toBeTruthy();
+  await expectOk(minted, 'mint key');
   const key: string = (await minted.json()).key;
   expect(key).toMatch(/^weirk_/);
 
-  // Sign in as the non-admin (this init script runs after the fixture's admin one).
+  // Sign in as the non-admin (this init script runs after the fixture's admin one). The key
+  // is new, so the server checks it against the store: a sqlite lock there answers 503 (not
+  // 401), and the page is loaded again.
   await page.addInitScript((k) => localStorage.setItem('weir_api_key', k), key);
-  const me = page.waitForResponse((r) => new URL(r.url()).pathname === '/auth/me');
-  await page.goto('/');
-  expect(await (await me).json()).toMatchObject({ tenant, is_admin: false });
+  await expect(async () => {
+    const me = nextResponse(page, 'GET', '/auth/me', 15_000);
+    await page.goto('/');
+    const res = await me;
+    await expectOk(res);
+    expect(await res.json()).toMatchObject({ tenant, is_admin: false });
+  }).toPass({ timeout: 60_000 });
   await expect(page.getByText('Run feed')).toBeVisible();
 
   // The tenant shows as a chip, not a switcher; no Platform tab, no tenants admin.
@@ -201,15 +183,14 @@ test('journey: a non-admin key gets a tenant chip, no switcher, no Platform', as
   await expect(page.getByRole('button', { name: 'Platform' })).toHaveCount(0);
   await expect(page.getByTitle('administer tenants')).toHaveCount(0);
 
-  await page.request.delete(`/tenants/${tenant}`, { headers: admin() });
+  await api(page.request, 'DELETE', `/tenants/${tenant}`);
 });
 
 test('journey: an admin switched to another tenant onboards and creates there', async ({ page }) => {
   test.setTimeout(180_000);
   const tenant = uniq('tb');
   const name = uniq('fx-tb');
-  const made = await page.request.post('/tenants', { headers: admin(), data: { id: tenant } });
-  expect(made.ok(), `create tenant ${tenant}: ${made.status()} ${await made.text()}`).toBeTruthy();
+  await expectOk(await api(page.request, 'POST', '/tenants', { data: { id: tenant } }), `create tenant ${tenant}`);
 
   // The admin has the switcher and the Platform tab; switch to tenant B.
   await page.goto('/');
@@ -237,14 +218,15 @@ test('journey: an admin switched to another tenant onboards and creates there', 
   await saveForm(page, name, tenant);
 
   // It is in B, and not in the admin's own tenant.
-  const inB = await page.request.get(`/tenants/${tenant}/connections`, { headers: admin() });
-  expect(inB.ok()).toBeTruthy();
-  expect(((await inB.json()) as { name: string }[]).map((c) => c.name)).toContain(name);
-  const own = await page.request.get('/connections', { headers: admin() });
-  expect(((await own.json()) as { name: string }[]).map((c) => c.name)).not.toContain(name);
+  const inB = await api(page.request, 'GET', `/tenants/${tenant}/connections`);
+  await expectOk(inB);
+  expect(await names(inB)).toContain(name);
+  const own = await api(page.request, 'GET', '/connections');
+  await expectOk(own);
+  expect(await names(own)).not.toContain(name);
   // And B's Operations lists it.
   await page.getByRole('button', { name: 'Operations' }).click();
   await expect(card(page, name)).toBeVisible({ timeout: 30_000 });
 
-  await page.request.delete(`/tenants/${tenant}`, { headers: admin() });
+  await api(page.request, 'DELETE', `/tenants/${tenant}`);
 });
