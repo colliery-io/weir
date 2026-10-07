@@ -854,15 +854,9 @@ impl<'a> Engine<'a> {
                 }
                 ReadMessage::Checkpoint(next) => {
                     tracing::debug!(target: "weir_engine", connection, cursor = ?next.cursor, batches = batch_buffer.len(), "checkpoint commit");
-                    // Acquire a pooled connection ONLY for this commit and release it at the
-                    // end of the arm — a resident run must not hold one across read()/cadence
-                    // waits ([[WEIR-I-0035]] F1.6 fix).
-                    let mut conn = self
-                        .store
-                        .pool
-                        .get()
-                        .map_err(|e| EngineError::Pool(e.to_string()))?;
-                    // Client-streaming write of the segment's batches, then commit.
+                    // Client-streaming write of the segment's batches — BEFORE checking out a
+                    // pooled connection, so a slow destination write never holds one.
+                    let mut diagnostics = Vec::new();
                     if !batch_buffer.is_empty() {
                         let wctx = WriteContext {
                             stream: stream.clone(),
@@ -870,23 +864,35 @@ impl<'a> Engine<'a> {
                         let wout = dest
                             .write(&wctx, std::mem::take(&mut batch_buffer))
                             .map_err(|e| EngineError::Rt(e.to_string()))?;
-                        for d in &wout.diagnostics {
-                            let _ = diesel::insert_into(run_logs::table)
-                                .values((
-                                    run_logs::id.eq(new_id()),
-                                    run_logs::connection.eq(connection),
-                                    run_logs::stream.eq(&state_key),
-                                    run_logs::level.eq(level_str(&d.level)),
-                                    run_logs::message.eq(&d.message),
-                                    run_logs::ts.eq(now_ms()),
-                                ))
-                                .execute(&mut conn);
-                        }
+                        diagnostics = wout.diagnostics;
                         pending_dead.extend(wout.dead_letters);
                         match wout.result {
                             WriteResult::Ok(receipt) => rows_written += receipt.accepted,
                             WriteResult::Err(e) => return Err(EngineError::Connector(e)),
                         }
+                    }
+                    // Acquire a pooled connection ONLY for this commit, and release it before
+                    // `on_progress` and the resident cadence sleep ([[WEIR-I-0035]] F1.6 fix).
+                    // `on_progress` checks out its own connection (the orchestrator's
+                    // `update_progress`): holding this one across it is hold-and-wait — with as
+                    // many concurrent runs as pool slots, every run waits on a second connection
+                    // until the pool's checkout times out ([[WEIR-T-0208]]).
+                    let mut conn = self
+                        .store
+                        .pool
+                        .get()
+                        .map_err(|e| EngineError::Pool(e.to_string()))?;
+                    for d in &diagnostics {
+                        let _ = diesel::insert_into(run_logs::table)
+                            .values((
+                                run_logs::id.eq(new_id()),
+                                run_logs::connection.eq(connection),
+                                run_logs::stream.eq(&state_key),
+                                run_logs::level.eq(level_str(&d.level)),
+                                run_logs::message.eq(&d.message),
+                                run_logs::ts.eq(now_ms()),
+                            ))
+                            .execute(&mut conn);
                     }
                     // Atomic checkpoint: advance stream_state, record the outbox
                     // entry, and flush dead-letters accumulated since the last
@@ -947,6 +953,7 @@ impl<'a> Engine<'a> {
                             Ok(())
                         })
                     })?;
+                    drop(conn); // released before on_progress / cadence — see above
                     dead_lettered += dead.len() as u64;
                     state = next;
                     chunks += 1;
