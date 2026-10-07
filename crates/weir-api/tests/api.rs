@@ -2069,3 +2069,48 @@ async fn tenant_key_revoke_is_tenant_scoped_and_purges_the_cache() {
     let (s, _) = send(&router, &globex, "GET", "/connections", None).await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
 }
+
+/// WEIR-T-0220: a credential that cannot be checked (a store error, e.g. sqlite "database is
+/// locked") is a 503 with the reason, not a 401: a 401 signs the UI out. An unknown key is
+/// still a 401.
+#[tokio::test]
+async fn auth_store_error_is_503_not_401() {
+    use diesel::RunQueryDsl;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let app = Arc::new(App::open(tmp.path().join("weir.db").to_str().unwrap()).unwrap());
+    let key = format!(
+        "Bearer {}",
+        app.create_api_key("ops", "write", None, false).unwrap()
+    );
+    let router = weir_api::router(Arc::clone(&app));
+    let get = |auth: String| {
+        Request::get("/connections")
+            .header("authorization", auth)
+            .body(Body::empty())
+            .unwrap()
+    };
+
+    let unknown = router
+        .clone()
+        .oneshot(get("Bearer weirk_not-a-key".into()))
+        .await
+        .unwrap();
+    assert_eq!(unknown.status(), StatusCode::UNAUTHORIZED);
+
+    // Break the key lookup. The key was never presented, so it is not cached: the store is asked.
+    let mut conn = app.store().pool().get().unwrap();
+    diesel::sql_query("ALTER TABLE api_keys RENAME TO api_keys_gone")
+        .execute(&mut conn)
+        .unwrap();
+    drop(conn);
+    let resp = router.oneshot(get(key)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = json(resp).await;
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("could not check the credential"),
+        "{body}"
+    );
+}

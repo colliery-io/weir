@@ -363,7 +363,17 @@ async fn require_auth(State(auth): State<AuthState>, mut req: Request, next: Nex
                 auth.cache.insert(hash, k.clone()).await;
                 Some(k)
             }
-            _ => None,
+            Ok(None) => None,
+            // The key could not be checked (e.g. sqlite "database is locked"): that is not a
+            // bad credential. A 401 here would sign the UI out on a transient store error
+            // (WEIR-T-0220); answer 503 with the reason so the caller can retry.
+            Err(e) => {
+                return ApiError(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("could not check the credential: {e}"),
+                )
+                .into_response();
+            }
         },
     };
     match authed {
