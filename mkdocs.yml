@@ -90,6 +90,7 @@ nav:
     - The connector model: explanation/connector-model.md
     - Multi-tenancy: explanation/multi-tenancy.md
     - Tenancy posture (alpha): explanation/tenancy-posture.md
+    - Secrets posture: explanation/secrets-posture.md
     - Delivery guarantees: explanation/delivery-guarantees.md
     - Typed schemas: explanation/typed-schemas.md
     - Deployment topology: explanation/deployment.md

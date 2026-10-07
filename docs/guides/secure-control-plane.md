@@ -68,7 +68,8 @@ sign-in gate.
 
 ## Notes
 
-- **Secrets are off-platform** — weir *consumes* rotated connector secrets, it does not store or manage them.
-  Provision them out of band; the host injects them into a connector's egress at run time and they never enter
-  the WASM guest.
+- **Connector secrets.** The API and the UI do not show secret values. The host injects credentials into the
+  egress of a connector, so they do not go into the WASM guest. The database stores a literal secret in
+  plaintext. To keep secrets out of weir, give them as [references](secret-references.md). Refer to
+  [Secrets posture](../explanation/secrets-posture.md).
 - Per-tenant keys pair with [tenant management](manage-tenants.md) for multi-tenant isolation.

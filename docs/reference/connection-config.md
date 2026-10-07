@@ -44,6 +44,9 @@ A secret field can hold a reference, `env:NAME` or `file:/path`, in place of the
 each run, and a read gives the reference text. A reference in a field that is not secret gets `400`. See
 [Give a secret as a reference](../guides/secret-references.md).
 
+The database stores a literal secret in plaintext. For what is protected and what is not, see
+[Secrets posture](../explanation/secrets-posture.md).
+
 ## Host-side auth (`auth_scheme`)
 
 Credentials are resolved and attached **on the host** — secret fields are stripped before the config reaches
