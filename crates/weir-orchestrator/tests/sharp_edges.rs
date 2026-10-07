@@ -101,7 +101,7 @@ fn stale_requeue_cannot_resurrect_a_cancelled_unit() {
         .claim("w1", "default", Duration::from_secs(60))
         .unwrap()
         .expect("claimed");
-    assert_eq!(relay.cancel("c1").unwrap(), 1);
+    assert_eq!(relay.cancel("default", "c1").unwrap(), 1);
     assert_eq!(relay.state(id).unwrap().as_deref(), Some("done"));
 
     relay.requeue(id, "w1", 0).unwrap();
@@ -237,7 +237,7 @@ fn poisoned_schedule_does_not_block_the_rest() {
         .expect("tick survives the poisoned schedule");
     assert_eq!(fired, 1, "the well-formed schedule still fired");
     assert!(
-        relay.has_active_in("default", "good").unwrap(),
+        relay.has_active("default", "good").unwrap(),
         "the good connection got its planned unit"
     );
 }

@@ -58,7 +58,7 @@ impl App {
         // Pre-staged **shared** packages (`Folder` — the generic runtimes/guests) stay in `<dir>`.
         let (package, version, search_path) = match source {
             Source::LocalCrate(path) => {
-                let sp = Path::new(&dir).join(tenant);
+                let sp = crate::tenant_id::tenant_dir(&dir, tenant)?;
                 std::fs::create_dir_all(&sp)
                     .map_err(|e| AppError::Config(format!("tenant connectors dir: {e}")))?;
                 let (p, v) = compile_and_stage(&path, &sp)?;
@@ -67,7 +67,7 @@ impl App {
             Source::Folder { package } => {
                 // Already staged: prefer the tenant's namespace (`<dir>/<tenant>/<pkg>`, e.g. a
                 // previously-compiled private crate), else the shared dir for the generic guests.
-                let tdir = Path::new(&dir).join(tenant);
+                let tdir = crate::tenant_id::tenant_dir(&dir, tenant)?;
                 let sp = if tdir.join(&package).exists() {
                     tdir.to_string_lossy().into_owned()
                 } else {

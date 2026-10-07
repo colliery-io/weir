@@ -62,6 +62,15 @@ between releases and are called out here.
   `weir-tiberius` fork (TDS 7.x in-PRELOGIN handshake).
 
 ### Fixed
+- **Security:** tenant ids must be safe slugs (`^[a-z0-9][a-z0-9-]{0,62}$`).
+  `POST /tenants` refuses any other id (for example `../x`) with a 400, and
+  every filesystem path built from a tenant id goes through the validated
+  type, so a tenant id cannot escape the connectors directory.
+- **Security:** stopping a resident connection is scoped by (tenant, name).
+  A stop by tenant A no longer cancels a same-named connection of tenant B,
+  and the no-double-start guard is tenant-scoped everywhere.
+  **Breaking (v0-unstable, Rust API):** `Relay::cancel` and `Relay::has_active`
+  now take the tenant; the name-only `has_active` and `has_active_in` are gone.
 - Orchestrator hardening for long continuous operation: work-unit completion is
   now owner-guarded (a lease-expired worker finishing late can no longer
   clobber a re-claimed unit's state, and a worker's exit can no longer

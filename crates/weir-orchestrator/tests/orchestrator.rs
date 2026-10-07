@@ -296,23 +296,37 @@ fn stale_resident_deregister_cannot_drop_replacement_handle() {
     assert_eq!(relay.stop_all_residents(), 0);
 }
 
-/// [[WEIR-T-0171]] characterization: the name-only guard aliases same-named connections
-/// across tenants; `has_active_in` is the tenant-scoped guard the scheduler now uses.
+/// [[WEIR-T-0171]] / [[WEIR-T-0209]]: the no-double-start guard and the durable cancel are
+/// scoped by (tenant, connection) — same-named connections in different tenants never alias.
 #[test]
-fn has_active_is_name_aliased_but_has_active_in_is_tenant_scoped() {
+fn has_active_and_cancel_are_tenant_scoped() {
     let (_tmp, _store, relay) = setup();
-    let mut s = spec("Echo", "echo", "{}");
-    s.connection = "shared-name".to_string();
-    s.tenant = "t1".to_string();
-    relay.plan(&s).unwrap();
+    for t in ["t1", "t2"] {
+        let mut s = spec("Echo", "echo", "{}");
+        s.connection = "shared-name".to_string();
+        s.tenant = t.to_string();
+        relay.plan(&s).unwrap();
+    }
+    assert!(relay.has_active("t1", "shared-name").unwrap());
+    assert!(relay.has_active("t2", "shared-name").unwrap());
+    assert!(!relay.has_active("t3", "shared-name").unwrap());
 
+    // t1 stopping its `shared-name` leaves t2's same-named unit running.
+    assert_eq!(relay.cancel("t1", "shared-name").unwrap(), 1);
+    assert!(!relay.has_active("t1", "shared-name").unwrap());
     assert!(
-        relay.has_active("shared-name").unwrap(),
-        "name-only sees t1's unit"
+        relay.has_active("t2", "shared-name").unwrap(),
+        "t1's cancel must not touch t2's same-named unit"
     );
-    assert!(relay.has_active_in("t1", "shared-name").unwrap());
-    assert!(
-        !relay.has_active_in("t2", "shared-name").unwrap(),
-        "t2 must not alias t1's same-named unit"
-    );
+    // A tenant with no such connection cancels nothing.
+    assert_eq!(relay.cancel("t3", "shared-name").unwrap(), 0);
+    assert!(relay.has_active("t2", "shared-name").unwrap());
+
+    // History is tenant-scoped too: each tenant sees only its own unit.
+    let h1 = relay.history("t1", "shared-name").unwrap();
+    let h2 = relay.history("t2", "shared-name").unwrap();
+    assert_eq!((h1.len(), h2.len()), (1, 1));
+    assert_eq!(h1[0].state, "done");
+    assert_ne!(h2[0].state, "done");
+    assert!(relay.history("t3", "shared-name").unwrap().is_empty());
 }

@@ -58,9 +58,11 @@ impl App {
         Ok(())
     }
 
-    /// Create (or rename) a tenant; idempotent by id.
+    /// Create (or rename) a tenant; idempotent by id. The id must be a safe slug
+    /// ([`crate::TenantId`], [[WEIR-T-0209]]); anything else is refused with `AppError::Config`.
     pub fn create_tenant(&self, id: &str, name: &str) -> Result<(), AppError> {
-        self.upsert_tenant(id, name)
+        let id = crate::TenantId::parse(id)?;
+        self.upsert_tenant(id.as_str(), name)
     }
 
     fn upsert_tenant(&self, id: &str, name: &str) -> Result<(), AppError> {
@@ -151,8 +153,8 @@ impl App {
             .get()
             .map_err(|e| AppError::Config(e.to_string()))?;
 
-        // 1. Stop in-flight runs of THIS tenant only (a tenant-scoped query: the name-only
-        //    `Relay::cancel` would also hit a same-named connection of another tenant).
+        // 1. Stop in-flight runs of THIS tenant only (a tenant-scoped query over every
+        //    connection of the tenant; `Relay::cancel` is per (tenant, connection)).
         let active: Vec<i64> = work_units::table
             .filter(
                 work_units::tenant_id
@@ -199,16 +201,11 @@ fn remove_tenant_staging(tenant: &str) -> Result<(), AppError> {
 }
 
 fn remove_tenant_staging_in(base: &str, tenant: &str) -> Result<(), AppError> {
-    let mut parts = std::path::Path::new(tenant).components();
-    let plain = matches!(
-        (parts.next(), parts.next()),
-        (Some(std::path::Component::Normal(_)), None)
-    );
-    if !plain {
-        // Never join `..`, `/` or an empty id onto the connectors dir.
+    // The join goes through the validated slug ([[WEIR-T-0209]]): `..`, `/`, an empty id or any
+    // other non-slug is never joined onto the connectors dir (no-op for such a legacy id).
+    let Ok(dir) = crate::tenant_id::tenant_dir(base, tenant) else {
         return Ok(());
-    }
-    let dir = std::path::Path::new(base).join(tenant);
+    };
     if !dir.is_dir() {
         return Ok(());
     }

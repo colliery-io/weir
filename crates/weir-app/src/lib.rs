@@ -88,6 +88,8 @@ pub mod secrets;
 pub mod tenant;
 pub use secrets::{SECRET_SENTINEL, SecretFields};
 pub use tenant::{DEFAULT_TENANT, Tenant};
+pub mod tenant_id;
+pub use tenant_id::TenantId;
 mod store;
 
 /// A persisted connection — the minimal config model the binary needs.
@@ -146,14 +148,24 @@ fn scope_wasm_to_tenant(r: ConnectorRef, tenant: &str) -> ConnectorRef {
             package,
             version,
             origin,
-        } if search_path == connectors_dir() => ConnectorRef::Wasm {
-            search_path: std::path::Path::new(&search_path)
-                .join(tenant)
-                .to_string_lossy()
-                .into_owned(),
-            package,
-            version,
-            origin,
+        } if search_path == connectors_dir() => match tenant_id::tenant_dir(&search_path, tenant) {
+            Ok(dir) => ConnectorRef::Wasm {
+                search_path: dir.to_string_lossy().into_owned(),
+                package,
+                version,
+                origin,
+            },
+            // A tenant id that is not a safe slug ([[WEIR-T-0209]]) is never joined into a
+            // path: the ref stays on the shared dir, so it cannot escape it.
+            Err(e) => {
+                tracing::warn!(tenant, error = %e, "not scoping connector ref to tenant");
+                ConnectorRef::Wasm {
+                    search_path,
+                    package,
+                    version,
+                    origin,
+                }
+            }
         },
         other => other,
     }
@@ -513,8 +525,9 @@ impl App {
         }
         self.check_contract(tenant, &c.source)?;
         self.check_contract(tenant, &c.dest)?;
-        // Enqueue-once: the perpetual lease + `has_active` keep it single ([[WEIR-T-0139]]).
-        if self.relay.has_active(name)? {
+        // Enqueue-once: the perpetual lease + `has_active` keep it single ([[WEIR-T-0139]]),
+        // scoped by (tenant, name) ([[WEIR-A-0036]] / [[WEIR-T-0209]]).
+        if self.relay.has_active(tenant, name)? {
             return Ok(None);
         }
         Ok(Some(self.relay.plan(&work_spec(tenant, &c))?))
@@ -522,9 +535,10 @@ impl App {
 
     /// **Stop** a resident source ([[WEIR-I-0035]] F1.5): durably end its supervised restart loop.
     /// Returns the number of active units stopped (0 if it wasn't running). See [`Relay::cancel`]
-    /// for the cross-process mid-stream caveat.
-    pub fn stop(&self, _tenant: &str, name: &str) -> Result<u64, AppError> {
-        Ok(self.relay.cancel(name)?)
+    /// for the cross-process mid-stream caveat. Scoped by (tenant, name) ([[WEIR-T-0209]]): it
+    /// never touches a same-named connection of another tenant.
+    pub fn stop(&self, tenant: &str, name: &str) -> Result<u64, AppError> {
+        Ok(self.relay.cancel(tenant, name)?)
     }
 
     /// Refuse a run whose pinned connector is cataloged with an incompatible contract.
@@ -1227,7 +1241,7 @@ impl App {
         } = r;
         let candidates: Vec<std::path::PathBuf> = if *search_path == connectors_dir() {
             vec![
-                std::path::Path::new(search_path).join(tenant).join(package),
+                tenant_id::tenant_dir(search_path, tenant)?.join(package),
                 std::path::Path::new(search_path).join(package),
             ]
         } else {
