@@ -11,7 +11,7 @@ use diesel::prelude::*;
 use diesel_dualdb::types::Uuid as DbUuid;
 use rand::Rng;
 use sha2::{Digest, Sha256};
-use weir_schema::{api_keys, audit_events};
+use weir_schema::{api_keys, audit_events, tenants};
 
 /// The authenticated identity resolved from a valid key (cloacina's `AuthenticatedKey`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,6 +106,15 @@ impl App {
         expires_at: Option<i64>,
         issued_via: Option<&str>,
     ) -> Result<String, AppError> {
+        // A tenant-bound key needs its tenant row: `validate_api_key` refuses a key whose tenant
+        // does not exist (WEIR-T-0210). Create the tenant (named by its id) when it is absent;
+        // an existing tenant is not renamed. This goes through `create_tenant`, so its id rules
+        // apply to key minting too.
+        if let Some(t) = tenant_id
+            && !self.tenant_exists(t)?
+        {
+            self.create_tenant(t, t)?;
+        }
         let (plaintext, hash) = generate_api_key();
         let mut conn = self
             .store
@@ -160,6 +169,18 @@ impl App {
         let now = now_ms();
         if expires_at.is_some_and(|exp| exp <= now) {
             return Ok(None); // expired
+        }
+        // A tenant-bound key is valid only while its tenant exists (WEIR-T-0210): defense in depth
+        // next to the delete cascade, which removes the key rows. Global keys (`tenant_id` NULL,
+        // e.g. admin + OIDC-minted keys) skip this check.
+        if let Some(t) = &tenant_id {
+            let live: i64 = tenants::table
+                .filter(tenants::id.eq(t))
+                .count()
+                .get_result(&mut conn)?;
+            if live == 0 {
+                return Ok(None);
+            }
         }
         diesel::update(api_keys::table.filter(api_keys::key_hash.eq(&hash)))
             .set(api_keys::last_used_at.eq(Some(now)))

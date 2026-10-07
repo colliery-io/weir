@@ -27,6 +27,10 @@ Admins can address any tenant explicitly via the mirrored `/tenants/{id}/…` ro
 
 - `GET/POST /tenants`, `DELETE /tenants/{id}`, `GET/POST /tenants/{id}/keys`, `.../connections`, `.../overview`,
   `.../runs`, `GET /platform/health`.
+- `DELETE /tenants/{id}` **cascades**: it stops the runs of the tenant and deletes all of its data (connections,
+  schedules, runs, logs, dead letters, state, catalog entries, API keys, staged connector files). The keys of
+  the tenant are refused (`401`) at once. You cannot delete the `default` tenant. See
+  [Manage tenants](../guides/manage-tenants.md#4-delete-a-tenant).
 
 ## Endpoint groups
 

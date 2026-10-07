@@ -39,6 +39,31 @@ connections, a run only touches its data. Admins can also address a tenant expli
 **Done** when the tenant-scoped key lists only `acme`'s connections and is refused the platform routes
 (`GET /tenants` → `403`).
 
+## 4. Delete a tenant
+
+```bash
+curl -s -X DELETE http://localhost:8080/tenants/acme \
+  -H "authorization: Bearer $ADMIN_KEY"
+```
+
+The delete **cascades**. It removes all of the data of the tenant:
+
+1. weir stops the runs of the tenant that are in progress, resident runs included.
+2. In one transaction, weir deletes the connections, schedules, runs (work units), run logs, dead letters,
+   stream state, stream schemas, catalog entries and API keys of the tenant, and then the tenant.
+3. weir deletes the staged connector files of the tenant (`<WEIR_CONNECTORS_DIR>/<tenant>/`).
+
+The audit events stay. Other tenants are not changed, also when they have connections with the same names.
+
+The keys of the deleted tenant are refused (`401`) on the next request: the delete clears the key cache of the
+server that does the delete. Other API servers of the same deployment ask the store again after their key cache
+TTL (30 seconds) at most. weir also refuses a tenant key when its tenant does not exist.
+
+You cannot delete the `default` tenant.
+
+**Caution:** a batch run that writes a chunk in a different process at the time of the delete can write one more
+checkpoint before it stops.
+
 ## Notes
 
 - Isolation is enforced at execution too: the orchestrator runs a **separate worker per active tenant**, and in
