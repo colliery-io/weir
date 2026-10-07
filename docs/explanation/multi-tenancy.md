@@ -3,6 +3,9 @@
 weir is multi-tenant from the ground up, but single-tenant deploys never pay for it. Understanding the model
 explains both how isolation works and why it stays invisible when you don't need it.
 
+In the alpha, tenants are workspaces for trusted operators, not a hardened security boundary. What that means,
+and what weir enforces, is in [Tenancy posture in the alpha](tenancy-posture.md).
+
 ## Everything belongs to a tenant
 
 Connections, API keys, runs, schedules, dead-letters, and schemas all carry a `tenant_id`. Connection identity is

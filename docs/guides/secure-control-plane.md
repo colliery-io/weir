@@ -58,6 +58,11 @@ weir --db weir.db api --port 8080
 The UI now offers an OIDC sign-in; the callback exchanges the code and issues the browser a session. Without the
 OIDC variables, the UI falls back to the API-key sign-in.
 
+!!! warning "OIDC gives a write key on `default`"
+    In the alpha, weir gives each user that your IdP authenticates a short-lived **write** key on the `default`
+    tenant. Use OIDC only with an IdP that authenticates only the people that you trust. Refer to
+    [Tenancy posture in the alpha](../explanation/tenancy-posture.md).
+
 **Done** when a `curl` with a valid `Bearer` key succeeds and one without gets `401`/`403`, and the UI shows the
 sign-in gate.
 
