@@ -71,6 +71,7 @@ nav:
     - Schedule syncs: guides/schedule-syncs.md
     - Capture changes + propagate deletes: guides/cdc-deletes.md
     - Secure the control plane: guides/secure-control-plane.md
+    - Give a secret as a reference: guides/secret-references.md
     - Manage tenants: guides/manage-tenants.md
     - Deploy to Kubernetes: guides/deploy-kubernetes.md
     - Map fields: guides/field-mapping.md
