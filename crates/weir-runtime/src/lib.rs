@@ -19,7 +19,8 @@ pub mod secret_ref;
 pub mod sigv4;
 
 pub use secret_ref::{
-    ResolvedConfig, SecretRef, SecretRefError, is_secret_ref, parse_secret_ref, resolve_secret_refs,
+    ResolvedConfig, SecretRef, SecretRefError, cache_key_digest, is_secret_ref, parse_secret_ref,
+    resolve_secret_refs,
 };
 
 use ed25519_dalek::VerifyingKey;
@@ -979,21 +980,54 @@ impl OAuth2Provider {
 /// Google service-account JWT-bearer grant ([[WEIR-T-0155]]): the host builds the RS256
 /// assertion from the SA JSON key's `client_email`/`private_key`, exchanges it at the
 /// key's `token_uri` for an access token scoped to `scopes`, and injects it as a bearer.
-/// Tokens are cached **process-wide** per `(client_email, scopes)` with the same
-/// [`REFRESH_MARGIN`] as OAuth2 — concurrent streams, and connections sharing one key,
+/// Tokens are cached **process-wide** per `(client_email, scopes, token_uri)` with the
+/// same [`REFRESH_MARGIN`] as OAuth2 — concurrent streams, and connections sharing one key,
 /// share one token. The key material never leaves the host.
 pub struct GoogleSaProvider {
     client_email: String,
     private_key_pem: String,
     token_uri: String,
     scopes: Vec<String>,
+    /// [`MINTED_TOKENS`] slot and credential digest ([[WEIR-T-0204]]).
+    cache_ids: MintedTokenIds,
 }
 
 /// Process-wide minted-token cache shared by the JWT-based schemes ([[WEIR-T-0155]] /
-/// [[WEIR-T-0156]]), keyed `<scheme>|<identity>|<scopes>` so concurrent streams — and
-/// connections sharing one key — share one token.
-static MINTED_TOKENS: std::sync::OnceLock<Mutex<std::collections::HashMap<String, CachedToken>>> =
+/// [[WEIR-T-0156]]), so concurrent streams — and connections sharing one key — share one
+/// token. Keyed by a **slot**: [`cache_key_digest`] over `(scheme, identity, scopes,
+/// endpoint)`. Each entry also holds the digest of the full credential (the slot parts
+/// plus the private key) it was minted from; a lookup with a different credential digest
+/// (a config change, or an `env:`/`file:` reference that now resolves to a new key) mints
+/// a fresh token and replaces the old one ([[WEIR-T-0204]]). Neither key nor value holds
+/// secret text other than the minted token.
+static MINTED_TOKENS: std::sync::OnceLock<Mutex<std::collections::HashMap<String, MintedToken>>> =
     std::sync::OnceLock::new();
+
+/// One [`MINTED_TOKENS`] entry: the token and the digest of the credential it came from.
+struct MintedToken {
+    credential: String,
+    token: CachedToken,
+}
+
+/// Where a provider's token lives in [`MINTED_TOKENS`] ([[WEIR-T-0204]]): `slot` is the
+/// map key (identity only), `credential` the digest of everything the token depends on
+/// (incl. the private key). Both are salted digests — never secret text.
+struct MintedTokenIds {
+    slot: String,
+    credential: String,
+}
+
+impl MintedTokenIds {
+    /// `identity` names the token (scheme first); `secret` is the key material.
+    fn new(identity: &[&str], secret: &str) -> Self {
+        let mut all = identity.to_vec();
+        all.push(secret);
+        Self {
+            slot: cache_key_digest(identity),
+            credential: cache_key_digest(&all),
+        }
+    }
+}
 
 impl GoogleSaProvider {
     pub fn new(
@@ -1002,19 +1036,24 @@ impl GoogleSaProvider {
         token_uri: String,
         scopes: Vec<String>,
     ) -> Self {
+        let scope = scopes.join(" ");
+        let cache_ids = MintedTokenIds::new(
+            &["google", &client_email, &scope, &token_uri],
+            &private_key_pem,
+        );
         Self {
             client_email,
             private_key_pem,
             token_uri,
             scopes,
+            cache_ids,
         }
     }
 
-    /// A valid bearer token — cached per `(client_email, scopes)`, re-minted when within
-    /// [`REFRESH_MARGIN`] of expiry.
+    /// A valid bearer token — cached per `(client_email, scopes, token_uri)`, re-minted
+    /// when within [`REFRESH_MARGIN`] of expiry or when the key changed ([[WEIR-T-0204]]).
     fn bearer(&self) -> Result<String, EgressDenied> {
-        let cache_key = format!("google|{}|{}", self.client_email, self.scopes.join(" "));
-        cached_bearer(&cache_key, || self.mint())
+        cached_bearer(&self.cache_ids, || self.mint())
     }
 
     /// Sign the assertion and run the JWT-bearer grant `POST` (on a dedicated thread —
@@ -1054,29 +1093,34 @@ impl GoogleSaProvider {
 }
 
 /// Serve a bearer from the process-wide [`MINTED_TOKENS`] cache, minting via `mint` when
-/// absent or within [`REFRESH_MARGIN`] of expiry. The lock is released during the mint (it
-/// may be a network call); a concurrent racer minting the same token twice is benign —
-/// last write wins.
+/// absent, within [`REFRESH_MARGIN`] of expiry, or minted from a different credential
+/// (the slot's entry is then replaced — the rotated-out token is never served,
+/// [[WEIR-T-0204]]). The lock is released during the mint (it may be a network call); a
+/// concurrent racer minting the same token twice is benign — last write wins.
 fn cached_bearer(
-    cache_key: &str,
+    ids: &MintedTokenIds,
     mint: impl FnOnce() -> Result<(String, Duration), EgressDenied>,
 ) -> Result<String, EgressDenied> {
     let cache = MINTED_TOKENS.get_or_init(Default::default);
     {
         let map = cache.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(c) = map.get(cache_key)
-            && Instant::now() + REFRESH_MARGIN < c.expires_at
+        if let Some(c) = map.get(&ids.slot)
+            && c.credential == ids.credential
+            && Instant::now() + REFRESH_MARGIN < c.token.expires_at
         {
-            return Ok(c.token.clone());
+            return Ok(c.token.token.clone());
         }
     }
     let (token, ttl) = mint()?;
     let mut map = cache.lock().unwrap_or_else(|e| e.into_inner());
     map.insert(
-        cache_key.to_string(),
-        CachedToken {
-            token: token.clone(),
-            expires_at: Instant::now() + ttl,
+        ids.slot.clone(),
+        MintedToken {
+            credential: ids.credential.clone(),
+            token: CachedToken {
+                token: token.clone(),
+                expires_at: Instant::now() + ttl,
+            },
         },
     );
     Ok(token)
@@ -1143,22 +1187,27 @@ pub struct SnowflakeKeypairProvider {
     account: String,
     user: String,
     private_key_pem: String,
+    /// [`MINTED_TOKENS`] slot and credential digest ([[WEIR-T-0204]]).
+    cache_ids: MintedTokenIds,
 }
 
 impl SnowflakeKeypairProvider {
     pub fn new(account: String, user: String, private_key_pem: String) -> Self {
+        let account = account.to_uppercase();
+        let user = user.to_uppercase();
+        let cache_ids = MintedTokenIds::new(&["snowflake", &account, &user], &private_key_pem);
         Self {
-            account: account.to_uppercase(),
-            user: user.to_uppercase(),
+            account,
+            user,
             private_key_pem,
+            cache_ids,
         }
     }
 
     /// A valid self-signed bearer — cached per `(account, user)`, re-signed when within
-    /// [`REFRESH_MARGIN`] of its 1h expiry.
+    /// [`REFRESH_MARGIN`] of its 1h expiry or when the key changed ([[WEIR-T-0204]]).
     fn bearer(&self) -> Result<String, EgressDenied> {
-        let cache_key = format!("snowflake|{}.{}", self.account, self.user);
-        cached_bearer(&cache_key, || {
+        cached_bearer(&self.cache_ids, || {
             let jwt = snowflake_jwt(
                 &self.account,
                 &self.user,
@@ -1763,6 +1812,150 @@ mod google_sa_tests {
             rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok(),
             "inside the refresh margin the second call must re-mint"
         );
+    }
+
+    /// [[WEIR-T-0204]]: a connection whose service-account key changes (same email,
+    /// scopes and endpoint) gets a freshly minted token on its next call, not the token
+    /// minted from the old key.
+    #[test]
+    fn google_sa_key_change_mints_a_fresh_token() {
+        const ROTATED_KEY_PEM: &str = include_str!("../tests/fixtures/rotated_test_key.pem");
+        let (token_url, rx) = mock_token_endpoint(r#"{"access_token":"tok","expires_in":3600}"#);
+        let make = |pem: &str| {
+            GoogleSaProvider::new(
+                "rotate-test@x.iam.gserviceaccount.com".into(),
+                pem.into(),
+                token_url.clone(),
+                vec!["s".into()],
+            )
+        };
+        let wait = || rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok();
+        make(TEST_KEY_PEM).bearer().expect("mint, old key");
+        assert!(wait(), "first call mints");
+        make(TEST_KEY_PEM).bearer().expect("cached, old key");
+        assert!(rx.try_recv().is_err(), "same key: served from the cache");
+        make(ROTATED_KEY_PEM).bearer().expect("mint, new key");
+        assert!(wait(), "a changed key must mint a fresh token");
+        make(ROTATED_KEY_PEM).bearer().expect("cached, new key");
+        assert!(rx.try_recv().is_err(), "the new token is then cached");
+    }
+}
+
+#[cfg(test)]
+mod minted_token_cache_tests {
+    //! [[WEIR-T-0204]]: the process-wide minted-token cache is keyed by digests (no secret
+    //! text) and serves a token only to the credential it was minted from.
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const KEY_A: &str = include_str!("../tests/fixtures/google_sa_test_key.pem");
+    const KEY_B: &str = include_str!("../tests/fixtures/rotated_test_key.pem");
+
+    /// The `iss` claim of a Snowflake JWT (it carries the public-key fingerprint).
+    fn iss(jwt: &str) -> String {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let claims: serde_json::Value =
+            serde_json::from_slice(&b64.decode(jwt.split('.').nth(1).unwrap()).unwrap()).unwrap();
+        claims["iss"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn a_changed_credential_mints_and_replaces_the_cached_token() {
+        let mints = AtomicUsize::new(0);
+        let mint = |tok: &'static str| {
+            mints.fetch_add(1, Ordering::SeqCst);
+            Ok((tok.to_string(), Duration::from_secs(3600)))
+        };
+        let old = MintedTokenIds::new(&["test", "t0204-unit-identity"], "old-secret");
+        let new = MintedTokenIds::new(&["test", "t0204-unit-identity"], "new-secret");
+        assert_eq!(old.slot, new.slot, "one slot per identity");
+        assert_ne!(old.credential, new.credential);
+        assert_eq!(cached_bearer(&old, || mint("t-old")).unwrap(), "t-old");
+        assert_eq!(cached_bearer(&old, || mint("unused")).unwrap(), "t-old");
+        assert_eq!(mints.load(Ordering::SeqCst), 1, "same credential: cached");
+        assert_eq!(cached_bearer(&new, || mint("t-new")).unwrap(), "t-new");
+        assert_eq!(
+            mints.load(Ordering::SeqCst),
+            2,
+            "changed credential: minted"
+        );
+        // The old token is gone, not served to the old credential either.
+        assert_eq!(cached_bearer(&old, || mint("t-old-2")).unwrap(), "t-old-2");
+        assert_eq!(mints.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn snowflake_key_change_signs_with_the_new_key() {
+        let make =
+            |pem: &str| SnowflakeKeypairProvider::new("t0204-acct".into(), "u".into(), pem.into());
+        let a = make(KEY_A).bearer().unwrap();
+        assert_eq!(make(KEY_A).bearer().unwrap(), a, "same key: cached");
+        let b = make(KEY_B).bearer().unwrap();
+        assert_ne!(
+            iss(&a),
+            iss(&b),
+            "a new key gives a JWT with the new fingerprint"
+        );
+    }
+
+    /// The run path: `env:` reference → `resolve_secret_refs` → credential → bearer. When
+    /// the variable is rotated to a new key, the next run's credential mints a new token.
+    #[test]
+    fn a_rotated_reference_mints_a_fresh_token_on_the_next_run() {
+        let var = "WEIR_T0204_ROTATED_SNOWFLAKE_KEY";
+        let cfg = serde_json::json!({
+            "auth_scheme": "snowflake_keypair_jwt",
+            "account": "t0204-ref-acct",
+            "user": "u",
+            "private_key": format!("env:{var}"),
+        })
+        .to_string();
+        let run = || {
+            let resolved = resolve_secret_refs(&cfg).expect("resolve");
+            let (cred, _) = Credential::from_auth_config(&resolved.json).expect("credential");
+            match cred {
+                Some(Credential::SnowflakeKeypairJwt(p)) => p.bearer().expect("bearer"),
+                _ => panic!("expected a snowflake credential"),
+            }
+        };
+        // SAFETY: the variable name is unique to this test.
+        unsafe { std::env::set_var(var, KEY_A) };
+        let first = run();
+        assert_eq!(run(), first, "unchanged reference: the cached token");
+        unsafe { std::env::set_var(var, KEY_B) };
+        let rotated = run();
+        assert_ne!(
+            iss(&first),
+            iss(&rotated),
+            "after rotation the token is minted from the new key"
+        );
+        unsafe { std::env::remove_var(var) };
+    }
+
+    #[test]
+    fn cache_keys_hold_no_secret_text() {
+        let p = SnowflakeKeypairProvider::new(
+            "t0204-keys-acct".into(),
+            "keys-user".into(),
+            KEY_A.into(),
+        );
+        p.bearer().unwrap();
+        let ids = &p.cache_ids;
+        let key_body = KEY_A.lines().nth(1).unwrap();
+        for digest in [&ids.slot, &ids.credential] {
+            assert_eq!(digest.len(), 64, "a hex SHA-256");
+            assert!(digest.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+        let map = MINTED_TOKENS.get().unwrap().lock().unwrap();
+        assert!(map.contains_key(&ids.slot));
+        for (k, v) in map.iter() {
+            for text in [k.as_str(), v.credential.as_str()] {
+                assert!(!text.contains(key_body), "no key material in the cache");
+                assert!(!text.contains("PRIVATE KEY"));
+                assert!(!text.to_lowercase().contains("t0204-keys-acct"));
+            }
+        }
     }
 }
 

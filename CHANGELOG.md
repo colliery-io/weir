@@ -62,6 +62,15 @@ between releases and are called out here.
   `weir-tiberius` fork (TDS 7.x in-PRELOGIN handshake).
 
 ### Fixed
+- **Security:** the host-side credential caches no longer hold secret text in
+  their keys, and a changed credential no longer reuses a cached token. The
+  connector-handle cache is keyed by a salted SHA-256 digest of the connector,
+  the stored config and the fingerprint of resolved `env:`/`file:` values, not
+  by the config JSON. Google service-account and Snowflake key-pair tokens are
+  cached per identity, together with a digest of the private key they were
+  minted from: when the key changes, by an edited config or by a rotated
+  `env:`/`file:` reference, the next run mints a new token instead of using the
+  old one until it expires.
 - **Security:** tenant ids must be safe slugs (`^[a-z0-9][a-z0-9-]{0,62}$`).
   `POST /tenants` refuses any other id (for example `../x`) with a 400, and
   every filesystem path built from a tenant id goes through the validated
