@@ -23,10 +23,16 @@ pub(crate) fn active_tenant() -> Option<String> {
         .filter(|t| !t.is_empty())
 }
 
+/// True for a data call that a switched admin re-scopes to `/tenants/{id}/…`. Auth + the
+/// tenant-admin surface itself are never re-scoped. Each re-scoped call must be listed in
+/// `tenant_routes.txt`, which the server mirrors ([[WEIR-T-0217]]; tests on both sides).
+pub(crate) fn is_tenant_scoped(url: &str) -> bool {
+    !(url.starts_with("/auth") || url.starts_with("/tenants") || url.starts_with("/platform"))
+}
+
 /// Re-scope a data call to the active tenant: a switched admin routes through `/tenants/{id}/…`.
-/// Auth + the tenant-admin surface itself are never re-scoped.
 pub(crate) fn apath(url: &str) -> String {
-    if url.starts_with("/auth") || url.starts_with("/tenants") || url.starts_with("/platform") {
+    if !is_tenant_scoped(url) {
         return url.to_string();
     }
     match active_tenant() {
@@ -138,5 +144,115 @@ pub(crate) async fn fetch_streams(plugin: &str, config: &str) -> Vec<String> {
     match req.send().await {
         Ok(r) => r.json::<Vec<String>>().await.unwrap_or_default(),
         Err(_) => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_tenant_scoped;
+    use std::collections::BTreeSet;
+    use std::path::Path;
+
+    /// `METHOD /path` with each `{param}` folded to `{}`, so `{n}` and `{name}` compare equal.
+    fn norm(method: &str, url: &str) -> String {
+        let path = url.split('?').next().unwrap_or(url);
+        let mut out = String::new();
+        let mut in_param = false;
+        for c in path.chars() {
+            match c {
+                '{' => {
+                    in_param = true;
+                    out.push_str("{}");
+                }
+                '}' => in_param = false,
+                _ if !in_param => out.push(c),
+                _ => {}
+            }
+        }
+        format!("{method} {out}")
+    }
+
+    fn listed() -> BTreeSet<String> {
+        include_str!("tenant_routes.txt")
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(|l| {
+                let (m, p) = l.split_once(' ').expect("METHOD PATH");
+                norm(m, p.trim())
+            })
+            .collect()
+    }
+
+    /// The URL literal at the start of a helper's argument (`"…"`, `format!("…")`, `&format!("…")`).
+    fn url_literal(arg: &str) -> Option<&str> {
+        let arg = arg.trim_start();
+        let arg = arg
+            .strip_prefix("&format!(")
+            .or_else(|| arg.strip_prefix("format!("))
+            .unwrap_or(arg);
+        let lit = arg.strip_prefix('"')?;
+        Some(&lit[..lit.find('"')?])
+    }
+
+    /// Every re-scoped URL literal passed to an authed request helper in the UI source.
+    fn called(dir: &Path, out: &mut BTreeSet<String>) {
+        // (call prefix, HTTP method). A turbofish helper's argument starts after its next `(`.
+        const HELPERS: [(&str, &str); 5] = [
+            ("areq_get(", "GET"),
+            ("areq_post(", "POST"),
+            ("areq_delete(", "DELETE"),
+            ("get_json::<", "GET"),
+            ("get_fetch::<", "GET"),
+        ];
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                called(&path, out);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).unwrap();
+            for (helper, method) in HELPERS {
+                for (at, _) in src.match_indices(helper) {
+                    if src[..at].ends_with("fn ") || src[..at].ends_with('"') {
+                        continue; // the helper's own definition, or this table
+                    }
+                    let mut rest = &src[at + helper.len()..];
+                    if helper.ends_with('<') {
+                        let Some(open) = rest.find('(') else { continue };
+                        rest = &rest[open + 1..];
+                    }
+                    if let Some(url) = url_literal(rest).filter(|u| is_tenant_scoped(u)) {
+                        out.insert(norm(method, url));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tenant_route_list_matches_the_calls_in_the_ui() {
+        let mut calls = BTreeSet::new();
+        called(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut calls);
+        assert!(calls.len() > 5, "the scanner found too few calls: {calls:?}");
+        let listed = listed();
+        let missing: Vec<_> = calls.difference(&listed).collect();
+        let stale: Vec<_> = listed.difference(&calls).collect();
+        assert!(
+            missing.is_empty(),
+            "UI calls not in tenant_routes.txt (add them, and mirror them on the server): {missing:?}"
+        );
+        assert!(stale.is_empty(), "tenant_routes.txt lists calls the UI no longer makes: {stale:?}");
+    }
+
+    #[test]
+    fn auth_tenants_and_platform_are_never_rescoped() {
+        assert!(!is_tenant_scoped("/auth/me"));
+        assert!(!is_tenant_scoped("/tenants/acme/keys"));
+        assert!(!is_tenant_scoped("/platform/health"));
+        assert!(is_tenant_scoped("/connections"));
     }
 }
