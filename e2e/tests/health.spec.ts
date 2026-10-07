@@ -42,6 +42,6 @@ test('schema: connection detail shows the typed schema section', async ({ page }
   await card.click();
 
   // The detail modal renders the Schema section (captured fields, or the empty state).
-  const dialog = page.getByRole('dialog', { name: 'Run detail' });
+  const dialog = page.getByRole('dialog', { name: 'Connection detail' });
   await expect(dialog.getByRole('heading', { name: 'Schema' })).toBeVisible();
 });

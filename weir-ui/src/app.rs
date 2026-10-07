@@ -7,7 +7,10 @@ use crate::fetch::{
 };
 use crate::helpers::{fmt_dur, log_color, side_config};
 use crate::models::*;
-use crate::views::{health_view, operations_view, platform_view, setup_view, SetupState, SyncForm};
+use crate::views::{
+    health_view, operations_view, platform_view, setup_view, RunDetailModal, RunFeed, SetupState,
+    SyncForm,
+};
 use aurora_leptos::components::*;
 use aurora_leptos::theme::{provide_theme, ThemeToggle};
 use aurora_leptos::tokens::token;
@@ -94,6 +97,15 @@ pub(crate) fn App() -> impl IntoView {
 
     let connections = RwSignal::new(Vec::<Connection>::new());
     let runs = RwSignal::new(Vec::<RunRow>::new());
+    // One run's detail ([[WEIR-T-0219]]): a run-feed row opens it by id.
+    let run_open = RwSignal::new(false);
+    let run_sel = RwSignal::new(Option::<i64>::None);
+    let open_run = Callback::new(move |id: i64| {
+        run_sel.set(Some(id));
+        run_open.set(true);
+    });
+    // The run feed's paging (live first page + older pages loaded on demand).
+    let feed = RunFeed::new(runs, open_run);
     // Aurora toasts: one queue at the root, one ToastStack in the view (6s, click to dismiss).
     let toaster = provide_toaster();
     let flash = move |ok: bool, msg: String| {
@@ -258,7 +270,7 @@ pub(crate) fn App() -> impl IntoView {
                 Fetched::Network => api_error.set(Some("server unreachable — retrying".into())),
             }
             if let Fetched::Ok(v) = get_fetch::<Vec<RunRow>>("/runs".into()).await {
-                runs.set(v);
+                feed.set_live(v);
             }
             if let Fetched::Ok(v) = get_fetch::<Vec<ConnHealth>>("/overview".into()).await {
                 health.set(v);
@@ -287,7 +299,7 @@ pub(crate) fn App() -> impl IntoView {
         view.set("Health".to_string());
     });
 
-    // Run-detail modal.
+    // Connection-detail modal (a card or health tile opens it; one run's detail is RunDetailModal).
     let selected = RwSignal::new(String::new());
     let detail_open = RwSignal::new(false);
     let detail_logs = RwSignal::new(Vec::<LogRow>::new());
@@ -341,7 +353,7 @@ pub(crate) fn App() -> impl IntoView {
                     flash(true, format!("Started {n}"));
                     // Refetch immediately so the pill flips without waiting for the 800ms poll.
                     connections.set(get_json::<Vec<Connection>>("/connections".into()).await);
-                    runs.set(get_json::<Vec<RunRow>>("/runs".into()).await);
+                    feed.set_live(get_json::<Vec<RunRow>>("/runs".into()).await);
                 }
                 Err(e) => flash(false, format!("Couldn't start {n}: {e}")),
             }
@@ -354,7 +366,7 @@ pub(crate) fn App() -> impl IntoView {
                     flash(true, format!("Stopped {n}"));
                     // Refetch immediately so the pill flips without waiting for the 800ms poll.
                     connections.set(get_json::<Vec<Connection>>("/connections".into()).await);
-                    runs.set(get_json::<Vec<RunRow>>("/runs".into()).await);
+                    feed.set_live(get_json::<Vec<RunRow>>("/runs".into()).await);
                 }
                 Err(e) => flash(false, format!("Couldn't stop {n}: {e}")),
             }
@@ -604,14 +616,14 @@ pub(crate) fn App() -> impl IntoView {
                             }),
                             "Health" => health_view(health, open_detail),
                             "Platform" => platform_view(platform, drill_tenant),
-                            _ => operations_view(connections, runs, ConnActions {
+                            _ => operations_view(connections, runs, feed, ConnActions {
                                 on_open: open_detail, on_run: run_conn, on_delete: ask_delete,
                                 on_start: start_conn, on_stop: stop_conn,
                             }),
                         }}
                     </div>
 
-                    <Modal open=detail_open title="Run detail" size="lg">
+                    <Modal open=detail_open title="Connection detail" size="lg">
                         <Text bold=true mono=true>{move || selected.get()}</Text>
                         // Lineage ([[WEIR-T-0101]]): source · stream → dest + rows/duration, from the run data.
                         <SectionLabel label="Lineage" divider=true/>
@@ -698,6 +710,8 @@ pub(crate) fn App() -> impl IntoView {
                                 .map(|l| LogLine::new(l.message).level_color(l.level.clone(), log_color(&l.level)))
                                 .collect::<Vec<_>>())/>
                     </Modal>
+
+                    <RunDetailModal open=run_open run_id=run_sel on_connection=open_detail/>
 
                     // Tenants admin ([[WEIR-T-0096]]) — platform-admin CRUD tenants + their keys.
                     <Modal open=show_tenants title="Tenants" size="lg" close_on_scrim=false on_close=Callback::new(move |_| minted_key.set(None))>

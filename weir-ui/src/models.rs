@@ -79,6 +79,43 @@ pub(crate) struct PlatformHealth {
     pub(crate) total_queue_depth: i64,
 }
 
+/// One run in full ([[WEIR-T-0189]]) from `GET /runs/{id}`. `logs` is the run's
+/// connection log tail (run logs are connection-scoped, not per run).
+#[derive(serde::Deserialize, Clone, PartialEq, Default)]
+pub(crate) struct RunDetail {
+    pub(crate) id: i64,
+    pub(crate) connection: String,
+    #[serde(default)]
+    pub(crate) stream: String,
+    pub(crate) state: String,
+    #[serde(default)]
+    pub(crate) attempt: i64,
+    #[serde(default)]
+    pub(crate) rows_written: i64,
+    #[serde(default)]
+    pub(crate) dead_lettered: i64,
+    #[serde(default)]
+    pub(crate) started_at: Option<i64>,
+    #[serde(default)]
+    pub(crate) finished_at: Option<i64>,
+    #[serde(default)]
+    pub(crate) duration_ms: Option<i64>,
+    #[serde(default)]
+    pub(crate) error: Option<String>,
+    #[serde(default)]
+    pub(crate) logs: Vec<LogRow>,
+}
+
+/// A connection's committed state from `GET /connections/{name}/state`: the resume
+/// cursor and committed chunk count. Connection-level — the API has no per-run cursor.
+#[derive(serde::Deserialize, Clone, PartialEq, Default)]
+pub(crate) struct ConnState {
+    #[serde(default)]
+    pub(crate) cursor: Option<String>,
+    #[serde(default)]
+    pub(crate) chunks: i64,
+}
+
 #[derive(serde::Deserialize, Clone, PartialEq)]
 pub(crate) struct LogRow {
     pub(crate) level: String,
