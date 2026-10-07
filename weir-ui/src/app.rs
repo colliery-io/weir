@@ -1,11 +1,11 @@
 //! The app shell: auth gate, shared state + actions, view routing and the modals.
 
-use crate::components::{Brand, ConnActions};
+use crate::components::{Brand, ConnActions, SideConfig};
 use crate::fetch::{
     active_tenant, areq_delete, areq_get, areq_post, check, fetch_props, fetch_streams, get_fetch,
     get_json, Fetched,
 };
-use crate::helpers::{fmt_dur, log_color};
+use crate::helpers::{fmt_dur, log_color, side_config};
 use crate::models::*;
 use crate::views::{health_view, operations_view, platform_view, setup_view, SetupState};
 use aurora_leptos::components::*;
@@ -203,7 +203,6 @@ pub(crate) fn App() -> impl IntoView {
     let src = RwSignal::new(String::new());
     let dst = RwSignal::new(String::new());
     let stream = RwSignal::new(String::new());
-    let config = RwSignal::new("{}".to_string());
     let every = RwSignal::new(String::new());
     // F1 execution mode ([[WEIR-I-0035]]): run_once (default) | resident.
     let exec_mode = RwSignal::new("run_once".to_string());
@@ -212,15 +211,24 @@ pub(crate) fn App() -> impl IntoView {
     let add_manifest = RwSignal::new(String::new());
     let add_path = RwSignal::new(String::new());
     let preview = RwSignal::new(Option::<PreviewReport>::None);
-    // Schema fields + streams for the selected source (refetch when source changes).
-    let props = RwSignal::new(Vec::<Prop>::new());
+    // Per-side config ([[WEIR-T-0214]]): each side's contract is refetched when its
+    // connector changes; the source's streams are rediscovered too.
+    let src_cfg = SideConfig::new();
+    let dst_cfg = SideConfig::new();
     let streams = RwSignal::new(Vec::<String>::new());
     Effect::new(move |_| {
         let s = src.get();
-        let cfg = config.get_untracked();
+        src_cfg.reset();
         leptos::task::spawn_local(async move {
-            props.set(fetch_props(&s).await);
-            streams.set(fetch_streams(&s, &cfg).await);
+            src_cfg.props.set(fetch_props(&s).await);
+            streams.set(fetch_streams(&s, "{}").await);
+        });
+    });
+    Effect::new(move |_| {
+        let d = dst.get();
+        dst_cfg.reset();
+        leptos::task::spawn_local(async move {
+            dst_cfg.props.set(fetch_props(&d).await);
         });
     });
 
@@ -437,14 +445,13 @@ pub(crate) fn App() -> impl IntoView {
             flash(false, "Name is required".into());
             return;
         }
-        let cfg_str = config.get();
-        let config_val: serde_json::Value = if cfg_str.trim().is_empty() {
-            serde_json::json!({})
-        } else {
-            match serde_json::from_str(&cfg_str) {
-                Ok(v) => v,
-                Err(e) => { flash(false, format!("Config JSON: {e}")); return; }
-            }
+        // Each side: form values + the advanced override, required fields checked here.
+        let side = |label: &str, c: SideConfig| {
+            side_config(label, &c.props.get_untracked(), &c.form.get_untracked(), &c.advanced.get_untracked())
+        };
+        let (source_config, dest_config) = match (side("Source", src_cfg), side("Destination", dst_cfg)) {
+            (Ok(s), Ok(d)) => (s, d),
+            (Err(e), _) | (_, Err(e)) => { flash(false, e); return; }
         };
         let every_secs = match every.get().trim() {
             "" => None,
@@ -456,7 +463,7 @@ pub(crate) fn App() -> impl IntoView {
         let saved = name.get();
         let body = NewConnection {
             name: name.get(), source: src.get(), dest: dst.get(), stream: stream.get(),
-            config: config_val, every_secs, cron: None,
+            source_config, dest_config, every_secs, cron: None,
             execution_mode: exec_mode.get(),
         };
         leptos::task::spawn_local(async move {
@@ -586,8 +593,8 @@ pub(crate) fn App() -> impl IntoView {
                         })}
                         {move || match view.get().as_str() {
                             "Setup" => setup_view(SetupState {
-                                catalog, available, props, streams, add_pkg, add_manifest, add_path, preview,
-                                name, src, dst, stream, config, every, exec_mode,
+                                catalog, available, src_cfg, dst_cfg, streams, add_pkg, add_manifest, add_path, preview,
+                                name, src, dst, stream, every, exec_mode,
                                 onboard_pick: Callback::new(move |_| onboard_pick()),
                                 do_preview: Callback::new(move |_| do_preview()),
                                 onboard_byo: Callback::new(move |_| onboard_byo()),
