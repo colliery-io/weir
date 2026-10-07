@@ -1,8 +1,8 @@
 //! Setup: onboard connectors and wire a connection.
 
-use crate::components::config_field;
+use crate::components::{config_side, SideConfig};
 use crate::helpers::{friendly, is_onboarded};
-use crate::models::{AvailableItem, CatalogItem, PreviewReport, Prop};
+use crate::models::{AvailableItem, CatalogItem, PreviewReport};
 use aurora_leptos::components::*;
 use aurora_leptos::tokens::token;
 use leptos::prelude::*;
@@ -12,7 +12,8 @@ use std::collections::HashSet;
 pub(crate) struct SetupState {
     pub(crate) catalog: RwSignal<Vec<CatalogItem>>,
     pub(crate) available: RwSignal<Vec<AvailableItem>>,
-    pub(crate) props: RwSignal<Vec<Prop>>,
+    pub(crate) src_cfg: SideConfig,
+    pub(crate) dst_cfg: SideConfig,
     pub(crate) streams: RwSignal<Vec<String>>,
     pub(crate) add_pkg: RwSignal<String>,
     pub(crate) add_manifest: RwSignal<String>,
@@ -22,7 +23,6 @@ pub(crate) struct SetupState {
     pub(crate) src: RwSignal<String>,
     pub(crate) dst: RwSignal<String>,
     pub(crate) stream: RwSignal<String>,
-    pub(crate) config: RwSignal<String>,
     pub(crate) every: RwSignal<String>,
     pub(crate) exec_mode: RwSignal<String>,
     pub(crate) onboard_pick: Callback<()>,
@@ -33,8 +33,8 @@ pub(crate) struct SetupState {
 
 pub(crate) fn setup_view(s: SetupState) -> AnyView {
     let SetupState {
-        catalog, available, props, streams, add_pkg, add_manifest, add_path, preview,
-        name, src, dst, stream, config, every, exec_mode,
+        catalog, available, src_cfg, dst_cfg, streams, add_pkg, add_manifest, add_path, preview,
+        name, src, dst, stream, every, exec_mode,
         onboard_pick, do_preview, onboard_byo, save_conn,
     } = s;
     // Picker options (raw_name, friendly), onboarded dropped.
@@ -58,7 +58,6 @@ pub(crate) fn setup_view(s: SetupState) -> AnyView {
         .filter(|c| c.roles.iter().any(|r| r == "Destination" || r == "ReverseEtl"))
         .map(versioned)
         .collect();
-    let prop_list = props.get();
     let stream_list = streams.get();
     let modes = vec![
         ("run_once".to_string(), "run once · scheduled / batch".to_string()),
@@ -117,13 +116,9 @@ pub(crate) fn setup_view(s: SetupState) -> AnyView {
                     }}
                 </SimpleGrid>
                 <Select label="Execution mode" option_pairs=modes value=exec_mode/>
-                {(!prop_list.is_empty()).then(|| view! {
-                    <SectionLabel label=format!("config · {} contract", src.get_untracked()) divider=true/>
-                    <SimpleGrid cols=2>
-                        {prop_list.into_iter().map(|p| config_field(p, config)).collect_view()}
-                    </SimpleGrid>
-                })}
-                <Textarea label="Config (JSON)" rows=3 mono=true value=config/>
+                // Per-side config ([[WEIR-T-0214]]): sent as `source_config` / `dest_config`.
+                {config_side("Source", src.get_untracked(), src_cfg)}
+                {config_side("Destination", dst.get_untracked(), dst_cfg)}
                 <div><Button on_click=save_conn>"Save connection"</Button></div>
             </div>
         </Panel>

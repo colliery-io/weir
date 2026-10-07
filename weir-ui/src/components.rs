@@ -17,24 +17,93 @@ pub(crate) fn Brand() -> impl IntoView {
     }
 }
 
-/// One field of a connector's config contract, bound both ways to the config JSON.
-pub(crate) fn config_field(p: Prop, config: RwSignal<String>) -> impl IntoView {
-    let field = RwSignal::new(cfg_get(&config.get_untracked(), &p.key));
-    let (k_sync, k_set, kind_sync, kind_set) = (p.key.clone(), p.key.clone(), p.kind.clone(), p.kind.clone());
-    // The JSON textarea can change the config too: follow it, unless the config already
-    // holds what this field's text means (so typing "1." is not rewritten to "1").
-    Effect::new(move |_| {
-        let now = cfg_get(&config.get(), &k_sync);
-        let mine = field.get_untracked();
-        if now != cfg_get(&cfg_set("{}", &k_sync, &mine, &kind_sync), &k_sync) {
-            field.set(now);
+/// One side (source or destination) of the connection form's config ([[WEIR-T-0214]]):
+/// the connector's contract, the values its fields hold, and an "Advanced JSON"
+/// override that is merged over them on save.
+#[derive(Clone, Copy)]
+pub(crate) struct SideConfig {
+    pub(crate) props: RwSignal<Vec<Prop>>,
+    /// The form values, as a JSON object string.
+    pub(crate) form: RwSignal<String>,
+    pub(crate) advanced: RwSignal<String>,
+    pub(crate) show_advanced: RwSignal<bool>,
+}
+
+impl SideConfig {
+    pub(crate) fn new() -> Self {
+        Self {
+            props: RwSignal::new(Vec::new()),
+            form: RwSignal::new("{}".to_string()),
+            advanced: RwSignal::new(String::new()),
+            show_advanced: RwSignal::new(false),
         }
-    });
-    let on_input = Callback::new(move |v: String| {
-        config.set(cfg_set(&config.get_untracked(), &k_set, &v, &kind_set));
-    });
-    let input_type = if p.secret { "password" } else { "text" };
-    view! { <TextInput label=p.key placeholder=p.kind value=field input_type=input_type on_input=on_input mono=true/> }
+    }
+
+    /// A different connector: its contract replaces the old one, and the old values go.
+    pub(crate) fn reset(&self) {
+        self.form.set("{}".to_string());
+        self.advanced.set(String::new());
+    }
+}
+
+/// One field of a connector's config contract, bound to the side's form JSON.
+/// String and number fields are text inputs, secret fields password inputs, `enum`
+/// fields selects, and booleans switches. A required field has a `*` on its label.
+pub(crate) fn config_field(p: Prop, form: RwSignal<String>) -> AnyView {
+    let label = if p.required { format!("{} *", p.key) } else { p.key.clone() };
+    let (key, kind) = (p.key.clone(), p.kind.clone());
+    let set = move |v: &str| form.set(cfg_set(&form.get_untracked(), &key, v, &kind));
+    let now = cfg_get(&form.get_untracked(), &p.key);
+    if p.kind == "boolean" {
+        let checked = RwSignal::new(now == "true");
+        let on_change = Callback::new(move |on: bool| set(if on { "true" } else { "false" }));
+        return view! { <Switch checked=checked label=label on_change=on_change/> }.into_any();
+    }
+    let field = RwSignal::new(now);
+    let on_input = Callback::new(move |v: String| set(&v));
+    if !p.options.is_empty() {
+        return view! {
+            <Select label=label placeholder="—" options=p.options value=field required=p.required on_change=on_input/>
+        }
+        .into_any();
+    }
+    if p.secret {
+        return view! {
+            <PasswordInput label=label value=field required=p.required on_input=on_input autocomplete="new-password"/>
+        }
+        .into_any();
+    }
+    view! {
+        <TextInput label=label placeholder=p.kind value=field required=p.required on_input=on_input mono=true/>
+    }
+    .into_any()
+}
+
+/// One side of the connection form: a field per contract property, then a switch
+/// that shows the "Advanced JSON" override.
+pub(crate) fn config_side(side: &'static str, connector: String, cfg: SideConfig) -> impl IntoView {
+    let props = cfg.props.get();
+    let caption = if connector.is_empty() { side.to_lowercase() } else { format!("{} · {connector}", side.to_lowercase()) };
+    let testid = format!("config-{}", side.to_lowercase());
+    view! {
+        <div class="weir-form" data-testid=testid>
+            <SectionLabel label=format!("config · {caption}") divider=true/>
+            {if props.is_empty() {
+                view! { <Text size="xs" dimmed=true>"No config contract: use Advanced JSON."</Text> }.into_any()
+            } else {
+                view! {
+                    <SimpleGrid cols=2>
+                        {props.into_iter().map(|p| config_field(p, cfg.form)).collect_view()}
+                    </SimpleGrid>
+                }.into_any()
+            }}
+            <Switch checked=cfg.show_advanced label=format!("{side} advanced JSON")/>
+            {move || cfg.show_advanced.get().then(|| view! {
+                <Textarea label=format!("{side} advanced JSON · merged over the fields") rows=3 mono=true
+                    placeholder="{}" value=cfg.advanced/>
+            })}
+        </div>
+    }
 }
 
 /// What a connection card can do.
