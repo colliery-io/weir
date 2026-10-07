@@ -197,6 +197,87 @@ pub(crate) fn side_config(
     Ok(serde_json::Value::Object(obj))
 }
 
+/// What the connection form holds for the sync/write modes and the schedule
+/// ([[WEIR-T-0215]]), as the user typed it.
+pub(crate) struct ModeInput<'a> {
+    pub(crate) sync_mode: &'a str,
+    pub(crate) write_mode: &'a str,
+    /// Comma-separated.
+    pub(crate) business_keys: &'a str,
+    pub(crate) cursor_field: &'a str,
+    /// `interval` (every N seconds) or `cron`.
+    pub(crate) schedule: &'a str,
+    pub(crate) every: &'a str,
+    pub(crate) cron: &'a str,
+}
+
+/// The mode and schedule fields of a `ConnectionDto`, checked like the server checks them.
+#[derive(Debug, PartialEq)]
+pub(crate) struct ModeFields {
+    pub(crate) sync_mode: String,
+    pub(crate) write_mode: String,
+    pub(crate) business_keys: Vec<String>,
+    pub(crate) cursor_field: Option<String>,
+    pub(crate) every_secs: Option<f64>,
+    pub(crate) cron: Option<String>,
+}
+
+/// Check the form's modes and schedule, and build the fields to send. A cursor field is
+/// sent only for `incremental`, business keys only for `upsert`, and at most one of
+/// `every_secs` / `cron` (the one the schedule toggle picks; blank = no schedule).
+pub(crate) fn mode_fields(m: &ModeInput) -> Result<ModeFields, String> {
+    let cursor = m.cursor_field.trim();
+    let cursor_field = match m.sync_mode {
+        "full_refresh" | "cdc" => None,
+        "incremental" if cursor.is_empty() => {
+            return Err("Incremental sync needs a cursor field".into());
+        }
+        "incremental" => Some(cursor.to_string()),
+        other => return Err(format!("Unknown sync mode `{other}`")),
+    };
+    let business_keys: Vec<String> = match m.write_mode {
+        "append" | "overwrite" => Vec::new(),
+        "upsert" => m
+            .business_keys
+            .split(',')
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+            .map(String::from)
+            .collect(),
+        other => return Err(format!("Unknown write mode `{other}`")),
+    };
+    if m.write_mode == "upsert" && business_keys.is_empty() {
+        return Err("Upsert needs at least one business key".into());
+    }
+    let (mut every_secs, mut cron) = (None, None);
+    if m.schedule == "cron" {
+        let expr = m.cron.split_whitespace().collect::<Vec<_>>();
+        match expr.len() {
+            0 => {}
+            6 | 7 => cron = Some(expr.join(" ")),
+            _ => {
+                return Err("Cron needs 6 or 7 fields, seconds first (e.g. 0 0 * * * *)".into());
+            }
+        }
+    } else {
+        match m.every.trim() {
+            "" => {}
+            t => match t.parse::<f64>() {
+                Ok(n) if n > 0.0 && n.is_finite() => every_secs = Some(n),
+                _ => return Err("Every must be a number of seconds above 0".into()),
+            },
+        }
+    }
+    Ok(ModeFields {
+        sync_mode: m.sync_mode.to_string(),
+        write_mode: m.write_mode.to_string(),
+        business_keys,
+        cursor_field,
+        every_secs,
+        cron,
+    })
+}
+
 /// Log level → an Aurora hue token.
 pub(crate) fn log_color(level: &str) -> &'static str {
     match level.to_ascii_lowercase().as_str() {
@@ -282,5 +363,83 @@ mod tests {
         assert!(side_config("Source", &props, "{}", "[1]").unwrap_err().contains("must be an object"));
         // No contract: whatever the form and override hold goes through.
         assert_eq!(side_config("Source", &[], "{}", "").unwrap(), serde_json::json!({}));
+    }
+
+    fn input() -> ModeInput<'static> {
+        ModeInput {
+            sync_mode: "full_refresh",
+            write_mode: "append",
+            business_keys: "",
+            cursor_field: "",
+            schedule: "interval",
+            every: "",
+            cron: "",
+        }
+    }
+
+    #[test]
+    fn mode_fields_defaults_send_no_keys_cursor_or_schedule() {
+        let f = mode_fields(&input()).unwrap();
+        assert_eq!(f.sync_mode, "full_refresh");
+        assert_eq!(f.write_mode, "append");
+        assert!(f.business_keys.is_empty() && f.cursor_field.is_none());
+        assert!(f.every_secs.is_none() && f.cron.is_none());
+    }
+
+    #[test]
+    fn mode_fields_incremental_upsert_cron() {
+        let f = mode_fields(&ModeInput {
+            sync_mode: "incremental",
+            write_mode: "upsert",
+            business_keys: " id, region ,,",
+            cursor_field: " updated_at ",
+            schedule: "cron",
+            every: "60", // the hidden interval is not sent
+            cron: "  0 0 3  * * * ",
+        })
+        .unwrap();
+        assert_eq!(f.cursor_field.as_deref(), Some("updated_at"));
+        assert_eq!(f.business_keys, vec!["id", "region"]);
+        assert_eq!(f.cron.as_deref(), Some("0 0 3 * * *"));
+        assert_eq!(f.every_secs, None);
+    }
+
+    #[test]
+    fn mode_fields_only_send_what_the_mode_uses() {
+        // A cursor typed and then left behind by switching to full refresh is dropped,
+        // and so are keys under append; the interval wins over a hidden cron.
+        let f = mode_fields(&ModeInput {
+            business_keys: "id",
+            cursor_field: "ts",
+            every: "30",
+            cron: "0 0 * * * *",
+            ..input()
+        })
+        .unwrap();
+        assert_eq!((f.cursor_field, f.business_keys.len()), (None, 0));
+        assert_eq!((f.every_secs, f.cron), (Some(30.0), None));
+        let cdc = ModeInput { sync_mode: "cdc", cursor_field: "ts", ..input() };
+        assert!(mode_fields(&cdc).unwrap().cursor_field.is_none());
+    }
+
+    #[test]
+    fn mode_fields_reject_what_the_server_rejects() {
+        let err = |m: ModeInput| mode_fields(&m).unwrap_err();
+        assert_eq!(
+            err(ModeInput { sync_mode: "incremental", ..input() }),
+            "Incremental sync needs a cursor field"
+        );
+        assert_eq!(
+            err(ModeInput { write_mode: "upsert", business_keys: " , ", ..input() }),
+            "Upsert needs at least one business key"
+        );
+        assert!(err(ModeInput { sync_mode: "nope", ..input() }).contains("Unknown sync mode"));
+        assert!(err(ModeInput { write_mode: "merge", ..input() }).contains("Unknown write mode"));
+        let five = ModeInput { schedule: "cron", cron: "0 * * * *", ..input() };
+        assert!(err(five).starts_with("Cron needs 6 or 7 fields"));
+        assert!(err(ModeInput { every: "soon", ..input() }).starts_with("Every must be"));
+        assert!(err(ModeInput { every: "0", ..input() }).starts_with("Every must be"));
+        // A blank cron is no schedule, not an error.
+        assert!(mode_fields(&ModeInput { schedule: "cron", ..input() }).unwrap().cron.is_none());
     }
 }
