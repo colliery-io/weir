@@ -154,8 +154,11 @@ impl ConnectorRef {
                 // injected by the egress policy and the guest receives only the
                 // **sanitized** config — no api-key / OAuth / session secret crosses
                 // into the sandbox. `allow_all` hosts (demo default); tighten to
-                // per-connection allow-lists later.
-                let (credential, guest_json) = Credential::from_auth_config(&config.json);
+                // per-connection allow-lists later. An unknown `auth_scheme` (an old
+                // row from before create-time validation, [[WEIR-T-0203]]) fails the
+                // run here: its config is never passed through to the guest.
+                let (credential, guest_json) = Credential::from_auth_config(&config.json)
+                    .map_err(|e| ExecutorError::Resolve(e.to_string()))?;
                 let guest_config = Config { json: guest_json };
                 let policy = match credential {
                     Some(c) => HostAllowList::allow_all().with_credential(c),

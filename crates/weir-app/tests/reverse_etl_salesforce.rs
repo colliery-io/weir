@@ -151,7 +151,8 @@ fn salesforce_manifest_upserts_with_oauth_refresh() {
     dest_cfg["client_secret"] = serde_json::Value::String("shhh-secret".into());
 
     // Host-side split: the OAuth2 credential is built + the secrets stripped from the guest cfg.
-    let (credential, guest_cfg) = Credential::from_auth_config(&dest_cfg.to_string());
+    let (credential, guest_cfg) =
+        Credential::from_auth_config(&dest_cfg.to_string()).expect("known auth scheme");
     assert!(credential.is_some(), "OAuth2 credential built host-side");
     assert!(
         !guest_cfg.contains("shhh-secret"),

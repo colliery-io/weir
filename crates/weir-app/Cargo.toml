@@ -21,6 +21,9 @@ weir-connector = { path = "../weir-connector", features = ["host"] }
 # map it onto the shared declarative runtime (rest) config.
 weir-importer = { path = "../weir-importer" }
 weir-manifest = { path = "../weir-manifest" }
+# The one list of known auth schemes ([[WEIR-T-0203]]): connection create
+# validates against the same definition the host-side credential split uses.
+weir-runtime = { path = "../weir-runtime" }
 serde_yaml = "0.9"
 diesel = "2.3"
 # Control-plane auth ([[WEIR-A-0008]] / [[WEIR-I-0017]], mirroring cloacina): UUID ids +
@@ -40,8 +43,6 @@ toml = "0.8"
 
 [dev-dependencies]
 weir-wasm-testkit = { path = "../weir-wasm-testkit" }
-# Reverse-ETL wire tests ([[WEIR-T-0074]]): load wasm guests with a host egress policy.
-weir-runtime = { path = "../weir-runtime" }
 tempfile = "3"
 # Drive the streaming read in the live snowflake read-back ([[WEIR-T-0157]]).
 futures = "0.3"
