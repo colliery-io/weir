@@ -11,8 +11,8 @@ between releases and are called out here.
   carries `started_at` and `finished_at` — RFC 3339 UTC with millisecond
   precision (`2026-10-07T09:25:01.123Z`), `null` until the run starts / while it
   is in flight (WEIR-T-0224). Additive under WEIR-A-0006: existing fields are
-  unchanged. `GET /runs/{id}` keeps its epoch-millisecond timestamps. The UI run
-  feed shows a "started" column (relative time, UTC on hover).
+  unchanged. The UI run feed shows a "started" column (relative time, UTC on
+  hover).
 - Runs API: `GET /runs` takes `?limit=` (default 50, max 500) and `?before=<id>`
   for cursor pagination (pass the smallest `id` of the previous page to walk
   history), and `GET /runs/{id}` returns one run in full — stream, timestamps,
@@ -33,6 +33,12 @@ between releases and are called out here.
   and when to use references (WEIR-T-0205).
 
 ### Changed
+- **Breaking (v0-unstable, WEIR-A-0006):** `GET /runs/{id}` (and the admin
+  mirror `/tenants/{id}/runs/{run_id}`) now gives `started_at` and `finished_at`
+  as RFC 3339 UTC strings with millisecond precision
+  (`2026-10-07T09:25:01.123Z`), `null` while unset — the same form and the same
+  values as the `GET /runs` feed rows. Before, these fields were epoch
+  milliseconds (integers). `duration_ms` is unchanged (WEIR-T-0224).
 - **Breaking (v0-unstable, WEIR-A-0006):** the connection API no longer returns
   secret values. `GET /connections`, `GET /connections/{name}` and the admin
   mirrors under `/tenants/{id}/connections` give the sentinel
