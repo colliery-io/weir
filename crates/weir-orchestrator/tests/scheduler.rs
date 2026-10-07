@@ -599,6 +599,8 @@ async fn fleet_reclaims_stranded_resident_with_no_due_work() {
         .claim("ghost", "default", Duration::from_millis(20))
         .unwrap()
         .expect("ghost claims the resident unit");
+    // The sleep is a lower bound (it never returns early), so the 20 ms lease has
+    // expired once it returns, however slow the runner is.
     tokio::time::sleep(Duration::from_millis(40)).await;
     assert_eq!(
         relay.state(id).unwrap().as_deref(),
@@ -633,6 +635,15 @@ async fn fleet_reclaims_stranded_resident_with_no_due_work() {
     let fleet = Fleet::new(relay.clone(), move || rec.clone(), WorkerConfig::default());
     fleet.run_until_idle().await.unwrap();
 
+    // The fleet runs a resident unit in a DETACHED task ([[WEIR-T-0146]]), so
+    // `run_until_idle` can return before that task is first polled: when the
+    // last claim's `spawn_blocking` finishes before its handle is polled, the drive
+    // never yields after the spawn ([[WEIR-T-0223]]). Yield-poll until the re-run is
+    // observed, with a bounded deadline.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while seen.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     assert_eq!(
         seen.lock().unwrap().as_slice(),
         &[id],
