@@ -7,7 +7,7 @@ use crate::fetch::{
 };
 use crate::helpers::{fmt_dur, log_color, side_config};
 use crate::models::*;
-use crate::views::{health_view, operations_view, platform_view, setup_view, SetupState};
+use crate::views::{health_view, operations_view, platform_view, setup_view, SetupState, SyncForm};
 use aurora_leptos::components::*;
 use aurora_leptos::theme::{provide_theme, ThemeToggle};
 use aurora_leptos::tokens::token;
@@ -203,7 +203,9 @@ pub(crate) fn App() -> impl IntoView {
     let src = RwSignal::new(String::new());
     let dst = RwSignal::new(String::new());
     let stream = RwSignal::new(String::new());
-    let every = RwSignal::new(String::new());
+    // Sync/write modes + schedule ([[WEIR-T-0215]]).
+    let sync = SyncForm::new();
+    sync.watch_schema(name, connections);
     // F1 execution mode ([[WEIR-I-0035]]): run_once (default) | resident.
     let exec_mode = RwSignal::new("run_once".to_string());
     // Onboarding state.
@@ -453,17 +455,17 @@ pub(crate) fn App() -> impl IntoView {
             (Ok(s), Ok(d)) => (s, d),
             (Err(e), _) | (_, Err(e)) => { flash(false, e); return; }
         };
-        let every_secs = match every.get().trim() {
-            "" => None,
-            t => match t.parse::<f64>() {
-                Ok(n) => Some(n),
-                Err(_) => { flash(false, "Every must be a number of seconds".into()); return; }
-            },
+        let modes = match sync.fields() {
+            Ok(m) => m,
+            Err(e) => { flash(false, e); return; }
         };
         let saved = name.get();
         let body = NewConnection {
             name: name.get(), source: src.get(), dest: dst.get(), stream: stream.get(),
-            source_config, dest_config, every_secs, cron: None,
+            source_config, dest_config,
+            every_secs: modes.every_secs, cron: modes.cron,
+            sync_mode: modes.sync_mode, write_mode: modes.write_mode,
+            business_keys: modes.business_keys, cursor_field: modes.cursor_field,
             execution_mode: exec_mode.get(),
         };
         leptos::task::spawn_local(async move {
@@ -594,7 +596,7 @@ pub(crate) fn App() -> impl IntoView {
                         {move || match view.get().as_str() {
                             "Setup" => setup_view(SetupState {
                                 catalog, available, src_cfg, dst_cfg, streams, add_pkg, add_manifest, add_path, preview,
-                                name, src, dst, stream, every, exec_mode,
+                                name, src, dst, stream, sync, exec_mode,
                                 onboard_pick: Callback::new(move |_| onboard_pick()),
                                 do_preview: Callback::new(move |_| do_preview()),
                                 onboard_byo: Callback::new(move |_| onboard_byo()),
