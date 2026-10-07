@@ -128,10 +128,12 @@ pub(crate) struct RunDetail {
     pub(crate) rows_written: i64,
     #[serde(default)]
     pub(crate) dead_lettered: i64,
+    /// RFC 3339 UTC, like the feed rows ([[WEIR-T-0224]]); `None` until the run starts.
     #[serde(default)]
-    pub(crate) started_at: Option<i64>,
+    pub(crate) started_at: Option<String>,
+    /// RFC 3339 UTC; `None` while in flight.
     #[serde(default)]
-    pub(crate) finished_at: Option<i64>,
+    pub(crate) finished_at: Option<String>,
     #[serde(default)]
     pub(crate) duration_ms: Option<i64>,
     #[serde(default)]

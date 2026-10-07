@@ -23,8 +23,9 @@ pub use weir_connector::{Field, FieldType, StreamSchema};
 use weir_engine::Store;
 pub use weir_engine::{DeadLetterRecord, LogRecord};
 
-/// One run in full ([[WEIR-T-0189]]): the feed fields plus `stream`, the raw
-/// timestamps, and a recent run-log tail for the run's connection.
+/// One run in full ([[WEIR-T-0189]]): the feed fields plus `stream` and a recent
+/// run-log tail for the run's connection. Timestamps are RFC 3339 UTC with
+/// millisecond precision, the same as the feed rows ([[WEIR-T-0224]]).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RunDetail {
     pub id: i64,
@@ -34,8 +35,10 @@ pub struct RunDetail {
     pub attempt: i64,
     pub rows_written: i64,
     pub dead_lettered: i64,
-    pub started_at: Option<i64>,
-    pub finished_at: Option<i64>,
+    /// When the run started, RFC 3339 UTC (`2026-10-07T09:25:01.123Z`); `None` until it starts.
+    pub started_at: Option<String>,
+    /// When the run finished, RFC 3339 UTC; `None` while in flight.
+    pub finished_at: Option<String>,
     /// Wall-clock duration in ms once finished; `None` while in flight.
     pub duration_ms: Option<i64>,
     /// Why the run failed (the connector/engine error), if it did.
@@ -1131,7 +1134,7 @@ impl App {
             .collect())
     }
 
-    /// One run by id ([[WEIR-T-0189]]) — the feed fields plus `stream`, raw
+    /// One run by id ([[WEIR-T-0189]]) — the feed fields plus `stream`, RFC 3339
     /// timestamps, and a recent run-log tail for the run's connection (run logs
     /// are connection-scoped, not per-unit). `None` for an unknown id or another
     /// tenant's run (no cross-tenant leak).
@@ -1154,8 +1157,8 @@ impl App {
             attempt: r.attempt,
             rows_written: r.rows_written,
             dead_lettered: r.dead_lettered,
-            started_at: r.started_at,
-            finished_at: r.finished_at,
+            started_at: weir_orchestrator::epoch_ms_to_rfc3339(r.started_at),
+            finished_at: weir_orchestrator::epoch_ms_to_rfc3339(r.finished_at),
             duration_ms: match (r.started_at, r.finished_at) {
                 (Some(s), Some(f)) => Some((f - s).max(0)),
                 _ => None,
@@ -2504,6 +2507,9 @@ mod runs_feed_tests {
         let got = app.run_detail(DEFAULT_TENANT, 7).unwrap().expect("found");
         assert_eq!((got.id, got.state.as_str()), (7, "done"));
         assert_eq!((got.connection.as_str(), got.stream.as_str()), ("c", "s"));
+        // [[WEIR-T-0224]] follow-up: RFC 3339 UTC millis, like the feed rows.
+        assert_eq!(got.finished_at.as_deref(), Some("1970-01-01T00:00:00.001Z"));
+        assert_eq!(got.started_at, None, "unset stays null");
 
         assert!(app.run_detail(DEFAULT_TENANT, 12345).unwrap().is_none());
         assert!(

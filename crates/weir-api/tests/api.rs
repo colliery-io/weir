@@ -14,6 +14,15 @@ fn use_wasm_connectors() {
     }
 }
 
+/// `YYYY-MM-DDTHH:MM:SS.mmmZ` — RFC 3339 UTC with exactly millisecond precision,
+/// the shape every run timestamp in the API uses ([[WEIR-T-0224]]).
+fn is_rfc3339_ms_utc(s: &str) -> bool {
+    s.len() == 24
+        && s.ends_with('Z')
+        && s.as_bytes()[19] == b'.'
+        && chrono::DateTime::parse_from_rfc3339(s).is_ok()
+}
+
 async fn json(resp: axum::response::Response) -> serde_json::Value {
     let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
     serde_json::from_slice(&bytes).unwrap()
@@ -199,9 +208,9 @@ async fn failed_run_surfaces_error_and_dead_letters() {
         boom["error"]
     );
 
-    // [[WEIR-T-0224]]: feed rows carry started_at / finished_at as RFC 3339 UTC,
-    // the same instants GET /runs/{id} gives as epoch millis — on /runs and on the
-    // admin tenant-scoped mirror alike.
+    // [[WEIR-T-0224]]: feed rows carry started_at / finished_at as RFC 3339 UTC —
+    // on /runs and on the admin tenant-scoped mirror alike — and GET /runs/{id}
+    // (and its tenant-scoped mirror) give the very same strings.
     let rfc = |v: &serde_json::Value| -> i64 {
         chrono::DateTime::parse_from_rfc3339(v.as_str().expect("an RFC 3339 string"))
             .expect("parses as RFC 3339")
@@ -250,8 +259,40 @@ async fn failed_run_surfaces_error_and_dead_letters() {
     assert_eq!(detail["state"], "failed");
     assert_eq!(detail["connection"], "boom");
     assert!(detail["logs"].is_array(), "detail carries a run-log tail");
-    assert_eq!(detail["started_at"].as_i64(), Some(feed_started));
-    assert_eq!(detail["finished_at"].as_i64(), Some(feed_finished));
+    assert_eq!(
+        detail["started_at"], boom["started_at"],
+        "same string as the feed row"
+    );
+    assert_eq!(
+        detail["finished_at"], boom["finished_at"],
+        "same string as the feed row"
+    );
+    assert_eq!(rfc(&detail["started_at"]), feed_started);
+    assert_eq!(rfc(&detail["finished_at"]), feed_finished);
+    assert!(
+        is_rfc3339_ms_utc(detail["started_at"].as_str().unwrap()),
+        "{}",
+        detail["started_at"]
+    );
+    assert!(
+        is_rfc3339_ms_utc(detail["finished_at"].as_str().unwrap()),
+        "{}",
+        detail["finished_at"]
+    );
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::get(format!("/tenants/default/runs/{boom_id}"))
+                .header("authorization", token.as_str())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let scoped_detail = json(resp).await;
+    assert_eq!(scoped_detail["started_at"], boom["started_at"]);
+    assert_eq!(scoped_detail["finished_at"], boom["finished_at"]);
     let resp = router
         .clone()
         .oneshot(

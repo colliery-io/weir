@@ -5,7 +5,7 @@
 //! not to one run, so the modal labels those sections as connection-level.
 
 use crate::fetch::{get_fetch, get_json, Fetched};
-use crate::helpers::{fmt_ts, log_color, run_duration, state_color};
+use crate::helpers::{fmt_ts, log_color, parse_rfc3339_ms, run_duration, state_color};
 use crate::models::{ConnState, DeadLetterRow, RunDetail};
 use aurora_leptos::components::*;
 use aurora_leptos::tokens::token;
@@ -19,9 +19,10 @@ enum Loaded {
     Ready(Box<RunDetail>),
 }
 
-/// A timestamp row value: absolute UTC time and "3m ago", or "—" when not set.
-fn when(ms: Option<i64>) -> AnyView {
-    match ms {
+/// A timestamp row value (the API's RFC 3339 UTC string, [[WEIR-T-0224]]): absolute
+/// UTC time and "3m ago", or "—" when not set.
+fn when(at: Option<&str>) -> AnyView {
+    match at.and_then(parse_rfc3339_ms) {
         Some(t) => view! {
             <span>{fmt_ts(t)}" · "<RelativeTime at=t as f64/></span>
         }
@@ -115,7 +116,10 @@ fn run_body(
     let (status, pill_text) = (r.state.clone(), r.state.clone());
     let (connection, stream) = (r.connection.clone(), format!("· {}", r.stream));
     let (attempt, rows, dead) = (r.attempt, r.rows_written, r.dead_lettered);
-    let (started, ended) = (when(r.started_at), when(r.finished_at));
+    let (started, ended) = (
+        when(r.started_at.as_deref()),
+        when(r.finished_at.as_deref()),
+    );
     view! {
         <Stack gap="sm">
             <Group gap="sm">
