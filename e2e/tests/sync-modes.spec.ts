@@ -20,13 +20,24 @@ test('sync modes: an incremental upsert cron connection is created and read back
   page,
 }) => {
   // Real create + GET against the e2e server (frankfurter + the arrow sink are seeded).
-  const name = 'fx-modes';
-  await page.request.delete(`/connections/${name}`, { headers: auth() });
+  // The create is slow on that server: to validate the config it loads each side's
+  // connector (a wasm guest, in a debug build) several times, synchronously — seen over
+  // 10s on a CI runner, with the server's other requests queued behind it. The budget is
+  // sized for that work.
+  test.setTimeout(120_000);
+  // The server's state outlives a spec (and a retry): a fresh name every time.
+  const name = `fx-modes-${Date.now().toString(36)}`;
 
   await page.goto('/');
   await page.getByRole('button', { name: 'Setup' }).click();
   await page.getByPlaceholder('my-sync').fill(name);
+  // Picking the source rediscovers its streams (a guest call on the server); wait for that
+  // answer, so the stream field is settled (text input or select) before it is picked.
+  const discovered = page.waitForResponse(
+    (r) => r.request().method() === 'POST' && r.url().endsWith('/connectors/frankfurter/discover'),
+  );
   await page.getByLabel('Source', { exact: true }).selectOption('frankfurter');
+  await discovered;
   // The seeded arrow sink's catalog name is the package's, not the `ArrowSink` alias.
   const dest = page.getByLabel('Destination', { exact: true });
   const arrow = dest.locator('option').filter({ hasText: /arrow/i }).first();
@@ -51,7 +62,19 @@ test('sync modes: an incremental upsert cron connection is created and read back
   await page.getByRole('button', { name: 'Cron', exact: true }).click();
   await page.getByLabel(/^Cron ·/).fill('0 0 3 * * *');
 
+  // Wait on the create itself, not on its toast with the default 10s: the toast shows
+  // only once the (slow, see above) create answers, and a refused create fails here
+  // with the server's reason.
+  const created = page.waitForResponse(
+    (r) => r.request().method() === 'POST' && new URL(r.url()).pathname === '/connections',
+    { timeout: 90_000 },
+  );
   await page.getByRole('button', { name: 'Save connection' }).click();
+  const res = await created;
+  // A 201 has no body (and Chromium keeps none to read): the reason is read on failure only.
+  const why = res.ok() ? '' : await res.text().catch(() => '');
+  expect(res.ok(), `POST /connections ${res.status()}: ${why}`).toBeTruthy();
+  expect(res.request().postDataJSON()).toMatchObject({ name, cron: '0 0 3 * * *', every_secs: null });
   await expect(page.getByText(`Saved connection ${name}`)).toBeVisible();
 
   const got = await page.request.get(`/connections/${name}`, { headers: auth() });
