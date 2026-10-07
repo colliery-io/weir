@@ -111,7 +111,7 @@ async fn run(relay: &Relay, store: &Arc<Store>, s: &WorkSpec) -> (String, Option
     .await
     .unwrap();
     let unit = relay
-        .history(&s.connection)
+        .history(&s.tenant, &s.connection)
         .unwrap()
         .into_iter()
         .find(|u| u.id == id)
