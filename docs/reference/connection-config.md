@@ -26,6 +26,20 @@ The source and destination resolve with **independent** config ([[WEIR-I-0029]])
 one table and write another. weir strips its own reserved keys (e.g. an embedded `__mapping`) before the config
 reaches the guest.
 
+## Secret fields in the API
+
+The API does not return secret values. A read gives `__weir_secret_unchanged__` in place of each secret in
+`source_config` and `dest_config`. A field is secret when the connector schema marks it
+`airbyte_secret: true` or `format: "password"`, or when it holds an auth credential (see the next section).
+
+When you send `POST /connections` for a connection that exists:
+
+- Send `__weir_secret_unchanged__`, or do not send the field, to keep the stored value.
+- Send a new value to replace it.
+- Send an empty string to clear it.
+
+A new connection that sends `__weir_secret_unchanged__` gets `400`, because there is no stored value to keep.
+
 ## Host-side auth (`auth_scheme`)
 
 Credentials are resolved and attached **on the host** — secret fields are stripped before the config reaches

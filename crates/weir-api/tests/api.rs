@@ -1172,3 +1172,230 @@ async fn create_rejects_unknown_connector_and_missing_required_config() {
         .unwrap();
     assert_eq!(json(resp).await.as_array().unwrap().len(), 0);
 }
+
+// ---- [[WEIR-T-0201]]: secret fields are redacted on read and kept on write ----
+
+const SENTINEL: &str = "__weir_secret_unchanged__";
+
+async fn send(
+    router: &axum::Router,
+    token: &str,
+    method: &str,
+    uri: &str,
+    body: Option<serde_json::Value>,
+) -> (StatusCode, serde_json::Value) {
+    let req = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("authorization", token)
+        .header("content-type", "application/json");
+    let req = match body {
+        Some(b) => req.body(Body::from(b.to_string())).unwrap(),
+        None => req.body(Body::empty()).unwrap(),
+    };
+    let resp = router.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let v = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, v)
+}
+
+#[tokio::test]
+async fn every_connection_route_redacts_secrets() {
+    use_wasm_connectors();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let app = Arc::new(App::open(tmp.path().join("weir.db").to_str().unwrap()).unwrap());
+    let router = weir_api::router(Arc::clone(&app));
+    let token = format!("Bearer {}", app.bootstrap_admin_key().unwrap().unwrap());
+
+    // `conv`: the `config` convenience block carries a baked-pattern secret (`api_key`) to both sides.
+    let (s, _) = send(
+        &router,
+        &token,
+        "POST",
+        "/connections",
+        Some(serde_json::json!({
+            "name":"conv","source":"Echo","dest":"ArrowSink","stream":"echo",
+            "config":{"api_key":"conv-secret-1","note":"visible"}
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED);
+    // `split`: per-side blocks — source holds baked basic-auth (the key named by
+    // `basic_password_key`); dest is postgres, whose schema marks `password` `format: password`.
+    let (s, body) = send(&router, &token, "POST", "/connections", Some(serde_json::json!({
+        "name":"split","source":"Echo","dest":"postgres","stream":"echo",
+        "source_config":{"auth_scheme":"basic","basic_password_key":"pw","pw":"src-secret-2","user":"u"},
+        "dest_config":{"host":"db","password":"dest-secret-3","table":"t"}
+    }))).await;
+    assert_eq!(s, StatusCode::CREATED, "{body}");
+
+    let routes = [
+        "/connections",
+        "/connections/conv",
+        "/connections/split",
+        "/tenants/default/connections",
+        "/tenants/default/connections/conv",
+        "/tenants/default/connections/split",
+    ];
+    for uri in routes {
+        let (s, v) = send(&router, &token, "GET", uri, None).await;
+        assert_eq!(s, StatusCode::OK, "{uri}");
+        let text = v.to_string();
+        for secret in ["conv-secret-1", "src-secret-2", "dest-secret-3"] {
+            assert!(!text.contains(secret), "{uri} leaks {secret}: {text}");
+        }
+        let conns: Vec<serde_json::Value> = match v {
+            serde_json::Value::Array(a) => a,
+            one => vec![one],
+        };
+        for c in conns {
+            match c["name"].as_str().unwrap() {
+                "conv" => {
+                    assert_eq!(c["source_config"]["api_key"], SENTINEL, "{uri}");
+                    assert_eq!(c["dest_config"]["api_key"], SENTINEL, "{uri}");
+                    assert_eq!(c["source_config"]["note"], "visible", "{uri}");
+                }
+                "split" => {
+                    assert_eq!(c["source_config"]["pw"], SENTINEL, "{uri}");
+                    assert_eq!(c["source_config"]["user"], "u", "{uri}");
+                    assert_eq!(c["dest_config"]["password"], SENTINEL, "{uri}");
+                    assert_eq!(c["dest_config"]["host"], "db", "{uri}");
+                }
+                other => panic!("unexpected connection {other}"),
+            }
+        }
+    }
+    // The store still holds the real values (redaction is read-side only).
+    let stored = app.get_connection("default", "split").unwrap();
+    assert!(stored.dest_config.contains("dest-secret-3"));
+}
+
+#[tokio::test]
+async fn write_keeps_replaces_and_clears_secrets() {
+    use_wasm_connectors();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let app = Arc::new(App::open(tmp.path().join("weir.db").to_str().unwrap()).unwrap());
+    let router = weir_api::router(Arc::clone(&app));
+    let token = format!("Bearer {}", app.bootstrap_admin_key().unwrap().unwrap());
+    let conn = |src: serde_json::Value, dst: serde_json::Value| {
+        serde_json::json!({
+            "name":"pg","source":"Echo","dest":"postgres","stream":"echo",
+            "source_config":src,"dest_config":dst
+        })
+    };
+    let stored = |app: &App| {
+        let c = app.get_connection("default", "pg").unwrap();
+        (
+            serde_json::from_str::<serde_json::Value>(&c.source_config).unwrap(),
+            serde_json::from_str::<serde_json::Value>(&c.dest_config).unwrap(),
+        )
+    };
+
+    // A new connection that sends the sentinel is refused: nothing to keep.
+    let (s, body) = send(
+        &router,
+        &token,
+        "POST",
+        "/connections",
+        Some(conn(
+            serde_json::json!({"api_key":SENTINEL}),
+            serde_json::json!({"password":"pw"}),
+        )),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body["error"].as_str().unwrap().contains(SENTINEL), "{body}");
+    assert!(
+        app.get_connection("default", "pg").is_err(),
+        "nothing persisted"
+    );
+
+    let (s, _) = send(
+        &router,
+        &token,
+        "POST",
+        "/connections",
+        Some(conn(
+            serde_json::json!({"api_key":"k1"}),
+            serde_json::json!({"host":"db","password":"pw1"}),
+        )),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED);
+
+    // 1. Keep: the sentinel (source) and an omitted secret (dest) keep the stored values,
+    //    while a non-secret field changes.
+    let (s, body) = send(
+        &router,
+        &token,
+        "POST",
+        "/connections",
+        Some(conn(
+            serde_json::json!({"api_key":SENTINEL}),
+            serde_json::json!({"host":"db2"}),
+        )),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{body}");
+    let (src, dst) = stored(&app);
+    assert_eq!(src["api_key"], "k1");
+    assert_eq!(dst["password"], "pw1");
+    assert_eq!(dst["host"], "db2");
+
+    // The round trip of a GET body is a no-op on the secrets.
+    let (_, got) = send(&router, &token, "GET", "/connections/pg", None).await;
+    let (s, body) = send(&router, &token, "POST", "/connections", Some(got)).await;
+    assert_eq!(s, StatusCode::CREATED, "{body}");
+    let (src, dst) = stored(&app);
+    assert_eq!(src["api_key"], "k1");
+    assert_eq!(dst["password"], "pw1");
+
+    // 2. Replace: a new value replaces the stored one.
+    let (s, _) = send(
+        &router,
+        &token,
+        "POST",
+        "/connections",
+        Some(conn(
+            serde_json::json!({"api_key":"k2"}),
+            serde_json::json!({"host":"db2","password":"pw2"}),
+        )),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED);
+    let (src, dst) = stored(&app);
+    assert_eq!(src["api_key"], "k2");
+    assert_eq!(dst["password"], "pw2");
+
+    // 3. Clear: an empty string removes the stored secret.
+    let (s, _) = send(
+        &router,
+        &token,
+        "POST",
+        "/connections",
+        Some(conn(
+            serde_json::json!({"api_key":""}),
+            serde_json::json!({"host":"db2","password":""}),
+        )),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED);
+    let (src, dst) = stored(&app);
+    assert!(src.get("api_key").is_none(), "{src}");
+    assert!(dst.get("password").is_none(), "{dst}");
+
+    // With nothing stored, the sentinel on an existing connection is refused too.
+    let (s, body) = send(
+        &router,
+        &token,
+        "POST",
+        "/connections",
+        Some(conn(
+            serde_json::json!({"api_key":SENTINEL}),
+            serde_json::json!({"host":"db2"}),
+        )),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{body}");
+}
