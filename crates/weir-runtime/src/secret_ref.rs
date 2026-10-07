@@ -88,6 +88,36 @@ pub struct ResolvedConfig {
     pub fingerprint: Option<String>,
 }
 
+/// A random salt, drawn once per process, that [`cache_key_digest`] mixes into each
+/// digest: a cache key cannot be compared with a hash computed outside this process (a
+/// guess at a short secret cannot be checked against it).
+fn cache_salt() -> &'static [u8; 32] {
+    static SALT: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+    SALT.get_or_init(|| {
+        use ring::rand::SecureRandom;
+        let mut salt = [0u8; 32];
+        ring::rand::SystemRandom::new()
+            .fill(&mut salt)
+            .expect("the system random source is available");
+        salt
+    })
+}
+
+/// The key of a credential cache entry ([[WEIR-T-0204]]): a salted SHA-256 (hex) over
+/// `parts`. A cache whose entry depends on secret material (a config, a resolved value, a
+/// private key) keys it by this digest, so no secret text is held in a map key, a log line
+/// or an error. Each part is length-prefixed, so no two different lists give the same
+/// digest; the salt is per process, so a digest is stable only within one process.
+pub fn cache_key_digest(parts: &[&str]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(cache_salt());
+    for part in parts {
+        hasher.update((part.len() as u64).to_le_bytes());
+        hasher.update(part.as_bytes());
+    }
+    hex::encode(hasher.finalize())
+}
+
 /// Resolve one reference to its value. `field` and `raw` name it in the error.
 fn resolve_one(field: &str, raw: &str, r: SecretRef<'_>) -> Result<String, SecretRefError> {
     let err = |reason: String| SecretRefError {
