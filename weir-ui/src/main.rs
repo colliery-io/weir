@@ -9,6 +9,7 @@
 
 mod app;
 mod components;
+mod discovery;
 mod fetch;
 mod helpers;
 mod models;

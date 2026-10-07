@@ -132,19 +132,14 @@ pub(crate) async fn fetch_props(plugin: &str) -> Vec<Prop> {
     parse_props(&schema)
 }
 
-/// Discover a source's streams — POST the config, get stream names.
-pub(crate) async fn fetch_streams(plugin: &str, config: &str) -> Vec<String> {
-    if plugin.is_empty() {
-        return Vec::new();
-    }
-    let req = match areq_post(&format!("/connectors/{plugin}/discover")).body(config.to_string()) {
-        Ok(r) => r,
-        Err(_) => return Vec::new(),
-    };
-    match req.send().await {
-        Ok(r) => r.json::<Vec<String>>().await.unwrap_or_default(),
-        Err(_) => Vec::new(),
-    }
+/// Discover a source's streams — POST the config, get stream names. A failure is the
+/// server's reason, for the form to show ([[WEIR-T-0218]]).
+pub(crate) async fn fetch_streams(plugin: &str, config: &str) -> Result<Vec<String>, String> {
+    let req = areq_post(&format!("/connectors/{plugin}/discover"))
+        .body(config.to_string())
+        .map_err(|e| e.to_string())?;
+    let resp = check(req.send().await).await?;
+    resp.json::<Vec<String>>().await.map_err(|e| format!("bad response: {e}"))
 }
 
 #[cfg(test)]
