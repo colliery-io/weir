@@ -1,6 +1,7 @@
 //! HTTP helpers: the auth header, tenant route rewriting, and the authed
 //! GET / mutation wrappers every view uses.
 
+use crate::helpers::parse_props;
 use crate::models::Prop;
 
 /// The stored API-key bearer (interim, [[WEIR-T-0084]]; the sign-in gate is [[WEIR-T-0087]]).
@@ -122,16 +123,7 @@ pub(crate) async fn fetch_props(plugin: &str) -> Vec<Prop> {
         .and_then(|s| s.as_str())
         .and_then(|s| serde_json::from_str(s).ok())
         .unwrap_or_default();
-    let Some(props) = schema.get("properties").and_then(|p| p.as_object()) else { return Vec::new() };
-    props
-        .iter()
-        .map(|(k, v)| {
-            let kind = v.get("type").and_then(|t| t.as_str()).unwrap_or("string").to_string();
-            let secret = v.get("format").and_then(|f| f.as_str()) == Some("password")
-                || v.get("airbyte_secret").and_then(|b| b.as_bool()) == Some(true);
-            Prop { key: k.clone(), kind, secret }
-        })
-        .collect()
+    parse_props(&schema)
 }
 
 /// Discover a source's streams — POST the config, get stream names.

@@ -128,6 +128,10 @@ pub(crate) struct Prop {
     pub(crate) key: String,
     pub(crate) kind: String,
     pub(crate) secret: bool,
+    /// Listed in the schema's `required` array.
+    pub(crate) required: bool,
+    /// The schema's `enum` values, as strings; empty for a free field.
+    pub(crate) options: Vec<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -136,7 +140,10 @@ pub(crate) struct NewConnection {
     pub(crate) source: String,
     pub(crate) dest: String,
     pub(crate) stream: String,
-    pub(crate) config: serde_json::Value,
+    // Per-side config ([[WEIR-T-0214]]). The shared `config` is not sent: the server
+    // defaults it to `{}`, and each side's object overrides it.
+    pub(crate) source_config: serde_json::Value,
+    pub(crate) dest_config: serde_json::Value,
     pub(crate) every_secs: Option<f64>,
     pub(crate) cron: Option<String>,
     // F1: "run_once" | "resident"; for resident, `every_secs` is the emit cadence.
