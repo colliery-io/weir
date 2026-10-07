@@ -5,7 +5,7 @@ use crate::fetch::{
     active_tenant, areq_delete, areq_get, areq_post, check, fetch_props, fetch_streams, get_fetch,
     get_json, Fetched,
 };
-use crate::helpers::{fmt_dur, log_color, side_config};
+use crate::helpers::{cfg_text, fmt_dur, log_color, side_config};
 use crate::models::*;
 use crate::views::{
     health_view, operations_view, platform_view, setup_view, RunDetailModal, RunFeed, SetupState,
@@ -220,6 +220,8 @@ pub(crate) fn App() -> impl IntoView {
     sync.watch_schema(name, connections);
     // F1 execution mode ([[WEIR-I-0035]]): run_once (default) | resident.
     let exec_mode = RwSignal::new("run_once".to_string());
+    // Edit mode ([[WEIR-T-0216]]): the name of the connection loaded into the form.
+    let editing = RwSignal::new(Option::<String>::None);
     // Onboarding state.
     let add_pkg = RwSignal::new(String::new());
     let add_manifest = RwSignal::new(String::new());
@@ -453,6 +455,40 @@ pub(crate) fn App() -> impl IntoView {
             }
         });
     };
+    // Edit ([[WEIR-T-0216]]): load a stored connection into the Setup form. Its secrets
+    // arrive as the sentinel, which the form sends back unless the user replaces or
+    // clears them; save is the same upsert as create.
+    let clear_form = move || {
+        editing.set(None);
+        name.set(String::new());
+        src.set(String::new());
+        dst.set(String::new());
+        stream.set(String::new());
+        exec_mode.set("run_once".to_string());
+        sync.load(&ConnectionDetail::default());
+    };
+    let edit_conn = Callback::new(move |n: String| {
+        leptos::task::spawn_local(async move {
+            match get_fetch::<ConnectionDetail>(format!("/connections/{n}")).await {
+                Fetched::Ok(c) => {
+                    // Config first: the connector change below resets each side to it.
+                    src_cfg.load(cfg_text(&c.source_config));
+                    dst_cfg.load(cfg_text(&c.dest_config));
+                    editing.set(Some(c.name.clone()));
+                    name.set(c.name.clone());
+                    src.set(c.source.clone());
+                    dst.set(c.dest.clone());
+                    stream.set(c.stream.clone());
+                    exec_mode.set(if c.execution_mode.is_empty() { "run_once".into() } else { c.execution_mode.clone() });
+                    sync.load(&c);
+                    view.set("Setup".to_string());
+                }
+                Fetched::Unauthorized => flash(false, format!("Couldn't load {n}: sign in again")),
+                Fetched::Failed(_, e) => flash(false, format!("Couldn't load {n}: {e}")),
+                Fetched::Network => flash(false, format!("Couldn't load {n}: server unreachable")),
+            }
+        });
+    });
     // Save the connection.
     let save_conn = move || {
         if name.get().trim().is_empty() {
@@ -487,6 +523,11 @@ pub(crate) fn App() -> impl IntoView {
             };
             match sent {
                 Ok(_) => {
+                    // An edit is done: the form goes back to a blank new connection, so
+                    // its sentinels are not sent for another name.
+                    if editing.get_untracked().is_some() {
+                        clear_form();
+                    }
                     name.set(String::new());
                     flash(true, format!("Saved connection {saved}"));
                 }
@@ -608,7 +649,8 @@ pub(crate) fn App() -> impl IntoView {
                         {move || match view.get().as_str() {
                             "Setup" => setup_view(SetupState {
                                 catalog, available, src_cfg, dst_cfg, streams, add_pkg, add_manifest, add_path, preview,
-                                name, src, dst, stream, sync, exec_mode,
+                                name, src, dst, stream, sync, exec_mode, editing,
+                                cancel_edit: Callback::new(move |_| clear_form()),
                                 onboard_pick: Callback::new(move |_| onboard_pick()),
                                 do_preview: Callback::new(move |_| do_preview()),
                                 onboard_byo: Callback::new(move |_| onboard_byo()),
@@ -618,7 +660,7 @@ pub(crate) fn App() -> impl IntoView {
                             "Platform" => platform_view(platform, drill_tenant),
                             _ => operations_view(connections, runs, feed, ConnActions {
                                 on_open: open_detail, on_run: run_conn, on_delete: ask_delete,
-                                on_start: start_conn, on_stop: stop_conn,
+                                on_start: start_conn, on_stop: stop_conn, on_edit: edit_conn,
                             }),
                         }}
                     </div>

@@ -12,6 +12,34 @@ pub(crate) struct Connection {
     pub(crate) execution_mode: String,
 }
 
+/// One connection as `GET /connections/{name}` gives it: everything the form edits
+/// ([[WEIR-T-0216]]). Secret values arrive as [`crate::helpers::SECRET_SENTINEL`].
+#[derive(serde::Deserialize, Clone, PartialEq, Default)]
+pub(crate) struct ConnectionDetail {
+    pub(crate) name: String,
+    pub(crate) source: String,
+    pub(crate) dest: String,
+    pub(crate) stream: String,
+    #[serde(default)]
+    pub(crate) source_config: serde_json::Value,
+    #[serde(default)]
+    pub(crate) dest_config: serde_json::Value,
+    #[serde(default)]
+    pub(crate) every_secs: Option<f64>,
+    #[serde(default)]
+    pub(crate) cron: Option<String>,
+    #[serde(default)]
+    pub(crate) sync_mode: String,
+    #[serde(default)]
+    pub(crate) write_mode: String,
+    #[serde(default)]
+    pub(crate) business_keys: Vec<String>,
+    #[serde(default)]
+    pub(crate) cursor_field: Option<String>,
+    #[serde(default)]
+    pub(crate) execution_mode: String,
+}
+
 #[derive(serde::Deserialize, Clone, PartialEq)]
 pub(crate) struct RunRow {
     pub(crate) id: i64,
