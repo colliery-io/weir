@@ -1229,20 +1229,34 @@ async fn every_connection_route_redacts_secrets() {
         "dest_config":{"host":"db","password":"dest-secret-3","table":"t"}
     }))).await;
     assert_eq!(s, StatusCode::CREATED, "{body}");
+    // `ms`: an mssql dest, whose schema marks `password` secret ([[WEIR-T-0222]]).
+    let (s, body) = send(&router, &token, "POST", "/connections", Some(serde_json::json!({
+        "name":"ms","source":"Echo","dest":"mssql","stream":"echo",
+        "source_config":{},
+        "dest_config":{"host":"sql","database":"d","user":"sa","password":"mssql-secret-4","table":"t"}
+    }))).await;
+    assert_eq!(s, StatusCode::CREATED, "{body}");
 
     let routes = [
         "/connections",
         "/connections/conv",
         "/connections/split",
+        "/connections/ms",
         "/tenants/default/connections",
         "/tenants/default/connections/conv",
         "/tenants/default/connections/split",
+        "/tenants/default/connections/ms",
     ];
     for uri in routes {
         let (s, v) = send(&router, &token, "GET", uri, None).await;
         assert_eq!(s, StatusCode::OK, "{uri}");
         let text = v.to_string();
-        for secret in ["conv-secret-1", "src-secret-2", "dest-secret-3"] {
+        for secret in [
+            "conv-secret-1",
+            "src-secret-2",
+            "dest-secret-3",
+            "mssql-secret-4",
+        ] {
             assert!(!text.contains(secret), "{uri} leaks {secret}: {text}");
         }
         let conns: Vec<serde_json::Value> = match v {
@@ -1262,6 +1276,10 @@ async fn every_connection_route_redacts_secrets() {
                     assert_eq!(c["dest_config"]["password"], SENTINEL, "{uri}");
                     assert_eq!(c["dest_config"]["host"], "db", "{uri}");
                 }
+                "ms" => {
+                    assert_eq!(c["dest_config"]["password"], SENTINEL, "{uri}");
+                    assert_eq!(c["dest_config"]["user"], "sa", "{uri}");
+                }
                 other => panic!("unexpected connection {other}"),
             }
         }
@@ -1269,6 +1287,84 @@ async fn every_connection_route_redacts_secrets() {
     // The store still holds the real values (redaction is read-side only).
     let stored = app.get_connection("default", "split").unwrap();
     assert!(stored.dest_config.contains("dest-secret-3"));
+}
+
+// ---- [[WEIR-T-0202]]: `env:` / `file:` references in secret fields ----
+
+#[tokio::test]
+async fn secret_references_are_stored_as_text_and_refused_outside_secret_fields() {
+    use_wasm_connectors();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let app = Arc::new(App::open(tmp.path().join("weir.db").to_str().unwrap()).unwrap());
+    let router = weir_api::router(Arc::clone(&app));
+    let token = format!("Bearer {}", app.bootstrap_admin_key().unwrap().unwrap());
+
+    // A reference in a field that is not secret is refused at create, naming the field.
+    let (s, body) = send(
+        &router,
+        &token,
+        "POST",
+        "/connections",
+        Some(serde_json::json!({
+            "name":"badref","source":"Echo","dest":"postgres","stream":"echo",
+            "source_config":{},
+            "dest_config":{"host":"env:WEIR_T0202_DB_HOST","password":"pw","table":"t"}
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{body}");
+    let err = body["error"].as_str().unwrap();
+    assert!(err.contains("dest config field `host`"), "{err}");
+    assert!(err.contains("`env:WEIR_T0202_DB_HOST`"), "{err}");
+    assert!(
+        app.get_connection("default", "badref").is_err(),
+        "nothing persisted"
+    );
+
+    // A reference in a secret field (schema-marked and baked-auth) is accepted, stored as
+    // the reference text, and a read returns the text: the API never resolves it.
+    // SAFETY: a unique name; the API must not read it, so its value must never appear.
+    unsafe { std::env::set_var("WEIR_T0202_API_PW", "resolved-must-not-leak") };
+    let (s, body) = send(
+        &router,
+        &token,
+        "POST",
+        "/connections",
+        Some(serde_json::json!({
+            "name":"refs","source":"Echo","dest":"postgres","stream":"echo",
+            "source_config":{"api_key":"file:/run/secrets/weir-t-0202"},
+            "dest_config":{"host":"db","password":"env:WEIR_T0202_API_PW","table":"t"}
+        })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{body}");
+    for uri in [
+        "/connections",
+        "/connections/refs",
+        "/tenants/default/connections/refs",
+    ] {
+        let (s, v) = send(&router, &token, "GET", uri, None).await;
+        assert_eq!(s, StatusCode::OK, "{uri}");
+        assert!(
+            !v.to_string().contains("resolved-must-not-leak"),
+            "{uri}: {v}"
+        );
+        let c = match v {
+            serde_json::Value::Array(a) => a.into_iter().find(|c| c["name"] == "refs").unwrap(),
+            one => one,
+        };
+        assert_eq!(
+            c["dest_config"]["password"], "env:WEIR_T0202_API_PW",
+            "{uri}"
+        );
+        assert_eq!(
+            c["source_config"]["api_key"], "file:/run/secrets/weir-t-0202",
+            "{uri}"
+        );
+    }
+    let stored = app.get_connection("default", "refs").unwrap();
+    assert!(stored.dest_config.contains("env:WEIR_T0202_API_PW"));
+    assert!(!stored.dest_config.contains("resolved-must-not-leak"));
 }
 
 #[tokio::test]
