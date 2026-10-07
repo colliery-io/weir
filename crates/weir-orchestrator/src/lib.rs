@@ -717,10 +717,24 @@ pub struct RunRow {
     pub attempt: i64,
     pub rows_written: i64,
     pub dead_lettered: i64,
+    /// When the run started, RFC 3339 UTC ([[WEIR-T-0224]]); `None` until it starts.
+    #[serde(default)]
+    pub started_at: Option<String>,
+    /// When the run finished, RFC 3339 UTC; `None` while in flight.
+    #[serde(default)]
+    pub finished_at: Option<String>,
     /// Wall-clock duration in ms once finished; `None` while in flight.
     pub duration_ms: Option<i64>,
     /// Why the run failed (the connector/engine error), if it did; `None` otherwise.
     pub error: Option<String>,
+}
+
+/// An epoch-millis column as an RFC 3339 UTC string with millisecond precision
+/// (`2026-10-07T12:00:00.000Z`) — how the run feed shows its timestamps
+/// ([[WEIR-T-0224]]). `None` (or an out-of-range value) stays `None`.
+pub fn epoch_ms_to_rfc3339(ms: Option<i64>) -> Option<String> {
+    ms.and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+        .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
 }
 
 /// The durable work queue + state machine. Sync DB ops over the shared store's
@@ -2230,6 +2244,17 @@ impl<C: Clock> Scheduler<C> {
 #[cfg(test)]
 mod sharp_edges_tests {
     use super::*;
+
+    /// [[WEIR-T-0224]]: feed timestamps are RFC 3339 UTC with millis; unset stays unset.
+    #[test]
+    fn epoch_ms_renders_as_rfc3339_utc() {
+        assert_eq!(
+            epoch_ms_to_rfc3339(Some(1_791_374_400_123)).as_deref(),
+            Some("2026-10-07T12:00:00.123Z")
+        );
+        assert_eq!(epoch_ms_to_rfc3339(None), None);
+        assert_eq!(epoch_ms_to_rfc3339(Some(i64::MAX)), None);
+    }
 
     /// [[WEIR-T-0190]] item 5: the resident restart delay is exponential in the
     /// attempt while crash-looping, DECAYS to the base after healthy uptime, and

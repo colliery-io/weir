@@ -27,9 +27,27 @@ test('operations: a run-feed row opens the run detail; the feed pages', async ({
   const feedBody = await feed.text();
   expect(feedBody, `GET /runs → ${feed.status()}`).toContain('fx-demo');
 
+  // [[WEIR-T-0224]]: every feed row carries started_at / finished_at — RFC 3339 UTC or null.
+  const rfc3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/;
+  const rows = JSON.parse(feedBody) as Array<Record<string, unknown>>;
+  for (const r of rows) {
+    for (const k of ['started_at', 'finished_at']) {
+      expect(k in r, `run ${r.id} has ${k}`).toBeTruthy();
+      const v = r[k];
+      if (v !== null) expect(String(v)).toMatch(rfc3339);
+    }
+  }
+
   await page.goto('/');
+  await expect(page.getByRole('columnheader', { name: 'started', exact: true })).toBeVisible();
   const row = page.getByRole('row', { name: /^run \d+ · fx-demo$/ }).first();
   await expect(row, `feed rows in the page; GET /runs gave: ${feedBody.slice(0, 400)}`).toBeVisible();
+  // The start column: "… ago" / "just now" with the UTC time as the tooltip, or "—" until it starts.
+  const started = row.getByTestId('run-started');
+  await expect(started).toHaveText(/^(—|just now|in \d+[a-z]+|\d+[a-z]+ ago)$/);
+  if ((await started.textContent()) !== '—') {
+    await expect(started).toHaveAttribute('title', /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} UTC$/);
+  }
   await row.click();
 
   const dialog = page.getByRole('dialog', { name: /^Run #\d+$/ });

@@ -77,6 +77,22 @@ async fn connection_crud_run_and_history() {
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(json(resp).await["state"], "pending");
 
+    // [[WEIR-T-0224]]: a queued run's feed row carries both timestamps as null.
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::get("/runs")
+                .header("authorization", token.as_str())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let queued = json(resp).await;
+    assert_eq!(queued[0]["state"], "pending");
+    assert!(queued[0]["started_at"].is_null(), "unset while queued");
+    assert!(queued[0]["finished_at"].is_null(), "unset while queued");
+
     // Drain the relay (a background worker does this in `serve`) → done.
     app.drain().await.unwrap();
 
@@ -183,6 +199,38 @@ async fn failed_run_surfaces_error_and_dead_letters() {
         boom["error"]
     );
 
+    // [[WEIR-T-0224]]: feed rows carry started_at / finished_at as RFC 3339 UTC,
+    // the same instants GET /runs/{id} gives as epoch millis — on /runs and on the
+    // admin tenant-scoped mirror alike.
+    let rfc = |v: &serde_json::Value| -> i64 {
+        chrono::DateTime::parse_from_rfc3339(v.as_str().expect("an RFC 3339 string"))
+            .expect("parses as RFC 3339")
+            .timestamp_millis()
+    };
+    let (feed_started, feed_finished) = (rfc(&boom["started_at"]), rfc(&boom["finished_at"]));
+    assert!(boom["started_at"].as_str().unwrap().ends_with('Z'), "UTC");
+    assert!(feed_finished >= feed_started);
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::get("/tenants/default/runs")
+                .header("authorization", token.as_str())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let scoped = json(resp).await;
+    let scoped_boom = scoped
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == boom["id"])
+        .expect("the boom run on the tenant-scoped feed");
+    assert_eq!(scoped_boom["started_at"], boom["started_at"]);
+    assert_eq!(scoped_boom["finished_at"], boom["finished_at"]);
+
     // GET /runs/{id} ([[WEIR-T-0189]]): full detail for a real run, 404 for an
     // unknown id; ?limit caps the feed page.
     let boom_id = boom["id"].as_i64().unwrap();
@@ -202,6 +250,8 @@ async fn failed_run_surfaces_error_and_dead_letters() {
     assert_eq!(detail["state"], "failed");
     assert_eq!(detail["connection"], "boom");
     assert!(detail["logs"].is_array(), "detail carries a run-log tail");
+    assert_eq!(detail["started_at"].as_i64(), Some(feed_started));
+    assert_eq!(detail["finished_at"].as_i64(), Some(feed_finished));
     let resp = router
         .clone()
         .oneshot(

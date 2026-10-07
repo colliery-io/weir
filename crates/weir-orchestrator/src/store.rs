@@ -110,6 +110,8 @@ impl RunFeedRow {
             attempt: self.attempt,
             rows_written: self.rows_written,
             dead_lettered: self.dead_lettered,
+            started_at: crate::epoch_ms_to_rfc3339(self.started_at),
+            finished_at: crate::epoch_ms_to_rfc3339(self.finished_at),
             duration_ms: match (self.started_at, self.finished_at) {
                 (Some(s), Some(f)) => Some((f - s).max(0)),
                 _ => None,

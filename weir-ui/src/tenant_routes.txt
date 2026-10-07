@@ -5,11 +5,13 @@
 # A test in weir-api (tests/api.rs) checks that the server serves each line under /tenants/{id}.
 GET /connections
 POST /connections
+GET /connections/{name}
 DELETE /connections/{name}
 POST /connections/{name}/run
 POST /connections/{name}/start
 POST /connections/{name}/stop
 GET /connections/{name}/logs
+GET /connections/{name}/state
 GET /connections/{name}/dead-letters
 GET /connections/{name}/schema
 POST /connections/{name}/schema/accept
@@ -20,4 +22,5 @@ GET /catalog/available
 POST /catalog/import
 POST /catalog/preview
 GET /runs
+GET /runs/{id}
 GET /overview
