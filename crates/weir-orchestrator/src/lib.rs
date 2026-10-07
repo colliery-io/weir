@@ -29,7 +29,7 @@ use weir_connector::{
 use weir_engine::{
     Engine, EngineError, StopHandle, Store, SyncOptions, SyncProgress, stop_channel,
 };
-use weir_runtime::{ConnectorHandle, Credential, HostAllowList};
+use weir_runtime::{ConnectorHandle, Credential, HostAllowList, resolve_secret_refs};
 
 mod lineage;
 mod store;
@@ -142,9 +142,22 @@ impl ConnectorRef {
                 package,
                 ..
             } => {
-                // Key on the full config (incl. any secret) so two connections to the
-                // same package with different credentials never share a handle/token.
-                let key = format!("{search_path}\u{0}{package}\u{0}{}", config.json);
+                // Resolve `env:` / `file:` secret references NOW, on each resolve (each
+                // run), so a rotated variable or file takes effect on the next run
+                // ([[WEIR-T-0202]] / [[WEIR-A-0037]]). The error names the field and the
+                // reference, never a value.
+                let resolved = resolve_secret_refs(&config.json)
+                    .map_err(|e| ExecutorError::Resolve(format!("{package}: {e}")))?;
+                // Key on the full config as stored (incl. any literal secret) so two
+                // connections to the same package with different credentials never share
+                // a handle/token. A config with references adds the SHA-256 fingerprint of
+                // the resolved values — never the values — so a rotation misses the cache
+                // and builds a handle with the new credential.
+                let base_key = format!("{search_path}\u{0}{package}\u{0}{}", config.json);
+                let key = match &resolved.fingerprint {
+                    Some(fp) => format!("{base_key}\u{0}{fp}"),
+                    None => base_key.clone(),
+                };
                 let cache = HANDLE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
                 if let Some((h, last_used)) = cache.lock().unwrap().get_mut(&key) {
                     *last_used = std::time::Instant::now();
@@ -157,8 +170,9 @@ impl ConnectorRef {
                 // per-connection allow-lists later. An unknown `auth_scheme` (an old
                 // row from before create-time validation, [[WEIR-T-0203]]) fails the
                 // run here: its config is never passed through to the guest.
-                let (credential, guest_json) = Credential::from_auth_config(&config.json)
+                let (credential, guest_json) = Credential::from_auth_config(&resolved.json)
                     .map_err(|e| ExecutorError::Resolve(e.to_string()))?;
+                drop(resolved);
                 let guest_config = Config { json: guest_json };
                 let policy = match credential {
                     Some(c) => HostAllowList::allow_all().with_credential(c),
@@ -194,6 +208,10 @@ impl ConnectorRef {
                 // otherwise — evict the least-recently-used entry at the cap.
                 // (Live runs keep their handle via the returned `Arc`.)
                 if !cache.contains_key(&key) {
+                    // A handle built from an older resolution of the same references holds
+                    // the rotated-out credential: drop it ([[WEIR-T-0202]]).
+                    let stale = format!("{base_key}\u{0}");
+                    cache.retain(|k, _| k == &key || !k.starts_with(&stale));
                     lru_evict(&mut cache, HANDLE_CACHE_CAP);
                 }
                 let (h, _) = cache

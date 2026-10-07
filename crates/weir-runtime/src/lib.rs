@@ -15,7 +15,12 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+pub mod secret_ref;
 pub mod sigv4;
+
+pub use secret_ref::{
+    ResolvedConfig, SecretRef, SecretRefError, is_secret_ref, parse_secret_ref, resolve_secret_refs,
+};
 
 use ed25519_dalek::VerifyingKey;
 // All host-side fidius surface is reached white-label via the facade (fidius 0.5.2
@@ -2097,5 +2102,118 @@ mod snowflake_keypair_tests {
             parts.uri.query().expect("query"),
             "page=2&apikey=k%2B%26%3D%23z"
         );
+    }
+}
+
+#[cfg(test)]
+mod secret_ref_scheme_tests {
+    //! [[WEIR-T-0202]]: an `env:` / `file:` reference in the secret field of each auth
+    //! scheme resolves at credential build, and neither the reference nor the value
+    //! reaches the guest config.
+    use super::*;
+    use serde_json::json;
+
+    /// The secret strings a credential holds (private fields, read in-crate).
+    fn secrets_of(c: &Credential) -> Vec<String> {
+        match c {
+            Credential::Header { value, .. } => vec![value.clone()],
+            Credential::Query { value, .. } => vec![value.clone()],
+            Credential::OAuth2(p) => {
+                let mut v = vec![p.client_secret.clone()];
+                if let OAuthGrantKind::RefreshToken { refresh_token } = &p.grant {
+                    v.push(refresh_token.clone());
+                }
+                v
+            }
+            Credential::Session(p) => vec![p.login_body.clone().unwrap_or_default()],
+            Credential::AwsSigV4 { secret_key, .. } => vec![secret_key.clone()],
+            Credential::GoogleServiceAccount(p) => vec![p.private_key_pem.clone()],
+            Credential::SnowflakeKeypairJwt(p) => vec![p.private_key_pem.clone()],
+        }
+    }
+
+    #[test]
+    fn each_scheme_resolves_references_in_its_secret_fields() {
+        let var = "WEIR_T0202_SCHEME_SECRET";
+        // SAFETY: the variable name is unique to this test.
+        unsafe { std::env::set_var(var, "resolved-secret-value") };
+        let dir = tempfile::TempDir::new().unwrap();
+        let sa_file = dir.path().join("sa.json");
+        std::fs::write(
+            &sa_file,
+            json!({"client_email":"sa@x","private_key":"resolved-sa-pem"}).to_string(),
+        )
+        .unwrap();
+        let env_ref = format!("env:{var}");
+        let file_ref = format!("file:{}", sa_file.display());
+        let cases: Vec<(&str, serde_json::Value, &str)> = vec![
+            (
+                "bearer",
+                json!({"api_key": env_ref}),
+                "resolved-secret-value",
+            ),
+            (
+                "header",
+                json!({"auth_name":"X-Key","api_key": env_ref}),
+                "resolved-secret-value",
+            ),
+            (
+                "query",
+                json!({"auth_name":"key","api_key": env_ref}),
+                "resolved-secret-value",
+            ),
+            (
+                "oauth2",
+                json!({"client_id":"id","client_secret": env_ref,"refresh_token": env_ref}),
+                "resolved-secret-value",
+            ),
+            (
+                "session",
+                json!({"session_login_body":{"pw":"{{password}}"},"password": env_ref}),
+                "resolved-secret-value",
+            ),
+            (
+                "basic",
+                json!({"username":"u","password": env_ref}),
+                // The Basic header carries base64("u:<value>").
+                "dTpyZXNvbHZlZC1zZWNyZXQtdmFsdWU=",
+            ),
+            (
+                "google_service_account",
+                json!({"service_account_key": file_ref}),
+                "resolved-sa-pem",
+            ),
+            (
+                "snowflake_keypair_jwt",
+                json!({"account":"a","user":"u","private_key": env_ref}),
+                "resolved-secret-value",
+            ),
+            (
+                "aws_sigv4",
+                json!({"access_key_id":"AKIA","secret_access_key": env_ref}),
+                "resolved-secret-value",
+            ),
+        ];
+        let covered: Vec<&str> = cases.iter().map(|(s, _, _)| *s).collect();
+        for s in KNOWN_AUTH_SCHEMES {
+            assert!(covered.contains(s), "scheme {s} has no reference case");
+        }
+        for (scheme, mut cfg, expect) in cases {
+            cfg["auth_scheme"] = json!(scheme);
+            cfg["table"] = json!("t");
+            let resolved = resolve_secret_refs(&cfg.to_string()).expect(scheme);
+            let (cred, guest) = Credential::from_auth_config(&resolved.json).expect(scheme);
+            let cred = cred.unwrap_or_else(|| panic!("{scheme}: no credential"));
+            assert!(
+                secrets_of(&cred).iter().any(|s| s.contains(expect)),
+                "{scheme}: the credential carries the resolved value"
+            );
+            assert!(
+                !guest.contains("resolved-") && !guest.contains("env:") && !guest.contains("file:"),
+                "{scheme}: neither value nor reference reaches the guest: {guest}"
+            );
+            assert!(guest.contains("\"table\":\"t\""), "{scheme}: {guest}");
+        }
+        unsafe { std::env::remove_var(var) };
     }
 }
