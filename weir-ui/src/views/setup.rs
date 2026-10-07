@@ -1,12 +1,139 @@
 //! Setup: onboard connectors and wire a connection.
 
 use crate::components::{config_side, SideConfig};
-use crate::helpers::{friendly, is_onboarded};
-use crate::models::{AvailableItem, CatalogItem, PreviewReport};
+use crate::fetch::get_json;
+use crate::helpers::{friendly, is_onboarded, mode_fields, ModeFields, ModeInput};
+use crate::models::{AvailableItem, CatalogItem, Connection, PreviewReport, SchemaView};
 use aurora_leptos::components::*;
 use aurora_leptos::tokens::token;
 use leptos::prelude::*;
 use std::collections::HashSet;
+
+/// The schedule toggle's two choices.
+const EVERY: &str = "Every N seconds";
+const CRON: &str = "Cron";
+
+/// The connection form's sync/write modes and schedule ([[WEIR-T-0215]]). Health
+/// thresholds and the other DTO fields stay API-only.
+#[derive(Clone, Copy)]
+pub(crate) struct SyncForm {
+    pub(crate) sync_mode: RwSignal<String>,
+    pub(crate) write_mode: RwSignal<String>,
+    /// Comma-separated.
+    pub(crate) business_keys: RwSignal<String>,
+    pub(crate) cursor_field: RwSignal<String>,
+    /// `EVERY` or `CRON`.
+    pub(crate) schedule: RwSignal<String>,
+    pub(crate) every: RwSignal<String>,
+    pub(crate) cron: RwSignal<String>,
+    /// Field names of the connection's captured schema, when it has one: the cursor
+    /// field is then a select. Empty = a free text input.
+    pub(crate) cursor_options: RwSignal<Vec<String>>,
+}
+
+impl SyncForm {
+    pub(crate) fn new() -> Self {
+        Self {
+            sync_mode: RwSignal::new("full_refresh".to_string()),
+            write_mode: RwSignal::new("append".to_string()),
+            business_keys: RwSignal::new(String::new()),
+            cursor_field: RwSignal::new(String::new()),
+            schedule: RwSignal::new(EVERY.to_string()),
+            every: RwSignal::new(String::new()),
+            cron: RwSignal::new(String::new()),
+            cursor_options: RwSignal::new(Vec::new()),
+        }
+    }
+
+    /// The fields to send, checked like the server checks them.
+    pub(crate) fn fields(&self) -> Result<ModeFields, String> {
+        let (sync, write) = (self.sync_mode.get_untracked(), self.write_mode.get_untracked());
+        let (keys, cursor) = (self.business_keys.get_untracked(), self.cursor_field.get_untracked());
+        let (every, cron) = (self.every.get_untracked(), self.cron.get_untracked());
+        let schedule = if self.schedule.get_untracked() == CRON { "cron" } else { "interval" };
+        mode_fields(&ModeInput {
+            sync_mode: &sync,
+            write_mode: &write,
+            business_keys: &keys,
+            cursor_field: &cursor,
+            schedule,
+            every: &every,
+            cron: &cron,
+        })
+    }
+
+    /// When the form's name is an existing connection, offer the fields of its captured
+    /// schema for the cursor. Discovery gives stream names only, so a new connection has
+    /// no schema yet ([[WEIR-T-0218]]).
+    pub(crate) fn watch_schema(&self, name: RwSignal<String>, connections: RwSignal<Vec<Connection>>) {
+        let options = self.cursor_options;
+        let existing = Memo::new(move |_| {
+            let n = name.get();
+            let n = n.trim();
+            connections.with(|cs| cs.iter().any(|c| c.name == n)).then(|| n.to_string())
+        });
+        Effect::new(move |_| match existing.get() {
+            None => options.set(Vec::new()),
+            Some(n) => leptos::task::spawn_local(async move {
+                let schema = get_json::<SchemaView>(format!("/connections/{n}/schema")).await;
+                // The name can change while the request is out: drop a stale answer.
+                if existing.get_untracked().as_deref() == Some(n.as_str()) {
+                    options.set(schema.fields.into_iter().map(|f| f.name).collect());
+                }
+            }),
+        });
+    }
+}
+
+/// The modes + schedule part of the connection form.
+fn sync_fields(f: SyncForm, exec_mode: RwSignal<String>) -> AnyView {
+    let sync_modes = vec![
+        ("full_refresh".to_string(), "full refresh · read everything".to_string()),
+        ("incremental".to_string(), "incremental · from a cursor field".to_string()),
+        ("cdc".to_string(), "cdc · change data capture".to_string()),
+    ];
+    let write_modes = vec![
+        ("append".to_string(), "append · add rows".to_string()),
+        ("upsert".to_string(), "upsert · merge on business keys".to_string()),
+        ("overwrite".to_string(), "overwrite · replace the table".to_string()),
+    ];
+    let SyncForm { sync_mode, write_mode, business_keys, cursor_field, schedule, every, cron, cursor_options } = f;
+    view! {
+        <SimpleGrid cols=2>
+            <Select label="Sync mode" option_pairs=sync_modes value=sync_mode/>
+            <Select label="Write mode" option_pairs=write_modes value=write_mode/>
+        </SimpleGrid>
+        {move || (sync_mode.get() == "incremental").then(|| {
+            let opts = cursor_options.get();
+            if opts.is_empty() {
+                view! {
+                    <TextInput label="Cursor field *" placeholder="updated_at" value=cursor_field required=true mono=true/>
+                }.into_any()
+            } else {
+                view! {
+                    <Select label="Cursor field *" placeholder="— field from the captured schema —" options=opts
+                        value=cursor_field required=true/>
+                }.into_any()
+            }
+        })}
+        {move || (write_mode.get() == "upsert").then(|| view! {
+            <TextInput label="Business keys *" placeholder="id, region" value=business_keys required=true mono=true/>
+        })}
+        <div>
+            <Text size="sm">"Schedule"</Text>
+            <SegmentedControl options=vec![EVERY.to_string(), CRON.to_string()] value=schedule/>
+        </div>
+        {move || if schedule.get() == CRON {
+            view! {
+                <TextInput label="Cron · 6 or 7 fields, seconds first" placeholder="0 0 * * * *" value=cron mono=true/>
+            }.into_any()
+        } else {
+            let label = if exec_mode.get() == "resident" { "Every (secs) · emit cadence" } else { "Every (secs)" };
+            view! { <TextInput label=label placeholder="— none: run on demand" value=every mono=true/> }.into_any()
+        }}
+    }
+    .into_any()
+}
 
 /// The Setup view's signals + actions.
 pub(crate) struct SetupState {
@@ -23,7 +150,7 @@ pub(crate) struct SetupState {
     pub(crate) src: RwSignal<String>,
     pub(crate) dst: RwSignal<String>,
     pub(crate) stream: RwSignal<String>,
-    pub(crate) every: RwSignal<String>,
+    pub(crate) sync: SyncForm,
     pub(crate) exec_mode: RwSignal<String>,
     pub(crate) onboard_pick: Callback<()>,
     pub(crate) do_preview: Callback<()>,
@@ -34,7 +161,7 @@ pub(crate) struct SetupState {
 pub(crate) fn setup_view(s: SetupState) -> AnyView {
     let SetupState {
         catalog, available, src_cfg, dst_cfg, streams, add_pkg, add_manifest, add_path, preview,
-        name, src, dst, stream, every, exec_mode,
+        name, src, dst, stream, sync, exec_mode,
         onboard_pick, do_preview, onboard_byo, save_conn,
     } = s;
     // Picker options (raw_name, friendly), onboarded dropped.
@@ -110,12 +237,9 @@ pub(crate) fn setup_view(s: SetupState) -> AnyView {
                     } else {
                         view! { <Select label="Stream" placeholder="— stream —" options=stream_list value=stream/> }.into_any()
                     }}
-                    {move || {
-                        let label = if exec_mode.get() == "resident" { "Every (secs) · emit cadence" } else { "Every (secs)" };
-                        view! { <TextInput label=label placeholder="—" value=every mono=true/> }
-                    }}
+                    <Select label="Execution mode" option_pairs=modes value=exec_mode/>
                 </SimpleGrid>
-                <Select label="Execution mode" option_pairs=modes value=exec_mode/>
+                {sync_fields(sync, exec_mode)}
                 // Per-side config ([[WEIR-T-0214]]): sent as `source_config` / `dest_config`.
                 {config_side("Source", src, src_cfg)}
                 {config_side("Destination", dst, dst_cfg)}

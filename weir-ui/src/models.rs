@@ -146,6 +146,12 @@ pub(crate) struct NewConnection {
     pub(crate) dest_config: serde_json::Value,
     pub(crate) every_secs: Option<f64>,
     pub(crate) cron: Option<String>,
+    // [[WEIR-T-0215]]: full_refresh | incremental | cdc; append | upsert | overwrite.
+    // `cursor_field` only for incremental, `business_keys` only for upsert.
+    pub(crate) sync_mode: String,
+    pub(crate) write_mode: String,
+    pub(crate) business_keys: Vec<String>,
+    pub(crate) cursor_field: Option<String>,
     // F1: "run_once" | "resident"; for resident, `every_secs` is the emit cadence.
     pub(crate) execution_mode: String,
 }
