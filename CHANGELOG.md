@@ -80,6 +80,16 @@ between releases and are called out here.
   and the no-double-start guard is tenant-scoped everywhere.
   **Breaking (v0-unstable, Rust API):** `Relay::cancel` and `Relay::has_active`
   now take the tenant; the name-only `has_active` and `has_active_in` are gone.
+- Key revoke is scoped to one tenant (WEIR-T-0221). Before, `DELETE
+  /tenants/{id}/keys/{kid}` ignored the tenant and matched on the key name only:
+  revoking key `ci` of one tenant revoked every key named `ci` in every tenant,
+  and revoking by key id (as the UI does) did nothing. Now `{kid}` is a key id
+  or a key name, only the keys of tenant `{id}` match, the revoked key is
+  refused (`401`) on the next request (it is purged from the API key cache),
+  and the route returns `404` when no live key of the tenant matches.
+  `weir auth token revoke <ident>` takes `--tenant <id>` and matches only the
+  keys of that tenant (without it, only global keys); `weir auth token list`
+  now shows the key id.
 - Orchestrator hardening for long continuous operation: work-unit completion is
   now owner-guarded (a lease-expired worker finishing late can no longer
   clobber a re-claimed unit's state, and a worker's exit can no longer

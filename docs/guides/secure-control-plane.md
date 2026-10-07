@@ -34,7 +34,7 @@ weir --db weir.db auth token create --name ci --admin
 weir --db weir.db auth token create --name acme-ro --role read --tenant acme
 
 weir --db weir.db auth token list
-weir --db weir.db auth token revoke <ident>
+weir --db weir.db auth token revoke acme-ro --tenant acme   # by name or id; omit --tenant for a global key
 ```
 
 Every API call carries the key: `Authorization: Bearer weirk_…`. Access is a **default-deny** route table — a

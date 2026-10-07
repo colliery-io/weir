@@ -267,22 +267,51 @@ impl App {
             .collect())
     }
 
-    /// Revoke live keys matching `ident` (id, prefix-of-id, or name). Returns the count revoked.
-    pub fn revoke_api_key(&self, ident: &str) -> Result<usize, AppError> {
+    /// Revoke the live keys of one scope that match `ident` (WEIR-T-0221, ADR WEIR-A-0042).
+    ///
+    /// `tenant_id` is the scope: `Some(t)` touches only the keys of tenant `t`, `None` touches
+    /// only global keys (no tenant). `ident` is a key id or a key name (both exact). A key of
+    /// another scope is never revoked, so the same name in two tenants is two separate keys.
+    ///
+    /// Returns the SHA-256 hashes of the revoked keys (empty when nothing matched), so a caller
+    /// that caches validated keys can purge them at once.
+    pub fn revoke_api_key(
+        &self,
+        tenant_id: Option<&str>,
+        ident: &str,
+    ) -> Result<Vec<String>, AppError> {
         let mut conn = self
             .store
             .pool()
             .get()
             .map_err(|e| AppError::Config(e.to_string()))?;
-        // Match by name (exact); id equality is handled by the CLI resolving name→id if needed.
-        let n = diesel::update(
-            api_keys::table
-                .filter(api_keys::revoked_at.is_null())
-                .filter(api_keys::name.eq(ident)),
-        )
-        .set(api_keys::revoked_at.eq(Some(now_ms())))
-        .execute(&mut conn)?;
-        Ok(n)
+        let now = now_ms();
+        let hashes = conn.transaction::<_, diesel::result::Error, _>(|conn| {
+            let live = api_keys::table.filter(api_keys::revoked_at.is_null());
+            let cols = (api_keys::id, api_keys::name, api_keys::key_hash);
+            let rows: Vec<(DbUuid, String, String)> = match tenant_id {
+                Some(t) => live
+                    .filter(api_keys::tenant_id.eq(t))
+                    .select(cols)
+                    .load(conn)?,
+                None => live
+                    .filter(api_keys::tenant_id.is_null())
+                    .select(cols)
+                    .load(conn)?,
+            };
+            let (ids, hashes): (Vec<DbUuid>, Vec<String>) = rows
+                .into_iter()
+                .filter(|(id, name, _)| name == ident || id.0.to_string() == ident)
+                .map(|(id, _, hash)| (id, hash))
+                .unzip();
+            if !ids.is_empty() {
+                diesel::update(api_keys::table.filter(api_keys::id.eq_any(ids)))
+                    .set(api_keys::revoked_at.eq(Some(now)))
+                    .execute(conn)?;
+            }
+            Ok(hashes)
+        })?;
+        Ok(hashes)
     }
 
     /// Record an audit event ([[WEIR-T-0085]]) — a mutation's actor/action/resource/outcome
@@ -387,7 +416,7 @@ mod tests {
             .unwrap();
         assert!(app.validate_api_key(&ek).unwrap().is_none());
         // revoke
-        assert_eq!(app.revoke_api_key("temp").unwrap(), 1);
+        assert_eq!(app.revoke_api_key(None, "temp").unwrap().len(), 1);
         assert!(app.validate_api_key(&key).unwrap().is_none());
     }
 
@@ -400,5 +429,44 @@ mod tests {
         assert_eq!(ak.permissions, "admin");
         assert!(app.bootstrap_admin_key().unwrap().is_none());
         assert_eq!(app.list_api_keys().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn revoke_is_scoped_to_the_tenant() {
+        // WEIR-T-0221: two tenants each have a key `ci`; revoking A's leaves B's valid.
+        let (app, _dir) = app();
+        let a = app
+            .create_api_key("ci", "write", Some("acme"), false)
+            .unwrap();
+        let b = app
+            .create_api_key("ci", "write", Some("globex"), false)
+            .unwrap();
+        let g = app.create_api_key("ci", "write", None, false).unwrap();
+        let revoked = app.revoke_api_key(Some("acme"), "ci").unwrap();
+        assert_eq!(revoked, vec![super::hash_api_key(&a)]);
+        assert!(app.validate_api_key(&a).unwrap().is_none());
+        assert!(app.validate_api_key(&b).unwrap().is_some());
+        assert!(app.validate_api_key(&g).unwrap().is_some());
+        // A second revoke matches nothing.
+        assert!(app.revoke_api_key(Some("acme"), "ci").unwrap().is_empty());
+    }
+
+    #[test]
+    fn revoke_by_id_only_in_its_own_tenant() {
+        let (app, _dir) = app();
+        let a = app
+            .create_api_key("ci", "write", Some("acme"), false)
+            .unwrap();
+        let id = app.validate_api_key(&a).unwrap().unwrap().key_id;
+        // The id under another tenant, or the global scope, does not match.
+        assert!(app.revoke_api_key(Some("globex"), &id).unwrap().is_empty());
+        assert!(app.revoke_api_key(None, &id).unwrap().is_empty());
+        assert!(app.validate_api_key(&a).unwrap().is_some());
+        // The id under its own tenant revokes it.
+        assert_eq!(
+            app.revoke_api_key(Some("acme"), &id).unwrap(),
+            vec![super::hash_api_key(&a)]
+        );
+        assert!(app.validate_api_key(&a).unwrap().is_none());
     }
 }
