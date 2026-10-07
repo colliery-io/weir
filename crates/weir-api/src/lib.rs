@@ -453,9 +453,10 @@ async fn list(
     let tenant = tenant_of(&key);
     let mut dtos = Vec::new();
     for c in app.list_connections(tenant)? {
-        let mut dto = ConnectionDto::from_connection(&c);
+        // Secrets leave the API only as the sentinel ([[WEIR-T-0201]]).
+        let mut dto = ConnectionDto::from_connection(&app.redact_connection(tenant, c));
         // Enrich with the committed resume point + progress for the card viz.
-        if let Ok(st) = app.connection_state(tenant, &c.name) {
+        if let Ok(st) = app.connection_state(tenant, &dto.name) {
             dto.cursor = st.cursor;
             dto.chunks = st.chunks;
             dto.dead_lettered = st.dead_lettered;
@@ -470,7 +471,10 @@ async fn create(
     axum::Extension(key): axum::Extension<AuthenticatedKey>,
     Json(dto): Json<ConnectionDto>,
 ) -> Result<StatusCode, ApiError> {
-    app.add_connection(tenant_of(&key), &dto.into_connection())?;
+    let tenant = tenant_of(&key);
+    // The sentinel / an omitted secret keeps the stored value ([[WEIR-T-0201]]).
+    let conn = app.merge_secret_writes(tenant, dto.into_connection())?;
+    app.add_connection(tenant, &conn)?;
     Ok(StatusCode::CREATED)
 }
 
@@ -479,8 +483,9 @@ async fn fetch(
     axum::Extension(key): axum::Extension<AuthenticatedKey>,
     Path(name): Path<String>,
 ) -> Result<Json<ConnectionDto>, ApiError> {
+    let tenant = tenant_of(&key);
     Ok(Json(ConnectionDto::from_connection(
-        &app.get_connection(tenant_of(&key), &name)?,
+        &app.redact_connection(tenant, app.get_connection(tenant, &name)?),
     )))
 }
 
@@ -909,8 +914,8 @@ async fn t_connections(
 ) -> Result<Json<Vec<ConnectionDto>>, ApiError> {
     let mut dtos = Vec::new();
     for c in app.list_connections(&tid)? {
-        let mut dto = ConnectionDto::from_connection(&c);
-        if let Ok(st) = app.connection_state(&tid, &c.name) {
+        let mut dto = ConnectionDto::from_connection(&app.redact_connection(&tid, c));
+        if let Ok(st) = app.connection_state(&tid, &dto.name) {
             dto.cursor = st.cursor;
             dto.chunks = st.chunks;
             dto.dead_lettered = st.dead_lettered;
@@ -925,7 +930,7 @@ async fn t_connection(
     Path((tid, name)): Path<(String, String)>,
 ) -> Result<Json<ConnectionDto>, ApiError> {
     Ok(Json(ConnectionDto::from_connection(
-        &app.get_connection(&tid, &name)?,
+        &app.redact_connection(&tid, app.get_connection(&tid, &name)?),
     )))
 }
 

@@ -84,7 +84,9 @@ pub use weir_importer::ImportReport;
 
 pub mod auth;
 pub use auth::{ApiKeyInfo, AuthenticatedKey};
+pub mod secrets;
 pub mod tenant;
+pub use secrets::{SECRET_SENTINEL, SecretFields};
 pub use tenant::{DEFAULT_TENANT, Tenant};
 mod store;
 
@@ -387,6 +389,92 @@ impl App {
         store::get(&mut conn, tenant, name)?
             .ok_or_else(|| AppError::NotFound(name.to_string()))?
             .into_connection()
+    }
+
+    /// The secret keys of each side of a stored connection ([[WEIR-T-0201]]): the
+    /// schema markers of its source / dest connector plus the baked-auth keys of its config
+    /// (see [`secrets`]). A connector whose spec does not load adds no schema keys.
+    pub fn secret_fields(&self, tenant: &str, c: &Connection) -> (SecretFields, SecretFields) {
+        let schema = |r: &ConnectorRef| {
+            scope_wasm_to_tenant(r.clone(), tenant)
+                .spec()
+                .ok()
+                .map(|s| s.config_schema)
+        };
+        let src_schema = schema(&c.source);
+        let dst_schema = schema(&c.dest);
+        let src_cfg = config_value(&c.source_config);
+        let dst_cfg = config_value(&c.dest_config);
+        (
+            SecretFields::for_side(src_schema.as_deref(), [&src_cfg]),
+            SecretFields::for_side(dst_schema.as_deref(), [&dst_cfg]),
+        )
+    }
+
+    /// `c` with each secret config value replaced by [`SECRET_SENTINEL`] — the only form in
+    /// which a connection leaves the API ([[WEIR-T-0201]]).
+    pub fn redact_connection(&self, tenant: &str, mut c: Connection) -> Connection {
+        let (src, dst) = self.secret_fields(tenant, &c);
+        c.source_config = secrets::redact(&config_value(&c.source_config), &src).to_string();
+        c.dest_config = secrets::redact(&config_value(&c.dest_config), &dst).to_string();
+        c
+    }
+
+    /// Apply the secret write rules ([[WEIR-T-0201]]) to an incoming connection before
+    /// [`App::add_connection`]: against the stored connection of the same name, the
+    /// sentinel or an omitted secret keeps the stored value, an empty string clears it.
+    /// A new connection that sends the sentinel is refused ([`AppError::Config`]).
+    pub fn merge_secret_writes(
+        &self,
+        tenant: &str,
+        mut c: Connection,
+    ) -> Result<Connection, AppError> {
+        let stored = match self.get_connection(tenant, &c.name) {
+            Ok(s) => Some(s),
+            Err(AppError::NotFound(_)) => None,
+            Err(e) => return Err(e),
+        };
+        let in_src = config_value(&c.source_config);
+        let in_dst = config_value(&c.dest_config);
+        let Some(stored) = stored else {
+            if secrets::has_sentinel(&in_src) || secrets::has_sentinel(&in_dst) {
+                return Err(AppError::Config(format!(
+                    "connection `{}` is new: `{SECRET_SENTINEL}` keeps a stored secret, and \
+                     there is none — send the value",
+                    c.name
+                )));
+            }
+            return Ok(c);
+        };
+        let st_src = config_value(&stored.source_config);
+        let st_dst = config_value(&stored.dest_config);
+        // The stored connection's connectors are resolved refs; the incoming ones may be
+        // manifest names whose spec does not load — those add no schema keys.
+        let schema = |r: &ConnectorRef| {
+            scope_wasm_to_tenant(r.clone(), tenant)
+                .spec()
+                .ok()
+                .map(|s| s.config_schema)
+        };
+        let src_schemas: Vec<String> = schema(&stored.source)
+            .into_iter()
+            .chain(schema(&c.source))
+            .collect();
+        let src_secrets =
+            SecretFields::for_side(src_schemas.iter().map(String::as_str), [&st_src, &in_src]);
+        let dst_schemas: Vec<String> = schema(&stored.dest)
+            .into_iter()
+            .chain(schema(&c.dest))
+            .collect();
+        let dst_secrets =
+            SecretFields::for_side(dst_schemas.iter().map(String::as_str), [&st_dst, &in_dst]);
+        c.source_config = secrets::merge(in_src, Some(&st_src), &src_secrets, "source")
+            .map_err(AppError::Config)?
+            .to_string();
+        c.dest_config = secrets::merge(in_dst, Some(&st_dst), &dst_secrets, "dest")
+            .map_err(AppError::Config)?
+            .to_string();
+        Ok(c)
     }
 
     /// Plan a run (enqueue a `pending` work unit) without executing it — the
@@ -1665,6 +1753,11 @@ fn catalog_row_to_entry(r: CatalogTuple) -> Result<CatalogEntry, AppError> {
         manifest,
         verified_at,
     })
+}
+
+/// A stored or incoming config string as JSON (empty or invalid → `{}`).
+fn config_value(config: &str) -> serde_json::Value {
+    serde_json::from_str(config).unwrap_or_else(|_| serde_json::json!({}))
 }
 
 fn json<T: Serialize>(v: &T) -> Result<String, AppError> {

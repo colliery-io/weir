@@ -18,6 +18,18 @@ between releases and are called out here.
   disables. In-flight runs are never touched.
 
 ### Changed
+- **Breaking (v0-unstable, WEIR-A-0006):** the connection API no longer returns
+  secret values. `GET /connections`, `GET /connections/{name}` and the admin
+  mirrors under `/tenants/{id}/connections` give the sentinel
+  `__weir_secret_unchanged__` in place of each secret in `source_config` and
+  `dest_config`. A field is secret when the connector's `config_schema` marks it
+  `airbyte_secret: true` or `format: "password"`, or when it holds a baked auth
+  credential (`api_key`, or the key that `basic_password_key`,
+  `oauth_client_secret_key`, `oauth_refresh_token_key`, `google_sa_key_key`,
+  `snowflake_private_key_key` or `aws_secret_access_key_key` names). On
+  `POST /connections`, the sentinel or an omitted secret field keeps the stored
+  value, a new value replaces it, and an empty string clears it. A new
+  connection that sends the sentinel gets `400`.
 - The declarative `rest` runtime now **streams checkpoints per page** instead of
   buffering the whole paginated read: a run that dies at page N keeps pages
   1..N-1 committed and the next run resumes from the saved position (carried in
