@@ -276,6 +276,20 @@ impl App {
             weir_runtime::check_auth_scheme(cfg)
                 .map_err(|e| AppError::Config(format!("{side} config: {e}")))?;
         }
+        // A secret reference (`env:` / `file:`) is allowed in a secret field only
+        // ([[WEIR-T-0202]]): the host resolves references there and nowhere else.
+        for (side, r, cfg) in [
+            ("source", &source, &source_config),
+            ("dest", &dest, &dest_config),
+        ] {
+            let value = config_value(cfg);
+            let schema = scope_wasm_to_tenant(r.clone(), tenant)
+                .spec()
+                .ok()
+                .map(|s| s.config_schema);
+            let secret = SecretFields::for_side(schema.as_deref(), [&value]);
+            secrets::check_references(&value, &secret, side).map_err(AppError::Config)?;
+        }
         // Creation-time validation ([[WEIR-T-0166]]): a typo'd connector or config missing the
         // connector's declared requireds fails NOW with a reason — never 201-then-fail-at-run.
         self.validate_connector_resolves(tenant, &source, "source")?;
