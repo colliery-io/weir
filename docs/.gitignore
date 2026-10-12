@@ -1,0 +1,5 @@
+node_modules/
+dist/
+.astro/
+# plissken writes the API reference at build time (plissken render).
+src/content/docs/reference/api/

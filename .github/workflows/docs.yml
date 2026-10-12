@@ -1,9 +1,30 @@
+# Builds the docs in docs/ (Astro Starlight with the Colliery theme
+# starlight-aurora) on each pull request that changes them, and publishes them
+# to the GitHub Pages of this repository on a push to main. The API reference
+# is rendered by plissken from the code (plissken.toml) before the build.
+#
+# One-time setup: Settings → Pages → Source = "GitHub Actions". Until then the
+# publish job fails. The site address is written here, not read from
+# configure-pages, so the build does not need Pages to be on.
+
 name: Docs
 
-# Manual-only: the site deploys to GitHub Pages (needs a public repo + Pages
-# enabled) and builds with `plissken`/mkdocs. Run it intentionally once the repo
-# is public, rather than gating every push.
 on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - "plissken.toml"
+      - "crates/weir-cli/**"
+      - "bindings/weir-py/python/**"
+      - ".github/workflows/docs.yml"
+  pull_request:
+    paths:
+      - "docs/**"
+      - "plissken.toml"
+      - "crates/weir-cli/**"
+      - "bindings/weir-py/python/**"
+      - ".github/workflows/docs.yml"
   workflow_dispatch:
 
 permissions:
@@ -12,8 +33,12 @@ permissions:
   id-token: write
 
 concurrency:
-  group: pages
+  group: docs-${{ github.ref }}
   cancel-in-progress: true
+
+env:
+  PLISSKEN_VERSION: "0.1.0"
+  PLISSKEN_SHA256: "9e6d1b8c5d2c54b9265263d768a2c392b539ab0ba8bb3cade5dfec2c594f63bf"
 
 jobs:
   build:
@@ -22,37 +47,49 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust 1.96.1
-        uses: dtolnay/rust-toolchain@master
+      - uses: actions/setup-node@v4
         with:
-          toolchain: "1.96.1"
-
-      - uses: Swatinem/rust-cache@v2
+          node-version: 22
+          cache: npm
+          cache-dependency-path: docs/package-lock.json
 
       - name: Install plissken
-        run: cargo install plissken
+        run: |
+          name="plissken-${PLISSKEN_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          curl -fsSL -o "$RUNNER_TEMP/$name" \
+            "https://github.com/colliery-io/plissken/releases/download/v${PLISSKEN_VERSION}/$name"
+          echo "${PLISSKEN_SHA256}  $RUNNER_TEMP/$name" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/plissken"
+          tar -xzf "$RUNNER_TEMP/$name" -C "$RUNNER_TEMP/plissken"
+          bin="$(find "$RUNNER_TEMP/plissken" -type f -name plissken | head -1)"
+          mkdir -p "$RUNNER_TEMP/bin"
+          install -m 755 "$bin" "$RUNNER_TEMP/bin/plissken"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Install mkdocs-material
-        run: pip install mkdocs-material
-
-      - name: Generate API docs
+      - name: Render the API reference
         run: plissken render
 
+      - name: Install
+        working-directory: docs
+        run: npm ci --no-audit --no-fund
+
+      # A pull request builds at /, which is enough to prove the site builds.
       - name: Build site
-        run: mkdocs build
+        working-directory: docs
+        run: npm run build
+        env:
+          DOCS_SITE: ${{ github.event_name != 'pull_request' && 'https://colliery-io.github.io' || '' }}
+          DOCS_BASE: ${{ github.event_name != 'pull_request' && '/weir' || '' }}
 
       - name: Upload artifact
+        if: github.event_name != 'pull_request'
         uses: actions/upload-pages-artifact@v3
         with:
-          path: site/
+          path: docs/dist
 
   deploy:
     name: Deploy to GitHub Pages
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     needs: build
     environment:

@@ -4,7 +4,7 @@ version = 1
 rustup.pkg-path = "rustup"
 mdbook.pkg-path = "mdbook"
 maturin.pkg-path = "maturin"
-mkdocs-material.pkg-path = "python312Packages.mkdocs-material"
+nodejs.pkg-path = "nodejs_22"
 
 [hook]
 on-activate = '''
