@@ -26,7 +26,6 @@ export default defineConfig({
 			description: 'An open-source, no-code data ingestion & reverse-ETL platform.',
 			social: [{ icon: 'github', label: 'GitHub', href: REPO }],
 			plugins: [starlightAurora({ hyper: true })],
-			expressiveCode: { frames: { extractFileNameFromCode: false } },
 			sidebar: [
 				{ label: 'Home', link: '/' },
 				{

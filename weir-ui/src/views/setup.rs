@@ -120,17 +120,17 @@ fn sync_fields(f: SyncForm, exec_mode: RwSignal<String>) -> AnyView {
             let opts = cursor_options.get();
             if opts.is_empty() {
                 view! {
-                    <TextInput label="Cursor field *" placeholder="updated_at" value=cursor_field required=true mono=true/>
+                    <TextInput label="Cursor field" placeholder="updated_at" value=cursor_field required=true mono=true/>
                 }.into_any()
             } else {
                 view! {
-                    <Select label="Cursor field *" placeholder="— field from the captured schema —" options=opts
+                    <Select label="Cursor field" placeholder="— field from the captured schema —" options=opts
                         value=cursor_field required=true/>
                 }.into_any()
             }
         })}
         {move || (write_mode.get() == "upsert").then(|| view! {
-            <TextInput label="Business keys *" placeholder="id, region" value=business_keys required=true mono=true/>
+            <TextInput label="Business keys" placeholder="id, region" value=business_keys required=true mono=true/>
         })}
         <div>
             <Text size="sm">"Schedule"</Text>

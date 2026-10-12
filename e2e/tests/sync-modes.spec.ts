@@ -1,4 +1,4 @@
-import { test, expect, act, api, ensurePair, expectOk, fillStable } from './fixtures';
+import { test, expect, act, api, ensurePair, expectOk, fillStable, toast } from './fixtures';
 import type { Page } from '@playwright/test';
 
 // [[WEIR-T-0215]]: the connection form sets sync mode, write mode, business keys, the
@@ -51,7 +51,7 @@ test('sync modes: an incremental upsert cron connection is created and read back
 
   // Upsert without keys is stopped in the form, before any request.
   await page.getByRole('button', { name: 'Save connection' }).click();
-  await expect(page.getByRole('alert').filter({ hasText: 'Upsert needs at least one business key' })).toBeVisible();
+  await expect(toast(page, 'Upsert needs at least one business key')).toBeVisible();
   await fillStable(page.getByLabel('Business keys *'), 'base, date');
 
   // An interval typed first, then the toggle moved to cron: only the cron is sent.
@@ -66,7 +66,7 @@ test('sync modes: an incremental upsert cron connection is created and read back
     page.getByRole('button', { name: 'Save connection' }).click(),
   );
   expect(res.request().postDataJSON()).toMatchObject({ name, cron: '0 0 3 * * *', every_secs: null });
-  await expect(page.getByText(`Saved connection ${name}`)).toBeVisible();
+  await expect(toast(page, `Saved connection ${name}`)).toBeVisible();
 
   const got = await api(page.request, 'GET', `/connections/${name}`);
   await expectOk(got);
@@ -131,13 +131,13 @@ test('sync modes: the cursor field is a select from the captured schema', async 
   await page.getByRole('button', { name: 'Cron', exact: true }).click();
   await page.getByLabel(/^Cron ·/).fill('0 * * * *');
   await page.getByRole('button', { name: 'Save connection' }).click();
-  await expect(page.getByRole('alert').filter({ hasText: 'Cron needs 6 or 7 fields' })).toBeVisible();
+  await expect(toast(page, 'Cron needs 6 or 7 fields')).toBeVisible();
   expect(posted).toHaveLength(0);
   await page.getByRole('button', { name: 'Every N seconds', exact: true }).click();
   await page.getByLabel('Every (secs)').fill('300');
 
   await page.getByRole('button', { name: 'Save connection' }).click();
-  await expect(page.getByText('Saved connection orders-sync')).toBeVisible();
+  await expect(toast(page, 'Saved connection orders-sync')).toBeVisible();
   expect(posted).toHaveLength(1);
   expect(posted[0]).toMatchObject({
     sync_mode: 'incremental',

@@ -8,6 +8,7 @@ import {
   fillStable,
   nextResponse,
   scoped,
+  toast,
 } from './fixtures';
 import type { Page } from '@playwright/test';
 
@@ -48,7 +49,7 @@ async function saveForm(page: Page, name: string, tenant: string | null) {
   await act(page, 'POST', scoped(tenant, '/connections'), () =>
     page.getByRole('button', { name: 'Save connection' }).click(),
   );
-  await expect(page.getByText(`Saved connection ${name}`)).toBeVisible();
+  await expect(toast(page, `Saved connection ${name}`)).toBeVisible();
 }
 
 const card = (page: Page, name: string) => page.getByTestId('connection-card').filter({ hasText: name });
@@ -134,14 +135,14 @@ test('journey: a resident source starts and stops from its card', async ({ page 
   await act(page, 'POST', `/connections/${name}/start`, () =>
     c.getByRole('button', { name: 'Start', exact: true }).click(),
   );
-  await expect(page.getByText(`Started ${name}`)).toBeVisible();
+  await expect(toast(page, `Started ${name}`)).toBeVisible();
   await expect(c.getByText('resident • live')).toBeVisible({ timeout: 30_000 });
   await expect.poll(active, { timeout: 30_000 }).toBe(1);
 
   await act(page, 'POST', `/connections/${name}/stop`, () =>
     c.getByRole('button', { name: 'Stop', exact: true }).click(),
   );
-  await expect(page.getByText(`Stopped ${name}`)).toBeVisible();
+  await expect(toast(page, `Stopped ${name}`)).toBeVisible();
   await expect(c.getByText('resident • stopped')).toBeVisible({ timeout: 30_000 });
   // Durably stopped: the worker does not bring it back.
   await expect.poll(active, { timeout: 30_000 }).toBe(0);
@@ -210,7 +211,7 @@ test('journey: an admin switched to another tenant onboards and creates there', 
     await act(page, 'POST', `/tenants/${tenant}/catalog/import`, () =>
       page.getByRole('button', { name: 'Onboard' }).first().click(),
     );
-    await expect(page.getByText(`Onboarded ${pkg}`)).toBeVisible();
+    await expect(toast(page, `Onboarded ${pkg}`)).toBeVisible();
   }
 
   // Create the connection in B through the form.

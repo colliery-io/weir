@@ -1,8 +1,9 @@
 import { test, expect } from './fixtures';
 
-// [[WEIR-T-0191]]: Aurora light/dark. The top bar has the Aurora ThemeToggle; the choice
-// sets data-theme on <html>, is stored, and THEME_INIT_SCRIPT applies it on the next load.
-test('theme: the top-bar toggle switches light/dark and survives a reload', async ({ page }) => {
+// [[WEIR-T-0191]]: Aurora light, dark and the opt-in hyper theme. The top bar has the Aurora
+// ThemeToggle; the choice sets data-theme on <html>, is stored, and THEME_INIT_SCRIPT applies
+// it on the next load.
+test('theme: the top-bar toggle switches light/dark/hyper and survives a reload', async ({ page }) => {
   await page.goto('/');
   const toggle = page.getByRole('group', { name: 'Theme' });
   await expect(toggle).toBeVisible();
@@ -17,7 +18,12 @@ test('theme: the top-bar toggle switches light/dark and survives a reload', asyn
   await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark');
   await expect(toggle.getByRole('button', { name: 'Dark' })).toHaveAttribute('aria-pressed', 'true');
 
+  await toggle.getByRole('button', { name: 'Hyper' }).click();
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'hyper');
+  await page.reload();
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'hyper');
+
   // System: no forced theme; the page follows the OS again.
   await toggle.getByRole('button', { name: 'System' }).click();
-  await expect(page.locator('html')).not.toHaveAttribute('data-theme', /light|dark/);
+  await expect(page.locator('html')).not.toHaveAttribute('data-theme', /light|dark|hyper/);
 });
