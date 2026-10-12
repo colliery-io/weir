@@ -37,13 +37,8 @@ lcov.info
 # Metis ephemeral state
 .metis/.index-dirty
 
-# Documentation build output
-/site/
-
-# plissken-generated API docs (rebuilt by docs.yml CI)
-docs/api/_nav.yml
-docs/api/weir.md
-docs/api/rust/
+# Documentation: the build output, node_modules and the plissken API reference
+# are ignored in docs/.gitignore.
 
 # Staged-connector output written by weir-app tests (compile-isolation staging
 # defaults connectors_dir() to this path) — test side effects, never inputs.

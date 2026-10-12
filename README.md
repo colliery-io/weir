@@ -39,8 +39,8 @@ fresh store — admin API key minted; save this, it is not shown again:
 
 ## Quickstart (from source)
 
-See [Installation](docs/reference/installation.md), then follow
-[Your first sync](docs/tutorials/first-sync.md) — a complete ingest, end to end, in a few
+See [Installation](docs/src/content/docs/reference/installation.md), then follow
+[Your first sync](docs/src/content/docs/tutorials/first-sync.md) — a complete ingest, end to end, in a few
 minutes. The full documentation (tutorials, how-to guides, reference, architecture) lives in
 [`docs/`](docs/).
 

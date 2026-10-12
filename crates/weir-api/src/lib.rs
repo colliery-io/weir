@@ -501,7 +501,7 @@ fn tenancy_posture_notice(named_tenants: usize, oidc_enabled: bool) -> Option<&'
     (named_tenants > 0 || oidc_enabled).then_some(
         "tenancy posture (alpha): tenants are workspaces for trusted operators, not a hardened \
          isolation boundary; OIDC sign-in gives each IdP-authenticated user a write key on the \
-         `default` tenant; see docs/explanation/tenancy-posture.md",
+         `default` tenant; see docs/src/content/docs/explanation/tenancy-posture.md",
     )
 }
 

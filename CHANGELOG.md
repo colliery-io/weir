@@ -33,6 +33,11 @@ between releases and are called out here.
   and when to use references (WEIR-T-0205).
 
 ### Changed
+- Docs: the site is now Astro Starlight with the Colliery theme starlight-aurora
+  (was MkDocs Material), in `docs/src/content/docs/`. The how-to guides are at
+  `how-to/` (was `guides/`), the HTTP API page at `reference/http-api/` (was
+  `api/`), and the plissken API reference at `reference/api/`; the old addresses
+  redirect (WEIR-T-0225).
 - **Breaking (v0-unstable, WEIR-A-0006):** `GET /runs/{id}` (and the admin
   mirror `/tenants/{id}/runs/{run_id}`) now gives `started_at` and `finished_at`
   as RFC 3339 UTC strings with millisecond precision
