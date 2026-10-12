@@ -541,7 +541,7 @@ pub(crate) fn App() -> impl IntoView {
     let needs_signin = Memo::new(move |_| authed.get() == Some(false));
 
     view! {
-        <AuroraStyles/>
+        <AuroraStyles hyper=true/>
         <style>{LAYOUT_CSS}</style>
         <ToastStack duration_ms=6000/>
         {move || if needs_signin.get() {
@@ -621,7 +621,7 @@ pub(crate) fn App() -> impl IntoView {
                                 <Button variant="subtle" size="xs" title=format!("signed in as {}", signed_in_as.get())
                                     on_click=Callback::new(move |_| sign_out())>"Sign out"</Button>
                             }}
-                            <ThemeToggle/>
+                            <ThemeToggle hyper=true/>
                         </Group>
                     }.into_any())
                 >

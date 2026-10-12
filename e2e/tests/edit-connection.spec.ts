@@ -1,4 +1,4 @@
-import { test, expect, act, api, ensurePair, expectOk, fillStable } from './fixtures';
+import { test, expect, act, api, ensurePair, expectOk, fillStable, toast } from './fixtures';
 
 // [[WEIR-T-0216]]: Edit on a connection card loads it into the Setup form. Secrets come
 // back from the server as the sentinel ([[WEIR-T-0201]]); the form shows them as
@@ -41,7 +41,7 @@ test('edit connection: a non-secret edit keeps the stored secret (real server)',
     page.getByRole('button', { name: 'Save connection' }).click(),
   );
   expect(res.request().postDataJSON()).toMatchObject({ name, every_secs: 300 });
-  await expect(page.getByText(`Saved connection ${name}`)).toBeVisible();
+  await expect(toast(page, `Saved connection ${name}`)).toBeVisible();
   // Edit mode ends with the save.
   await expect(page.getByPlaceholder('my-sync')).toBeEnabled();
 

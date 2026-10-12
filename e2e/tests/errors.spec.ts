@@ -1,4 +1,4 @@
-import { test, expect } from './fixtures';
+import { test, expect, toast } from './fixtures';
 
 // [[WEIR-T-0167]] (+ [[WEIR-T-0166]]): failures surface as errors — a rejected create
 // carries the server's reason into the toast, and an unreachable control plane shows
@@ -13,11 +13,12 @@ test('errors: rejected create surfaces the server reason in the toast', async ({
   await page.getByPlaceholder('my-sync').fill('typo-proof');
   await page.getByRole('button', { name: 'Save connection' }).click();
 
-  // Aurora toasts: an error toast is role=alert.
-  const toast = page.getByRole('alert').filter({ hasText: "Couldn't save" });
-  await expect(toast).toBeVisible();
-  await expect(toast).toContainText("Couldn't save typo-proof");
-  await expect(toast).toContainText('unknown source connector');
+  // The error toast; its live region (role=alert) reads the same text.
+  const shown = toast(page, "Couldn't save");
+  await expect(shown).toBeVisible();
+  await expect(shown).toContainText("Couldn't save typo-proof");
+  await expect(shown).toContainText('unknown source connector');
+  await expect(page.getByRole('alert').filter({ hasText: "Couldn't save typo-proof" })).toHaveCount(1);
 });
 
 test('errors: unreachable control plane shows the degraded banner, not empty states', async ({

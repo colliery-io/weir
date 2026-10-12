@@ -1,4 +1,4 @@
-import { test, expect } from './fixtures';
+import { test, expect, toast } from './fixtures';
 
 // [[WEIR-T-0077]] verification: the piece a Ralph loop couldn't self-check.
 // Drives the real embedded Leptos + Aurora UI ([[WEIR-I-0016]]): a destination manifest
@@ -16,7 +16,7 @@ test('destination manifest: discover → onboard → appears in the dest dropdow
   await picker.selectOption('hubspot-dest');
   // The "Add a connector" panel's Onboard button (the "Bring your own" panel has one too).
   await page.getByRole('button', { name: 'Onboard' }).first().click();
-  await expect(page.getByText('Onboarded hubspot-dest')).toBeVisible();
+  await expect(toast(page, 'Onboarded hubspot-dest')).toBeVisible();
 
   // Onboarded → dropped from the discover picker, and now a selectable option exactly once:
   // the **destination** dropdown (the source dropdown excludes it — Destination-only role).

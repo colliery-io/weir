@@ -17,6 +17,12 @@ export const test = base.extend({
 export { expect } from '@playwright/test';
 
 /**
+ * A toast on screen. Aurora reads each toast from a live region too (role status or
+ * alert, visually hidden), so the text of a toast is on the page twice.
+ */
+export const toast = (page: Page, text: string | RegExp) => page.locator('.cl-toast').filter({ hasText: text });
+
+/**
  * Fill a form field and make sure the value stuck. The Setup view is rebuilt when its data
  * lands (e.g. `/catalog/available`); a rebuild in the middle of a fill drops the typed text
  * with no error (seen on CI: `edit-connection` saved `every_secs: null` after a fill of 300).

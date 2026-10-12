@@ -1,4 +1,4 @@
-import { test, expect } from './fixtures';
+import { test, expect, toast } from './fixtures';
 
 // [[WEIR-T-0214]]: the connection form renders one config form per side from each
 // connector's `config_schema`, checks required fields before submit, merges each side's
@@ -63,7 +63,7 @@ test('config forms: two-sided schema forms post source_config + dest_config', as
 
   // Required fields are checked before submit: nothing is sent.
   await page.getByRole('button', { name: 'Save connection' }).click();
-  await expect(page.getByRole('alert').filter({ hasText: 'Source config: missing required host, token' })).toBeVisible();
+  await expect(toast(page, 'Source config: missing required host, token')).toBeVisible();
   expect(posted).toHaveLength(0);
 
   await source.getByLabel('host *').fill('db.internal');
@@ -79,7 +79,7 @@ test('config forms: two-sided schema forms post source_config + dest_config', as
   await dest.getByLabel(/Destination advanced JSON ·/).fill('{"region": "eu-west-1", "bucket": "lake-2"}');
 
   await page.getByRole('button', { name: 'Save connection' }).click();
-  await expect(page.getByText('Saved connection two-sided')).toBeVisible();
+  await expect(toast(page, 'Saved connection two-sided')).toBeVisible();
   expect(posted).toHaveLength(1);
   const body = posted[0];
   expect(body.source_config).toEqual({ host: 'db.internal', port: 5432, token: 's3cret', mode: 'safe', tls: true });

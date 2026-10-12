@@ -6,8 +6,8 @@
     <meta name="color-scheme" content="light dark" />
     <title>weir · control plane</title>
     <!-- aurora_leptos::THEME_INIT_SCRIPT (a test keeps this copy exact): sets the stored
-         light/dark choice on <html> before the first paint. With no choice the page follows the OS. -->
-    <script>(function(){try{var t=localStorage.getItem("aurora-theme");if(t==="light"||t==="dark"){var d=document.documentElement;d.setAttribute("data-theme",t);d.style.colorScheme=t;}}catch(e){}})();</script>
+         light/dark/hyper choice on <html> before the first paint. With no choice the page follows the OS. -->
+    <script>(function(){try{var t=localStorage.getItem("aurora-theme");if(t==="light"||t==="dark"||t==="hyper"){var d=document.documentElement;d.setAttribute("data-theme",t);if(t!=="hyper")d.style.colorScheme=t;}}catch(e){}})();</script>
     <!-- Colliery Aurora styling (incl. IBM Plex fonts) is injected at runtime by
          <AuroraStyles/>; the app mounts to <body> (Leptos mount_to_body). -->
     <link data-trunk rel="rust" data-wasm-opt="z" />

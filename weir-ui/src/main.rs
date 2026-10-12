@@ -1,5 +1,5 @@
 //! weir control-plane UI — Leptos (CSR) on the Colliery Aurora design system
-//! ([[WEIR-A-0035]]), light and dark ([[WEIR-T-0191]]). Aurora ships the chrome;
+//! ([[WEIR-A-0035]]), light, dark and hyper ([[WEIR-T-0191]]). Aurora ships the chrome;
 //! weir supplies the data + vocabulary.
 //! Shell + Operations + Setup ([[WEIR-T-0079]]/[[WEIR-T-0080]]/[[WEIR-T-0081]]).
 //!

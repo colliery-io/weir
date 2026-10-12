@@ -88,16 +88,18 @@ impl SideConfig {
 
 /// One field of a connector's config contract, bound to the side's form JSON.
 /// String and number fields are text inputs, secret fields password inputs, `enum`
-/// fields selects, and booleans switches. A required field has a `*` on its label.
+/// fields selects, and booleans switches. Aurora marks the label of a required field
+/// with `*`; a switch and a stored secret take no `required`, so their label has it.
 pub(crate) fn config_field(p: Prop, form: RwSignal<String>) -> AnyView {
-    let label = if p.required { format!("{} *", p.key) } else { p.key.clone() };
+    let label = p.key.clone();
+    let marked = if p.required { format!("{} *", p.key) } else { p.key.clone() };
     let (key, kind) = (p.key.clone(), p.kind.clone());
     let set = move |v: &str| form.set(cfg_set(&form.get_untracked(), &key, v, &kind));
     let now = cfg_get(&form.get_untracked(), &p.key);
     if p.kind == "boolean" {
         let checked = RwSignal::new(now == "true");
         let on_change = Callback::new(move |on: bool| set(if on { "true" } else { "false" }));
-        return view! { <Switch checked=checked label=label on_change=on_change/> }.into_any();
+        return view! { <Switch checked=checked label=marked on_change=on_change/> }.into_any();
     }
     let field = RwSignal::new(now);
     let on_input = Callback::new(move |v: String| set(&v));
@@ -108,7 +110,7 @@ pub(crate) fn config_field(p: Prop, form: RwSignal<String>) -> AnyView {
         .into_any();
     }
     if p.secret && field.get_untracked() == SECRET_SENTINEL {
-        return stored_secret_field(p, form, label);
+        return stored_secret_field(p, form, marked);
     }
     if p.secret {
         return view! {
