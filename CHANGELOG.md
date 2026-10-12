@@ -35,6 +35,8 @@ between releases and are called out here.
 ### Changed
 - Web UI: on Aurora 0.6.1 (was 0.4.1). The theme toggle offers Hyper too. Toasts
   are read from two live regions; a required field gets its `*` from Aurora.
+- Docs: the API reference is rendered with plissken 0.2.0 (was 0.1.0): private
+  items are left out, generated pages have no edit link.
 - Docs: the site is now Astro Starlight with the Colliery theme starlight-aurora
   (was MkDocs Material), in `docs/src/content/docs/`. The how-to guides are at
   `how-to/` (was `guides/`), the HTTP API page at `reference/http-api/` (was
