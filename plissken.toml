@@ -8,7 +8,22 @@ path = "docs/src/content/docs/reference/api"
 template = "starlight"
 
 [rust]
-crates = ["crates/weir-core", "crates/weir-cli"]
+# The library crates, and the CLI. Not the soak driver, the wasm test kit or
+# the connector plugins.
+crates = [
+    "crates/weir-api",
+    "crates/weir-app",
+    "crates/weir-cli",
+    "crates/weir-codegen",
+    "crates/weir-connector",
+    "crates/weir-connector-types",
+    "crates/weir-engine",
+    "crates/weir-importer",
+    "crates/weir-manifest",
+    "crates/weir-orchestrator",
+    "crates/weir-runtime",
+    "crates/weir-schema",
+]
 
 [python]
 package = "bindings/weir-py/python/weir"
